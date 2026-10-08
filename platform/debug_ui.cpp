@@ -173,6 +173,18 @@ bool sShowShaderCompilation = true;
 int sHudScale = PortDebug::kHudScaleMax;
 bool sHideHelmet = false;
 bool sHideVisorEffects = false;
+// Screen-space effects (PortDebug::ScreenSpace). MP_SSAO and MP_SSR override the two switches
+// for one run (-1: unset) without being saved.
+bool sSsao = false;
+float sSsaoIntensity = 1.5f;
+float sSsaoRadius = 1.f;
+bool sSsr = false;
+float sSsrStrength = 0.5f;
+bool sSsrFloorsOnly = true;
+bool sScreenSpaceHalfRes = true;
+int sScreenSpaceDebugView = 0;
+int sSsaoRun = -1;
+int sSsrRun = -1;
 bool sRevealMap = false;
 bool sMapPickups = false;
 bool sMapLogicColors = true;
@@ -578,6 +590,29 @@ void ApplySetting(const std::string& key, const std::string& value) {
     sHideHelmet = ParseBool(value);
   } else if (key == "hide_visor_effects") {
     sHideVisorEffects = ParseBool(value);
+  } else if (key == "ssao") {
+    sSsao = ParseBool(value);
+  } else if (key == "ssao_intensity") {
+    const float f = static_cast< float >(std::atof(value.c_str()));
+    if (std::isfinite(f)) {
+      sSsaoIntensity = std::clamp(f, PortDebug::kSsaoIntensityMin, PortDebug::kSsaoIntensityMax);
+    }
+  } else if (key == "ssao_radius") {
+    const float f = static_cast< float >(std::atof(value.c_str()));
+    if (std::isfinite(f)) {
+      sSsaoRadius = std::clamp(f, PortDebug::kSsaoRadiusMin, PortDebug::kSsaoRadiusMax);
+    }
+  } else if (key == "ssr") {
+    sSsr = ParseBool(value);
+  } else if (key == "ssr_strength") {
+    const float f = static_cast< float >(std::atof(value.c_str()));
+    if (std::isfinite(f)) {
+      sSsrStrength = std::clamp(f, 0.f, 1.f);
+    }
+  } else if (key == "ssr_floors_only") {
+    sSsrFloorsOnly = ParseBool(value);
+  } else if (key == "screen_space_half_res") {
+    sScreenSpaceHalfRes = ParseBool(value);
   } else if (key == "reveal_map") {
     sRevealMap = ParseBool(value);
   } else if (key == "map_pickups") {
@@ -897,6 +932,13 @@ void SaveSettings() {
   file << "hud_scale=" << sHudScale << '\n';
   file << "hide_helmet=" << (sHideHelmet ? 1 : 0) << '\n';
   file << "hide_visor_effects=" << (sHideVisorEffects ? 1 : 0) << '\n';
+  file << "ssao=" << (sSsao ? 1 : 0) << '\n';
+  file << "ssao_intensity=" << sSsaoIntensity << '\n';
+  file << "ssao_radius=" << sSsaoRadius << '\n';
+  file << "ssr=" << (sSsr ? 1 : 0) << '\n';
+  file << "ssr_strength=" << sSsrStrength << '\n';
+  file << "ssr_floors_only=" << (sSsrFloorsOnly ? 1 : 0) << '\n';
+  file << "screen_space_half_res=" << (sScreenSpaceHalfRes ? 1 : 0) << '\n';
   file << "reveal_map=" << (sRevealMap ? 1 : 0) << '\n';
   file << "map_pickups=" << (sMapPickups ? 1 : 0) << '\n';
   file << "tracker_progress=" << (sTrackerProgress ? 1 : 0) << '\n';
@@ -1197,6 +1239,12 @@ void EnsureInitialized() {
     sSimAdaptive = true;
   }
   sOriginalExperience = port::EnvFlag("MP_ORIGINAL", sOriginalExperience);
+  if (std::getenv("MP_SSAO") != nullptr) {
+    sSsaoRun = port::EnvFlag("MP_SSAO", false) ? 1 : 0;
+  }
+  if (std::getenv("MP_SSR") != nullptr) {
+    sSsrRun = port::EnvFlag("MP_SSR", false) ? 1 : 0;
+  }
 
   std::atexit(SaveSettings);
   ApplyLiveSplit();
@@ -1570,6 +1618,23 @@ void SetHideVisorEffects(bool enabled) {
   EnsureInitialized();
   sHideVisorEffects = enabled;
   MarkDirty();
+}
+
+ScreenSpaceSettings ScreenSpace() {
+  EnsureInitialized();
+  ScreenSpaceSettings s{};
+  if (sOriginalExperience) {
+    return s;
+  }
+  s.ao = sSsaoRun >= 0 ? sSsaoRun != 0 : sSsao;
+  s.aoIntensity = sSsaoIntensity;
+  s.aoRadius = sSsaoRadius;
+  s.ssr = sSsrRun >= 0 ? sSsrRun != 0 : sSsr;
+  s.ssrStrength = sSsrStrength;
+  s.ssrFloorsOnly = sSsrFloorsOnly;
+  s.halfRes = sScreenSpaceHalfRes;
+  s.debugView = sScreenSpaceDebugView;
+  return s;
 }
 
 bool RevealMap() {
@@ -5834,6 +5899,77 @@ void DrawVideoQuality() {
   ImGui::EndDisabled();
   ImGui::SetItemTooltip("Draws the game's text with a sharp, high-resolution font. Recommended: on.\n"
                         "Not saved: it is on at each start. Off under Original experience.");
+
+  ImGui::SeparatorText("Screen-space effects");
+  if (!GXPortScreenSpaceSupported()) {
+    ImGui::PushTextWrapPos(0.f);
+    ImGui::TextDisabled(
+        "This GPU or driver can't run these: they need WebGPU's core features, which it "
+        "doesn't have. The settings are kept for other devices.");
+    ImGui::PopTextWrapPos();
+  }
+  locked = BeginOriginalLocked();
+  if (ImGui::Checkbox("Ambient occlusion (SSAO)", &sSsao)) {
+    MarkDirty();
+  }
+  ImGui::SetItemTooltip(
+      "Darkens creases, corners and where objects meet the floor, worked out from the\n"
+      "depth buffer. Costs some GPU time.");
+  if (sSsaoRun >= 0) {
+    ImGui::SameLine();
+    ImGui::TextDisabled(sSsaoRun != 0 ? "(on for this run: MP_SSAO)"
+                                      : "(off for this run: MP_SSAO)");
+  }
+  if (sSsao || sSsaoRun > 0) {
+    ImGui::Indent();
+    if (ImGui::SliderFloat("Intensity##ssao", &sSsaoIntensity, kSsaoIntensityMin, kSsaoIntensityMax,
+                           "%.2f")) {
+      MarkDirty();
+    }
+    if (ImGui::SliderFloat("Radius##ssao", &sSsaoRadius, kSsaoRadiusMin, kSsaoRadiusMax,
+                           "%.2f m")) {
+      MarkDirty();
+    }
+    ImGui::SetItemTooltip("How far from a crease the shadow reaches. Larger is softer and wider.");
+    ImGui::Unindent();
+  }
+  if (ImGui::Checkbox("Reflections (SSR)", &sSsr)) {
+    MarkDirty();
+  }
+  ImGui::SetItemTooltip(
+      "Reflects what is on screen in floors, ice and still water. What is off screen\n"
+      "can't be reflected, so reflections fade out towards the edges of the frame.");
+  if (sSsrRun >= 0) {
+    ImGui::SameLine();
+    ImGui::TextDisabled(sSsrRun != 0 ? "(on for this run: MP_SSR)" : "(off for this run: MP_SSR)");
+  }
+  if (sSsr || sSsrRun > 0) {
+    ImGui::Indent();
+    if (ImGui::SliderFloat("Strength##ssr", &sSsrStrength, 0.f, 1.f, "%.2f")) {
+      MarkDirty();
+    }
+    if (ImGui::Checkbox("Floors only##ssr", &sSsrFloorsOnly)) {
+      MarkDirty();
+    }
+    ImGui::SetItemTooltip(
+        "Off: walls reflect too, which suits the metal and glass rooms but makes\n"
+        "rock look wet. Recommended: on.");
+    ImGui::Unindent();
+  }
+  if (sSsao || sSsr || sSsaoRun > 0 || sSsrRun > 0) {
+    if (ImGui::Checkbox("Half resolution##screenspace", &sScreenSpaceHalfRes)) {
+      MarkDirty();
+    }
+    ImGui::SetItemTooltip(
+        "Works both out at half resolution and filters them up: about a quarter of\n"
+        "the cost, slightly softer. Recommended: on, especially on phones.");
+    ImGui::Combo("Debug view##screenspace", &sScreenSpaceDebugView,
+                 "Off\0"
+                 "Occlusion only\0"
+                 "Reflections only\0");
+    ImGui::SetItemTooltip("Shows one effect on its own, to tune it. Not saved.");
+  }
+  EndOriginalLocked(locked);
 }
 
 // Rendering API, driver and workarounds for GPU driver bugs, and the self-test that finds them.

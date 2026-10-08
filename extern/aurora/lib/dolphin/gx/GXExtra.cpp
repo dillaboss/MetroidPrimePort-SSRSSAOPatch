@@ -6,6 +6,7 @@
 #include "../../gfx/probe.hpp"
 #include "../../gfx/shadow.hpp"
 #include "../../gfx/volfog.hpp"
+#include "../../gfx/screenspace.hpp"
 #include "../../webgpu/gpu_prof.hpp"
 
 #include <atomic>
@@ -168,6 +169,31 @@ GXBool GXPortVolumetricFog(const GXPortFogParams* fog) {
 }
 
 void GXPortVolumetricFogEnd() { GX_WRITE_AURORA(GX_AURORA_PORT_VOLUMETRIC_FOG_END); }
+
+GXBool GXPortScreenSpaceSupported() { return aurora::gfx::screenspace::supported(); }
+
+GXBool GXPortScreenSpace(const GXPortScreenSpaceParams* ss) {
+  if (ss == nullptr || GXGetPBRCostTest() == 10 || sDrawIdMode || (ss->flags & (GX_PORT_SS_AO | GX_PORT_SS_SSR)) == 0) {
+    return true;
+  }
+  if (!aurora::gfx::screenspace::ensure_task()) {
+    return false;
+  }
+  namespace ssp = aurora::gfx::screenspace;
+  static_assert(ssp::FlagAo == GX_PORT_SS_AO && ssp::FlagSsr == GX_PORT_SS_SSR &&
+                ssp::FlagShowAo == GX_PORT_SS_SHOW_AO && ssp::FlagShowSsr == GX_PORT_SS_SHOW_SSR &&
+                ssp::FlagHalfRes == GX_PORT_SS_HALF_RES);
+  ssp::Params params{};
+  static_assert(offsetof(ssp::Params, size) == sizeof(GXPortScreenSpaceParams));
+  std::memcpy(&params, ss, sizeof(*ss));
+  u32 words[sizeof(params) / sizeof(u32)];
+  std::memcpy(words, &params, sizeof(words));
+  GX_WRITE_AURORA(GX_AURORA_PORT_SCREEN_SPACE);
+  for (const u32 word : words) {
+    GX_WRITE_U32(word);
+  }
+  return true;
+}
 
 void GXPortSetParticleFog(GXBool on) {
   GX_WRITE_AURORA(GX_AURORA_PORT_PARTICLE_FOG);

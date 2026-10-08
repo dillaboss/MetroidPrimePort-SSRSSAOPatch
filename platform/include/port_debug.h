@@ -194,6 +194,23 @@ void SetHideHelmet(bool enabled);
 // hit splashes on the visor.
 bool HideVisorEffects();
 void SetHideVisorEffects(bool enabled);
+// Screen-space ambient occlusion and reflections over the opaque world
+// (GXPortScreenSpace). All off under Original experience.
+struct ScreenSpaceSettings {
+  bool ao;
+  float aoIntensity; // the occlusion's exponent, kSsaoIntensityMin to Max
+  float aoRadius;    // world units, kSsaoRadiusMin to Max
+  bool ssr;
+  float ssrStrength;  // 0 to 1
+  bool ssrFloorsOnly; // only surfaces facing up reflect, else walls too
+  bool halfRes;       // both work at half resolution
+  int debugView;      // 0 off, 1 the occlusion alone, 2 the reflections alone; not saved
+};
+const float kSsaoIntensityMin = 0.5f;
+const float kSsaoIntensityMax = 3.f;
+const float kSsaoRadiusMin = 0.25f;
+const float kSsaoRadiusMax = 3.f;
+ScreenSpaceSettings ScreenSpace();
 // Every world's map shows as if its map station had been used; the save is
 // not changed.
 bool RevealMap();

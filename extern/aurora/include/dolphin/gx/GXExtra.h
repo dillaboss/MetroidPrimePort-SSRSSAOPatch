@@ -276,6 +276,32 @@ GXBool GXPortVolumetricFog(const GXPortFogParams* params);
 // opaque ones per pixel as the full-screen pass, blended and additive ones per vertex (blended:
 // colour T + in-scatter, additive: colour T). Harmless when no fog was drawn.
 void GXPortVolumetricFogEnd(void);
+// Port extension: screen-space ambient occlusion and reflections over the EFB as drawn so far
+// (see lib/gfx/screenspace.cpp). Both read only the depth buffer and the colour: positions come
+// from the frustum and the depth range below, normals from neighbouring depths. Call it after the
+// opaque world and before what is drawn without depth (transparents, particles), and before
+// GXPortVolumetricFog so that the fog is not occluded. View space is GX's (x right, y up, z
+// towards the camera).
+enum {
+  GX_PORT_SS_AO = 1,       // ambient occlusion
+  GX_PORT_SS_SSR = 2,      // reflections
+  GX_PORT_SS_SHOW_AO = 4,  // debug: show the occlusion alone
+  GX_PORT_SS_SHOW_SSR = 8, // debug: show the reflections alone
+  GX_PORT_SS_HALF_RES = 16 // work at half resolution
+};
+typedef struct {
+  f32 frustum[4]; // left, right, bottom, top at a view depth of 1
+  f32 depth[4];   // near, far, and the GX z range the world draws in (min, max)
+  f32 up[4];      // xyz: the world's up direction in view space
+  f32 ao[4];      // radius (world units), intensity (an exponent), fade-out distance, bias
+  f32 ssr[4];     // strength (0-1), ray length (world units), thickness, the least dot(normal, up)
+  u32 flags;      // GX_PORT_SS_*
+} GXPortScreenSpaceParams;
+// False when it could not be recorded, which includes devices that can't run it (see below).
+GXBool GXPortScreenSpace(const GXPortScreenSpaceParams* params);
+// Whether this device can run GXPortScreenSpace: it needs WebGPU's core features, which some
+// OpenGL ES devices lack. Valid once the graphics device is up.
+GXBool GXPortScreenSpaceSupported(void);
 // Marks the draws up to the next call with false as particles' (inside the volumetric fog). As
 // Remastered's particle renderers, they fog themselves per vertex as colour T + in-scatter unless
 // their blend mode is additive or premultiplied (the static render state's "no fog" flag), when

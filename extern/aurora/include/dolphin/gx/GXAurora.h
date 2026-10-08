@@ -283,6 +283,12 @@ extern "C" {
 // Payload: none
 #define GX_AURORA_PORT_VOLUMETRIC_FOG_END 0x005A
 
+// Port extension: screen-space ambient occlusion and reflections over the EFB as drawn so far
+// (see GXPortScreenSpace). Queued like GX_AURORA_PORT_POST_PROCESS.
+// Payload:
+//   24 u32: aurora::gfx::screenspace::Params, word for word
+#define GX_AURORA_PORT_SCREEN_SPACE 0x006B
+
 // Port extension: draws the following opaque surfaces in two passes (see GXPortSetDepthPrepass).
 // Payload:
 //   u8 pass (0 = off, 1 = depth only, 2 = shade where the depth is equal)

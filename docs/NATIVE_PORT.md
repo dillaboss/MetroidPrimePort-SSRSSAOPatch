@@ -989,6 +989,28 @@ unpacks to a temporary directory instead of mounting.
   textures, which retail asks for as GX_ANISO_4. Both apply at the start of the
   next frame without a restart; an MSAA change rebuilds the framebuffers and
   pipelines, so it hitches once. Console: `msaa <1|4>`, `aniso <1..16>`.
+- Screen-space ambient occlusion and reflections (Video > Quality > Screen-space
+  effects; persisted as `ssao`, `ssao_intensity` 0.5-3 default 1.5,
+  `ssao_radius` 0.25-3 world units default 1, `ssr`, `ssr_strength` 0-1
+  default 0.5, `ssr_floors_only` default on, and `screen_space_half_res`
+  default on; both off by default, and off under Original experience;
+  `MP_SSAO=0|1` and `MP_SSR=0|1` switch them for one run without saving).
+  Drawn by `GXPortScreenSpace` (`extern/aurora/lib/gfx/screenspace.cpp`) right
+  after the opaque world, sky and render-first actors, before the volumetric
+  fog, transparents and particles. Neither has material data to work from: view
+  positions come from the depth buffer and the projection, normals from the
+  neighbouring depths, and how much a surface reflects is the strength times
+  Schlick's Fresnel. SSAO takes 16 hemisphere samples with a range check; SSR
+  marches the reflected view ray (32 steps, then bisection) and reflects only
+  what is on screen, fading towards the frame's edges. Both use a 4x4 ordered
+  noise pattern that a depth-aware 4x4 filter averages out as it upsamples.
+  Floors only reflects surfaces within about 35 degrees of up. Actors drawn in
+  the sorted pass (enemies, Samus in morph ball, doors) neither receive nor
+  cast the occlusion, and transparent surfaces such as water don't reflect,
+  since neither is in the depth buffer yet when the passes run. Off in the
+  thermal and X-ray visors. Needs WebGPU's core features: on a device without
+  them (some OpenGL ES drivers) the overlay says so and the passes are skipped.
+  The overlay's Debug view shows either effect on its own for tuning.
 - HUD scale (Video > Display and pause Options > Display, persisted as `hud_scale`,
   50-100 percent, default 100): shrinks the combat HUD, radar, beam and visor
   menus and the minimap toward the screen centre, each frame as a whole so the

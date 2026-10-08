@@ -2,6 +2,7 @@
 
 #include "../gfx/bloom.hpp"
 #include "../gfx/volfog.hpp"
+#include "../gfx/screenspace.hpp"
 #include "../gfx/depth_peek.hpp"
 #include "../gfx/probe.hpp"
 #include "../gfx/shadow.hpp"
@@ -1269,6 +1270,14 @@ void handle_aurora(ByteReader& reader) noexcept {
       // A new froxel texture when the frame's size changed.
       g_gxState.dirty |= DirtyTextures;
     }
+  } else if (subCmd == GX_AURORA_PORT_SCREEN_SPACE) {
+    gfx::screenspace::Params params;
+    u32 words[sizeof(params) / sizeof(u32)];
+    for (u32& word : words) {
+      word = reader.read<u32>();
+    }
+    std::memcpy(&params, words, sizeof(params));
+    gfx::screenspace::record(params);
   } else if (subCmd == GX_AURORA_PORT_VOLUMETRIC_FOG_END) {
     if (g_gxState.volFog) {
       g_gxState.volFog = false;

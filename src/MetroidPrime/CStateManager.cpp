@@ -2971,6 +2971,57 @@ static void PortDrawVolumetricFog(const CStateManager& mgr, const CTransform4f& 
   GXPortVolumetricFog(&p);
 }
 
+// Screen-space ambient occlusion and reflections over the opaque world drawn so far
+// (GXPortScreenSpace), before the fog so that the fog is not occluded. Off in the thermal and
+// X-ray visors, which recolour the world, and in the debug views that replace it.
+static void PortDrawScreenSpace(const CStateManager& mgr, const CTransform4f& view) {
+  const PortDebug::ScreenSpaceSettings ss = PortDebug::ScreenSpace();
+  if (!ss.ao && !ss.ssr) {
+    return;
+  }
+  const CPlayerState::EPlayerVisor visor = mgr.GetPlayerState()->GetActiveVisor(mgr);
+  if (visor == CPlayerState::kPV_Thermal || visor == CPlayerState::kPV_XRay ||
+      CCubeMaterial::sPortCapturingProbe || PortCollisionView::Only()) {
+    return;
+  }
+  GXPortScreenSpaceParams p;
+  memset(&p, 0, sizeof(p));
+  const CGraphics::CProjectionState& proj = CGraphics::GetProjectionState();
+  const float zNear = proj.GetNear();
+  if (!(zNear > 0.f) || !(proj.GetFar() > zNear)) {
+    return;
+  }
+  p.frustum[0] = proj.GetLeft() / zNear;
+  p.frustum[1] = proj.GetRight() / zNear;
+  p.frustum[2] = proj.GetBottom() / zNear;
+  p.frustum[3] = proj.GetTop() / zNear;
+  p.depth[0] = zNear;
+  p.depth[1] = proj.GetFar();
+  // SetupViewForDraw's depth range, as the volumetric fog has it.
+  p.depth[2] = 0.125f;
+  p.depth[3] = 1.f;
+  // The world's up (+z) in GX view space (right, up, towards the camera): the third row of
+  // view -> world, as PortDrawVolumetricFog builds it, read as a column.
+  p.up[0] = view.Get20();
+  p.up[1] = view.Get22();
+  p.up[2] = -view.Get21();
+  p.ao[0] = ss.aoRadius;
+  p.ao[1] = ss.aoIntensity;
+  p.ao[2] = 60.f;   // faded out by here, where the samples become sub-pixel
+  p.ao[3] = 0.002f; // the samples' lift off the surface, per unit of distance
+  p.ssr[0] = ss.ssrStrength;
+  p.ssr[1] = 24.f; // the ray's length
+  p.ssr[2] = 0.6f; // how thick a surface is taken to be
+  // Floors only: within about 35 degrees of up. Else anything but ceilings.
+  p.ssr[3] = ss.ssrFloorsOnly ? 0.82f : -0.3f;
+  p.flags = (ss.ao ? GX_PORT_SS_AO : 0) | (ss.ssr && ss.ssrStrength > 0.f ? GX_PORT_SS_SSR : 0) |
+            (ss.halfRes ? GX_PORT_SS_HALF_RES : 0) |
+            (ss.debugView == 1   ? GX_PORT_SS_SHOW_AO
+             : ss.debugView == 2 ? GX_PORT_SS_SHOW_SSR
+                                 : 0);
+  GXPortScreenSpace(&p);
+}
+
 void CStateManager::PortCaptureProbeFace() const {
   if (CCubeMaterial::sPortPBRProbeMode < 0) {
     const char* const env = getenv("MP_PBR_PROBE");
@@ -3285,6 +3336,9 @@ void CStateManager::DrawWorld() const {
   }
 
 #ifdef TARGET_PC
+  if (!portCollisionOnly) {
+    PortDrawScreenSpace(*this, backupViewMatrix);
+  }
   // Remastered fogs the opaque world and sky full-screen, then the actors and transparents as
   // they draw (up to GXPortVolumetricFogEnd).
   PortDrawVolumetricFog(*this, backupViewMatrix, frustum);
