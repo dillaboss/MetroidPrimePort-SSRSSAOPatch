@@ -5,6 +5,7 @@
 #include "gx/gx.hpp"
 #include "gfx/bloom.hpp"
 #include "gfx/volfog.hpp"
+#include "gfx/screenspace.hpp"
 #include "gfx/shadow.hpp"
 #include "gfx/clear.hpp"
 #include "gfx/resources.hpp"
@@ -298,6 +299,13 @@ bool ensure_task() { return false; }
 bool record(const Params& params) { return false; }
 void shutdown() {}
 } // namespace aurora::gfx::volfog
+
+namespace aurora::gfx::screenspace {
+bool supported() noexcept { return false; }
+bool ensure_task() { return false; }
+bool record(const Params& params) { return false; }
+void shutdown() {}
+} // namespace aurora::gfx::screenspace
 
 namespace aurora::gfx::shadow {
 bool ensure_task() { return false; }
