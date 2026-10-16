@@ -69,6 +69,7 @@ public:
   }
   int GetMusicVolume() const { return x5c_musicVol; }
   int GetSfxVolume() const { return x58_sfxVol; }
+  CAudioSys::ESurroundModes GetSurroundMode() const { return static_cast<CAudioSys::ESurroundModes>(x44_soundMode); }
   const float GetHudAlpha() const;
   int GetHUDAlpha() const { return x60_hudAlpha; }
   const float GetHelmetAlpha() const;
@@ -108,6 +109,12 @@ private:
   bool x68_26_rumble : 1;
   bool x68_27_swapBeamsControls : 1;
   bool x68_28_hintSystem : 1;
+#ifdef TARGET_PC
+  // PAL's sixth option flag (option 4, after the swap-beams flag): default off,
+  // no menu row; only the PAL world draw (0x801ff0b4) reads it, to pick its
+  // draw masks. Kept so a PAL save round-trips; the port never acts on it.
+  bool x68_29_palFlag : 1;
+#endif
   rstl::vector< rstl::pair< CAssetId, CAssetId > > x6c_controlTxtrMap;
 };
 

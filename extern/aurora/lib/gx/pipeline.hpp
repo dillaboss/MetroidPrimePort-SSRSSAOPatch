@@ -33,10 +33,16 @@ struct PipelineConfig {
   uint32_t polygonOffsetScaleBits;
   uint32_t polygonOffsetClampBits;
   // 1: the sun's shadow-map pipeline of a ShaderConfig::shadow draw (vs_shadow, depth only).
+  // 2: the same with the draw's cut test (vs_shadow_cut, fs_shadow; the colour pass's group 2 and layout).
   uint32_t shadowPass = 0;
   bool depthCompare, depthUpdate, alphaUpdate, colorUpdate;
 };
 static_assert(std::has_unique_object_representations_v<PipelineConfig>);
+
+constexpr bool pipeline_config_compatible(const PipelineConfig& config, bool lightmapBinding) noexcept {
+  const auto& shader = config.shaderConfig;
+  return shader.pbr == 0 || shader.pbrLightmapAttr == GX_VA_NULL || lightmapBinding;
+}
 
 wgpu::RenderPipeline create_pipeline([[maybe_unused]] const PipelineConfig& config);
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);

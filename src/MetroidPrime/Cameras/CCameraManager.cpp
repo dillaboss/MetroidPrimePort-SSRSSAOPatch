@@ -1,6 +1,8 @@
 #include "MetroidPrime/Cameras/CCameraManager.hpp"
 
 #include "port_debug.h"
+#include "port_presentation_rules.h"
+#include "MetroidPrime/CActor.hpp"
 #include "port_room_liquid.h"
 
 #include "Kyoto/Math/CQuaternion.hpp"
@@ -47,8 +49,12 @@ float CCameraManager::sMaxShakeVolume = 127.f;
 namespace {
 const CCameraManager* sCameraSnapshotOwner = nullptr;
 TUniqueId sCameraSnapshotId = kInvalidUniqueId;
+// Tick generation (CActor::PortTickGeneration) that wrote the snapshot.
+uint sCameraSnapshotGeneration = 0;
 CTransform4f sPreviousCameraTransform = CTransform4f::Identity();
 CTransform4f sCurrentCameraTransform = CTransform4f::Identity();
+// Squared translation of the current camera over the last tick.
+float sCameraLastStep2 = 0.f;
 float sPresentationInterpolation = -1.f;
 
 CTransform4f InterpolateCameraTransform(const CTransform4f& previous,
@@ -361,11 +367,17 @@ void CCameraManager::Update(float dt, CStateManager& mgr) {
       GetCurrentCamera(mgr).GetTransform() * CTransform4f::Translate(x30_shakeOffset);
   const CQuaternion previousRotation = CQuaternion::FromMatrix(previousTransform);
   const CQuaternion currentRotation = CQuaternion::FromMatrix(currentTransform);
+  const float step2 =
+      (currentTransform.GetTranslation() - previousTransform.GetTranslation()).MagSquared();
+  const bool sameCamera = sCameraSnapshotOwner == this && previousId == currentId;
+  // A fast chase camera (Meta Ridley's fly-in, issue #99) moves over 4 units a
+  // tick; only a jump well past the last tick's step is a cut.
   const bool discontinuity =
-      (currentTransform.GetTranslation() - previousTransform.GetTranslation()).MagSquared() > 16.f ||
+      PortIsTeleport(step2, sameCamera ? sCameraLastStep2 : 0.f) ||
       (!mgr.GetPlayer()->MouseLookIsFree(mgr) &&
        fabsf(CQuaternion::Dot(previousRotation, currentRotation)) < 0.9238795f);
-  if (sCameraSnapshotOwner != this || previousId != currentId || discontinuity) {
+  sCameraLastStep2 = sameCamera ? step2 : 0.f;
+  if (!sameCamera || discontinuity) {
     sPreviousCameraTransform = currentTransform;
   } else {
     sPreviousCameraTransform = previousTransform;
@@ -373,6 +385,7 @@ void CCameraManager::Update(float dt, CStateManager& mgr) {
   sCurrentCameraTransform = currentTransform;
   sCameraSnapshotOwner = this;
   sCameraSnapshotId = currentId;
+  sCameraSnapshotGeneration = CActor::PortTickGeneration();
 }
 
 void CCameraManager::SetInsideFluid(bool isInside, TUniqueId fluidId) {
@@ -512,7 +525,8 @@ void CCameraManager::RemoveCameraShaker(int id) {
 
 CTransform4f CCameraManager::GetCurrentCameraTransform(const CStateManager& mgr) const {
   if (sPresentationInterpolation >= 0.f && sCameraSnapshotOwner == this &&
-      sCameraSnapshotId == GetCurrentCameraId()) {
+      sCameraSnapshotId == GetCurrentCameraId() &&
+      PortSnapshotFresh(sCameraSnapshotGeneration, CActor::PortTickGeneration())) {
     CTransform4f presentation = InterpolateCameraTransform(sPreviousCameraTransform, sCurrentCameraTransform,
                                                            sPresentationInterpolation);
     if (mgr.GetPlayer()->MouseLookIsFree(mgr)) {
@@ -522,6 +536,8 @@ CTransform4f CCameraManager::GetCurrentCameraTransform(const CStateManager& mgr)
       CTransform4f latest = sCurrentCameraTransform;
       // Look input that arrived since the tick is shown now; the next tick
       // applies the same delta before it fires, so the view shows the shot.
+      // The twin stick is the exception: its turn is drawn after its tick,
+      // trailing the shot by up to one tick (docs/FRAME_INTERPOLATION.md 4).
       CTransform4f look = CTransform4f::Identity();
       if (GetPresentedLookRotation(mgr, look)) {
         latest = look * latest.GetRotation();
@@ -539,7 +555,9 @@ bool CCameraManager::GetPresentedLookRotation(const CStateManager& mgr,
   float dyaw = 0.f;
   float dpitch = 0.f;
   if (sPresentationInterpolation < 0.f || sCameraSnapshotOwner != this ||
-      sCameraSnapshotId != GetCurrentCameraId() || !mgr.GetPlayer()->MouseLookIsFree(mgr) ||
+      sCameraSnapshotId != GetCurrentCameraId() ||
+      !PortSnapshotFresh(sCameraSnapshotGeneration, CActor::PortTickGeneration()) ||
+      !mgr.GetPlayer()->MouseLookIsFree(mgr) ||
       !PortDebug::PresentedAimDelta(sPresentationInterpolation, dyaw, dpitch)) {
     return false;
   }

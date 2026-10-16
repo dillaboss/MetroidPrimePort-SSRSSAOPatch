@@ -13,23 +13,36 @@ struct Output {
   bool pressed; // the press edge (CFinalInput's P* flags)
 };
 
-// Toggle lock-on: a press latches L as held until the next press, so lock-on,
-// scanning, strafing and the grapple beam work without holding the trigger. The
-// latch also lets go by itself when a lock the player had ends (target killed or
-// out of range), since a latched L would otherwise keep Samus strafing.
+// Toggle lock-on: a press that locks on (or scans, or grapples) latches L as
+// held until the next press, so those work without holding the trigger. A press
+// with nothing to lock on is a plain hold (strafe while held), and only latches
+// if a lock comes during that hold. The latch also lets go by itself when its
+// lock ends (target killed or out of range), since a latched L would otherwise
+// keep Samus strafing.
 class Toggle {
 public:
   // active: gameplay has control and the option applies (unmorphed, input not
   // disabled). locked: the player was locked on an object or grappling at the end
   // of the previous tick (orbiting a carcass or a point is not a lock).
-  Output Update(bool active, bool held, bool pressed, bool locked) {
+  //
+  // dt: seconds since the last call. A press within kDebounce of the press that
+  // ended the latch is contact bounce (an analog trigger crossing its threshold
+  // again while being released) and is swallowed instead of locking again.
+  static constexpr float kDebounce = 0.2f;
+
+  Output Update(bool active, bool held, bool pressed, bool locked, float dt = 0.f) {
     if (!active) {
       Reset();
       return {held, pressed};
     }
+    mDebounce = mDebounce > dt ? mDebounce - dt : 0.f;
     if (mLatched && mWasLocked && !locked) {
       mLatched = false;
       mSwallow = held; // the finger may still be on the button
+    }
+    if (mPending && held && !pressed && locked) {
+      mPending = false;
+      mLatched = true;
     }
     mWasLocked = mLatched && locked;
     if (mSwallow) {
@@ -42,27 +55,35 @@ public:
       if (pressed) {
         mLatched = false;
         mSwallow = true;
+        mDebounce = dt > 0.f ? kDebounce : 0.f;
         return {false, false};
       }
       return {true, false};
     }
-    if (pressed) {
-      mLatched = true;
-      return {true, true};
+    if (pressed && mDebounce > 0.f) {
+      mSwallow = true;
+      mDebounce = kDebounce;
+      return {false, false};
     }
-    return {false, false};
+    // Not latched: the button passes through, and a press waits for its lock.
+    mPending = held && (pressed || mPending);
+    return {held, pressed};
   }
   void Reset() {
     mLatched = false;
     mSwallow = false;
     mWasLocked = false;
+    mPending = false;
+    mDebounce = 0.f;
   }
   bool Latched() const { return mLatched; }
 
 private:
+  float mDebounce = 0.f; // time left in which a new press counts as bounce
   bool mLatched = false;
   bool mSwallow = false; // a press that ended the latch, hidden until released
   bool mWasLocked = false;
+  bool mPending = false; // held since a press, no lock yet
 };
 
 // Sticky charge: taps fire as usual, but letting go of a button held for at

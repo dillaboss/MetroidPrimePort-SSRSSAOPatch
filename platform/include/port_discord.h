@@ -1,5 +1,7 @@
 #pragma once
 
+#include "port_strings.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -70,23 +72,7 @@ inline bool TakeFrame(std::string& buffer, Frame& out, bool& bad) {
 }
 
 // A JSON string literal, quotes included. Input is UTF-8 and passes through.
-inline std::string JsonString(const std::string& text) {
-  std::string out = "\"";
-  for (const char c : text) {
-    const unsigned char u = static_cast<unsigned char>(c);
-    if (c == '"' || c == '\\') {
-      out += '\\';
-      out += c;
-    } else if (u < 0x20) {
-      char escape[8];
-      std::snprintf(escape, sizeof(escape), "\\u%04x", u);
-      out += escape;
-    } else {
-      out += c;
-    }
-  }
-  return out + "\"";
-}
+inline std::string JsonString(const std::string& text) { return port::JsonQuote(text); }
 
 // Discord takes 2 to 128 characters in details/state; longer text is cut on a
 // UTF-8 boundary and a single character is padded.

@@ -236,6 +236,48 @@ std::u16string MessageWords(const std::u16string& text) {
 
 size_t CountBreaks(const std::u16string& text) { return size_t(std::count(text.begin(), text.end(), u'\n')); }
 
+// A text's words as tokens: lower case, letters and digits only.
+std::vector<std::u16string> Tokens(const std::u16string& words) {
+  std::vector<std::u16string> tokens(1);
+  for (const char16_t c : words) {
+    if (c == u' ') {
+      if (!tokens.back().empty()) {
+        tokens.emplace_back();
+      }
+    } else if ((c >= u'0' && c <= u'9') || (c >= u'a' && c <= u'z') || c >= 0x80) {
+      tokens.back().push_back(c);
+    } else if (c >= u'A' && c <= u'Z') {
+      tokens.back().push_back(char16_t(c - u'A' + u'a'));
+    }
+  }
+  if (tokens.back().empty()) {
+    tokens.pop_back();
+  }
+  return tokens;
+}
+
+// Whether two strings say the same thing: the same tokens when short, else at
+// least 3/4 of them in common, in order (Remastered rewords a little, a PAL
+// disc rewrote some logs outright).
+bool SameText(const std::vector<std::u16string>& a, const std::vector<std::u16string>& b) {
+  if (a.empty() || b.empty()) {
+    return false;
+  }
+  if (a.size() < 4 || b.size() < 4) {
+    return a == b;
+  }
+  std::vector<size_t> row(b.size() + 1, 0);
+  for (size_t i = 0; i < a.size(); ++i) {
+    size_t diagonal = 0;
+    for (size_t j = 0; j < b.size(); ++j) {
+      const size_t up = row[j + 1];
+      row[j + 1] = a[i] == b[j] ? diagonal + 1 : std::max(row[j], up);
+      diagonal = up;
+    }
+  }
+  return 4 * 2 * row[b.size()] >= 3 * (a.size() + b.size());
+}
+
 constexpr uint32_t FourCc(const char* code) {
   return uint32_t(uint8_t(code[0])) << 24 | uint32_t(uint8_t(code[1])) << 16 | uint32_t(uint8_t(code[2])) << 8 |
          uint32_t(uint8_t(code[3]));
@@ -359,6 +401,23 @@ bool ConvertText(const std::u16string& remastered, const std::u16string& retail,
   return true;
 }
 
+// Remastered's own button glyph for START (cd17), and the coloured door glyphs
+// it draws before a door's name (cd37 wave, cd38 plasma, and the door textures).
+constexpr char16_t kStartButton = 0xCD17;
+
+// `count` is the payload's length in units.
+bool IsDoorGlyph(unsigned group, unsigned type, const char16_t* payload, size_t count) {
+  if (group == 1 && type == 0) {
+    return count >= 1 && (payload[0] == 0xCD37 || payload[0] == 0xCD38);
+  }
+  if (group == 1 && type == 1) {
+    // "TXTR_WhiteDoor": a texture name after a length unit.
+    const std::u16string name(payload, count);
+    return name.find(u"TXTR_") != std::u16string::npos && name.find(u"Door") != std::u16string::npos;
+  }
+  return false;
+}
+
 bool TranslateText(const std::u16string& remastered, const std::u16string& retail, const std::u16string& english,
                    std::u16string& out) {
   // The disc's button images, in the order its string shows them.
@@ -391,6 +450,14 @@ bool TranslateText(const std::u16string& remastered, const std::u16string& retai
         AppendColour(payload, body, coloured);
       } else if ((group == 0 && type == 2) || (group == 1 && type == 3)) {
         // A size and a layout mode, as in ConvertText.
+      } else if (IsDoorGlyph(group, type, payload, units - 3)) {
+        // Remastered's door icon: the disc names the door in colour only. Its space goes too.
+        if (i + 1 < remastered.size() && remastered[i + 1] == u' ') {
+          ++i;
+        }
+      } else if (group == 1 && type == 0 && image == images.size() && units == 4 && payload[0] == kStartButton &&
+                 retail.find(u"START") != std::u16string::npos) {
+        body += u"START";  // the disc prints the button's name as plain text
       } else if (group == 1 && (type == 0 || type == 1) && image < images.size()) {
         body += images[image++];  // a button or an icon, where the disc shows its own
       } else {
@@ -433,8 +500,44 @@ bool TranslateText(const std::u16string& remastered, const std::u16string& retai
   return true;
 }
 
-bool MergeStringTable(const uint8_t* retail, size_t size, const TableText& text, std::vector<uint8_t>& out,
-                      int& reworded, int& translated) {
+// Strings whose English differs from the disc's, so the wording match misses
+// them: Remastered's name for the 1.00 index. Each pair was read against both
+// English texts. The 1.00 tables only: another version's indices move.
+struct NamedIndex {
+  uint32_t strg;
+  const char* name;
+  uint32_t index;
+};
+constexpr NamedIndex kNamedIndices[] = {
+    {0x0552A456, "HyperMode", 21},
+    {0x0552A456, "ThardusBoost", 104},
+    {0x0552A456, "FirstPowerBombPickup", 109},
+    {0x500EC6A0, "PowerBeamCombo", 41},
+    {0x500EC6A0, "CombatVisorDescription", 66},
+    {0x500EC6A0, "ScanVisorDescription", 67},
+    {0x500EC6A0, "XRayVisorDescription", 68},
+    {0x500EC6A0, "ThermoVisorDescription", 69},
+    {0x500EC6A0, "PowerBeamDescription", 70},
+    {0x500EC6A0, "IceBeamDescription", 72},
+    {0x500EC6A0, "WaveBeamDescription", 74},
+    {0x500EC6A0, "WaveBeamComboDescription", 75},
+    {0x500EC6A0, "PlasmaBeamDescription", 76},
+    {0x500EC6A0, "SpaceJumpBootsDescription", 79},
+    {0x500EC6A0, "GrappleBeamDescription", 80},
+    {0x500EC6A0, "MissileLauncherDescription", 81},
+    {0x500EC6A0, "VariaSuitDescription", 83},
+    {0x500EC6A0, "GravitySuitDescription", 84},
+    {0x500EC6A0, "PhazonSuitDescription", 85},
+    {0x500EC6A0, "EnergyTankDescription", 86},
+    {0x500EC6A0, "BoostBallDescription", 88},
+    {0x500EC6A0, "BombDescription", 90},
+    {0x500EC6A0, "PowerBombDescription", 91},
+    {0x500EC6A0, "ChargeBeamDescription", 92},
+    {0x500EC6A0, "BeamComboDescription", 93},
+};
+
+bool MergeStringTable(const uint8_t* retail, size_t size, const TableText& text, bool checkWording,
+                      std::vector<uint8_t>& out, int& reworded, int& translated, uint32_t strgId) {
   reworded = 0;
   translated = 0;
   if (size < 16 || ReadBE32(retail) != kStrgMagic || ReadBE32(retail + 4) != 0) {
@@ -486,15 +589,89 @@ bool MergeStringTable(const uint8_t* retail, size_t size, const TableText& text,
   // without its brackets.
   std::vector<const std::map<std::string, std::u16string>*> versions(count, nullptr);
   std::vector<bool> bracketed(count, false);
-  for (const auto& [index, byLanguage] : text.byIndex) {
-    if (index < count) {
-      versions[index] = &byLanguage;
-    }
-  }
   std::vector<std::u16string> discWords;
-  if (!text.byName.empty()) {
+  if (!text.byName.empty() || checkWording) {
     for (size_t s = 0; s < count; ++s) {
       discWords.push_back(Words(disc[s], true));
+    }
+  }
+  // Remastered's indices are 1.00's. Another version keeps them unless it moved
+  // a table's strings (PAL inserted some into the pause screen's): there each
+  // string goes where its wording is, and one Remastered reworded moves as the
+  // nearest string before it does.
+  std::vector<std::pair<uint32_t, const std::map<std::string, std::u16string>*>> entries;
+  for (const auto& [index, byLanguage] : text.byIndex) {
+    entries.emplace_back(index, &byLanguage);
+  }
+  std::vector<long> placed(entries.size(), -1);
+  bool moved = false;
+  if (checkWording) {
+    std::vector<std::vector<std::u16string>> discTokens;
+    for (const std::u16string& words : discWords) {
+      discTokens.push_back(Tokens(words));
+    }
+    std::vector<std::vector<std::u16string>> tokens;
+    for (const auto& [index, byLanguage] : entries) {
+      const auto found = byLanguage->find(kRemasteredEnglish);
+      tokens.push_back(found != byLanguage->end() ? Tokens(MessageWords(found->second))
+                                                  : std::vector<std::u16string>());
+    }
+    std::vector<bool> taken(count, false);
+    for (size_t e = 0; e < entries.size(); ++e) {
+      const uint32_t index = entries[e].first;
+      if (index < count && SameText(tokens[e], discTokens[index])) {
+        placed[e] = long(index);
+        taken[index] = true;
+      }
+    }
+    for (size_t e = 0; e < entries.size(); ++e) {
+      for (size_t s = 0; s < count && placed[e] < 0; ++s) {
+        if (!taken[s] && SameText(tokens[e], discTokens[s])) {
+          placed[e] = long(s);
+          taken[s] = true;
+          moved = moved || tokens[e].size() >= 4;  // a sentence, not a word two strings share
+        }
+      }
+    }
+    for (size_t e = 0; moved && e < entries.size(); ++e) {
+      if (placed[e] >= 0) {
+        continue;
+      }
+      long shift = 0;
+      bool anchored = false;
+      for (size_t k = e; k-- > 0 && !anchored;) {
+        if (placed[k] >= 0) {
+          shift = placed[k] - long(entries[k].first);
+          anchored = true;
+        }
+      }
+      for (size_t k = e + 1; k < entries.size() && !anchored; ++k) {
+        if (placed[k] >= 0) {
+          shift = placed[k] - long(entries[k].first);
+          anchored = true;
+        }
+      }
+      const long at = long(entries[e].first) + shift;
+      if (at >= 0 && at < long(count) && !taken[at]) {
+        placed[e] = at;
+        taken[at] = true;
+      }
+    }
+  }
+  for (size_t e = 0; e < entries.size(); ++e) {
+    if (moved && placed[e] >= 0) {
+      versions[placed[e]] = entries[e].second;
+    } else if (!moved && entries[e].first < count) {
+      versions[entries[e].first] = entries[e].second;
+    }
+  }
+  if (!checkWording) {
+    for (const NamedIndex& named : kNamedIndices) {
+      const auto at = text.byName.find(named.name);
+      if (named.strg == strgId && named.index < count && versions[named.index] == nullptr &&
+          at != text.byName.end() && at->second.count(kRemasteredEnglish) != 0) {
+        versions[named.index] = &at->second;
+      }
     }
   }
   for (const auto& [name, byLanguage] : text.byName) {
@@ -525,13 +702,30 @@ bool MergeStringTable(const uint8_t* retail, size_t size, const TableText& text,
       ++reworded;
     }
   }
-  // A language starts as the English, so a string without a translation stays readable.
+  // A language starts as the disc's own section for it (PAL's FREN for EUFR), else
+  // the English, so a string without a translation stays readable.
+  static const struct {
+    const char* remastered;
+    uint32_t disc;
+  } kDiscSections[] = {
+      {"EUFR", FourCc("FREN")}, {"USFR", FourCc("FREN")}, {"EUGE", FourCc("GERM")},
+      {"EUSP", FourCc("SPAN")}, {"USSP", FourCc("SPAN")}, {"EUIT", FourCc("ITAL")},
+  };
   for (size_t k = 0; k < kTextLanguageCount; ++k) {
     const uint32_t code = FourCc(kTextLanguages[k].code);
     if (std::find(codes.begin(), codes.end(), code) != codes.end()) {
       continue;
     }
-    std::vector<std::u16string> strings = tables[english];
+    size_t base = english;
+    for (const auto& section : kDiscSections) {
+      if (std::strcmp(section.remastered, kTextLanguages[k].code) == 0) {
+        const auto at = std::find(codes.begin(), codes.end(), section.disc);
+        if (at != codes.end()) {
+          base = size_t(at - codes.begin());
+        }
+      }
+    }
+    std::vector<std::u16string> strings = tables[base];
     int done = 0;
     for (size_t s = 0; s < count; ++s) {
       if (versions[s] == nullptr) {

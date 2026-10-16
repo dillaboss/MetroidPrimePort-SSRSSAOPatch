@@ -47,6 +47,8 @@ enum Item : int {
   kWavebuster = 28,
   kArtifactFirst = 29,
   kArtifactLast = 40,
+  kUnlimitedMissiles = 41,
+  kUnlimitedPowerBombs = 42,
   kLauncher = 43,
   kMainPb = 44,
   kProgPower = 49,
@@ -163,11 +165,19 @@ uint64_t HashInput(const Settings& s, const std::string& seedText) {
   for (const std::string& name : s.trickDeny)
     h.Add(name);
   h.Add(s.flaahgraPowerBombs);
+  // Only a changed capacity enters the hash, so older seeds keep their text.
+  if (s.etankCapacity != 100)
+    h.Add(s.etankCapacity);
   h.Add(s.backwardsLowerMines);
   h.Add(s.removeXray);
   h.Add(s.removeThermal);
   h.Add(s.removeHiveMecha);
   h.Add(s.springBall);
+  // Off leaves the hash as it was, so older seeds keep their text.
+  if (s.shuffleUnlimitedMissiles)
+    h.Add(std::string("shuffle_unlimited_missiles"));
+  if (s.shuffleUnlimitedPowerBombs)
+    h.Add(std::string("shuffle_unlimited_power_bombs"));
   h.Add(s.startingRoom);
   h.Add(s.randomizeStartingBeam);
   h.Add(s.blastShieldRandomization);
@@ -741,6 +751,7 @@ PortApWorld::Layout MakeLayout(const Settings& s, const Start& start, const Elev
       s.removeHiveMecha || ((room == "Landing Site" || room == "Save Station 1") && start.beam != kPower);
   layout.backwardsLowerMines = s.backwardsLowerMines;
   layout.flaahgraPowerBombs = s.flaahgraPowerBombs;
+  layout.etankCapacity = s.etankCapacity;
   return layout;
 }
 
@@ -843,6 +854,10 @@ std::vector< PoolItem > BuildPool(const Settings& s, const std::vector< int >& p
     for (const int id : {kPower, kWave, kIce, kPlasma, kCharge, kSuper, kWavebuster, kIceSpreader, kFlamethrower})
       items.push_back({id, true});
   }
+  if (s.shuffleUnlimitedMissiles)
+    items.push_back({kUnlimitedMissiles, false});
+  if (s.shuffleUnlimitedPowerBombs)
+    items.push_back({kUnlimitedPowerBombs, false});
   const auto remove = [&items](int id) {
     for (size_t i = 0; i < items.size(); ++i) {
       if (items[i].id == id) {
@@ -994,10 +1009,13 @@ std::string SlotData(const Settings& s, const Attempt& a, const std::vector< int
        << ",\"trick_difficulty\":" << s.trickDifficulty << ",\"combat_logic_difficulty\":" << s.combatLogic
        << ",\"remove_xray_requirements\":" << s.removeXray << ",\"remove_thermal_requirements\":" << s.removeThermal
        << ",\"flaahgra_power_bombs\":" << flag(s.flaahgraPowerBombs)
+       << ",\"etank_capacity\":" << s.etankCapacity
        << ",\"non_varia_heat_damage\":" << flag(s.nonVariaHeatDamage)
        << ",\"staggered_suit_damage\":" << s.staggeredSuitDamage
        << ",\"backwards_lower_mines\":" << flag(s.backwardsLowerMines)
        << ",\"remove_hive_mecha\":" << flag(a.layout.removeHiveMecha) << ",\"spring_ball\":" << flag(s.springBall)
+       << ",\"shuffle_unlimited_missiles\":" << flag(s.shuffleUnlimitedMissiles)
+       << ",\"shuffle_unlimited_power_bombs\":" << flag(s.shuffleUnlimitedPowerBombs)
        << ",\"required_artifacts\":" << s.requiredArtifacts << ",\"final_bosses\":" << s.finalBosses
        << ",\"artifact_hints\":" << flag(s.artifactHints) << ",\"starting_room\":" << s.startingRoom
        << ",\"randomize_starting_beam\":" << flag(s.randomizeStartingBeam)
@@ -1312,6 +1330,7 @@ bool Generate(const Settings& settings, const std::string& seedText, Seed& out, 
   s.finalBosses = std::clamp(s.finalBosses, 0, 3);
   s.doorColorRandomization = std::clamp(s.doorColorRandomization, 0, 2);
   s.combatLogic = std::clamp(s.combatLogic, -1, 1);
+  s.etankCapacity = std::clamp(s.etankCapacity, 10, 200);
   s.trickDifficulty = std::clamp(s.trickDifficulty, -1, 2);
   s.removeXray = std::clamp(s.removeXray, 0, 2);
   s.removeThermal = std::clamp(s.removeThermal, 0, 2);

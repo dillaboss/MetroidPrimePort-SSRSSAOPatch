@@ -145,9 +145,12 @@ bool Settings::operator==(const Settings& other) const {
          staggeredSuitDamage == other.staggeredSuitDamage && combatLogic == other.combatLogic &&
          trickDifficulty == other.trickDifficulty && trickAllow == other.trickAllow &&
          trickDeny == other.trickDeny && flaahgraPowerBombs == other.flaahgraPowerBombs &&
+         etankCapacity == other.etankCapacity &&
          backwardsLowerMines == other.backwardsLowerMines && removeXray == other.removeXray &&
          removeThermal == other.removeThermal && removeHiveMecha == other.removeHiveMecha &&
          springBall == other.springBall && startingRoom == other.startingRoom &&
+         shuffleUnlimitedMissiles == other.shuffleUnlimitedMissiles &&
+         shuffleUnlimitedPowerBombs == other.shuffleUnlimitedPowerBombs &&
          randomizeStartingBeam == other.randomizeStartingBeam &&
          blastShieldRandomization == other.blastShieldRandomization &&
          blastShieldFrequency == other.blastShieldFrequency &&
@@ -179,11 +182,14 @@ std::string SettingsText(const Settings& s) {
   out += ",\"trick_deny_list\":";
   NamesText(s.trickDeny, out);
   out += std::string(",\"flaahgra_power_bombs\":") + flag(s.flaahgraPowerBombs);
+  out += ",\"etank_capacity\":" + std::to_string(s.etankCapacity);
   out += std::string(",\"backwards_lower_mines\":") + flag(s.backwardsLowerMines);
   out += ",\"remove_xray_requirements\":" + std::to_string(s.removeXray);
   out += ",\"remove_thermal_requirements\":" + std::to_string(s.removeThermal);
   out += std::string(",\"remove_hive_mecha\":") + flag(s.removeHiveMecha);
   out += std::string(",\"spring_ball\":") + flag(s.springBall);
+  out += std::string(",\"shuffle_unlimited_missiles\":") + flag(s.shuffleUnlimitedMissiles);
+  out += std::string(",\"shuffle_unlimited_power_bombs\":") + flag(s.shuffleUnlimitedPowerBombs);
   out += ",\"starting_room\":" + std::to_string(s.startingRoom);
   out += std::string(",\"randomize_starting_beam\":") + flag(s.randomizeStartingBeam);
   out += ",\"blast_shield_randomization\":" + std::to_string(s.blastShieldRandomization);
@@ -218,11 +224,15 @@ void ReadSettings(const PortJson::Value& root, Settings& out) {
   NamesMember(root, "trick_allow_list", s.trickAllow);
   NamesMember(root, "trick_deny_list", s.trickDeny);
   s.flaahgraPowerBombs = BoolMember(root, "flaahgra_power_bombs", s.flaahgraPowerBombs);
+  s.etankCapacity = IntMember(root, "etank_capacity", s.etankCapacity, 10, 200);
   s.backwardsLowerMines = BoolMember(root, "backwards_lower_mines", s.backwardsLowerMines);
   s.removeXray = IntMember(root, "remove_xray_requirements", s.removeXray, 0, 2);
   s.removeThermal = IntMember(root, "remove_thermal_requirements", s.removeThermal, 0, 2);
   s.removeHiveMecha = BoolMember(root, "remove_hive_mecha", s.removeHiveMecha);
   s.springBall = BoolMember(root, "spring_ball", s.springBall);
+  s.shuffleUnlimitedMissiles = BoolMember(root, "shuffle_unlimited_missiles", s.shuffleUnlimitedMissiles);
+  s.shuffleUnlimitedPowerBombs =
+      BoolMember(root, "shuffle_unlimited_power_bombs", s.shuffleUnlimitedPowerBombs);
   s.startingRoom = IntMember(root, "starting_room", s.startingRoom, 0, 2);
   s.randomizeStartingBeam = BoolMember(root, "randomize_starting_beam", s.randomizeStartingBeam);
   s.blastShieldRandomization =

@@ -224,6 +224,22 @@ void TestTranslate() {
         "a button the disc lacks stays English");
   Check(!TranslateText(u"Dr\u00fccke", u"Press &image=SI,0.7,A;", u"Press", out),
         "an image the translation lacks stays English");
+  // Remastered's door icons are decoration: the disc names a door by its colour.
+  const std::u16string whiteDoor = Tag(1, 1, u"\u001cTXTR_WhiteDoor\u0001");
+  Check(TranslateText(u"Utilisez " + Tag(1, 0, {char16_t(0xCD08)}) + u" pour les " + whiteDoor + u" portes",
+                      u"Use &image=SA,3.0,0.6,1.0,1A29C0E6,951546A8; for Ice Doors", u"x", out) &&
+            out == u"Utilisez &image=SA,3.0,0.6,1.0,1A29C0E6,951546A8; pour les portes",
+        "a door icon is dropped with its space, the button keeps the disc's image");
+  Check(TranslateText(u"Onde " + Tag(1, 0, {char16_t(0xCD37)}) + u" portes", u"Wave Doors", u"x", out) &&
+            out == u"Onde portes",
+        "a door glyph button is dropped");
+  Check(!TranslateText(u"Onde " + Tag(1, 0, {char16_t(0xCD36)}) + u" portes", u"Wave Doors", u"x", out),
+        "another glyph the disc lacks stays English");
+  Check(TranslateText(u"Appuyez sur " + Tag(1, 0, {char16_t(0xCD17)}) + u".", u"Press START to access", u"x", out) &&
+            out == u"Appuyez sur START.",
+        "START as plain text where the disc prints it");
+  Check(!TranslateText(u"Appuyez sur " + Tag(1, 0, {char16_t(0xCD17)}) + u".", u"Press now", u"x", out),
+        "START stays a refusal where the disc does not print it");
   Check(TranslateText(u"Rouge " + kRed + u"vif", u"x", u"x", out) && out == u"Rouge &push;&main-color=#FF0A0AFF;vif&pop;",
         "a colour run is kept");
   Check(!TranslateText(u"A & B", u"x", u"x", out), "an ampersand stays English");
@@ -249,7 +265,7 @@ void TestMerge() {
   std::vector<uint8_t> merged;
   int reworded = 0;
   int translated = 0;
-  Check(MergeStringTable(retail.data(), retail.size(), text, merged, reworded, translated) && reworded == 1 &&
+  Check(MergeStringTable(retail.data(), retail.size(), text, false, merged, reworded, translated) && reworded == 1 &&
             translated == 0,
         "one string changes");
   Check(merged.size() % 32 == 0, "the table is padded to a block");
@@ -262,21 +278,36 @@ void TestMerge() {
   text.byIndex[1]["EUFR"] = u"seconde";
   text.byName["Third"]["USEN"] = u"three";
   text.byName["Third"]["EUFR"] = u"troisi\u00e8me";
-  Check(MergeStringTable(retail.data(), retail.size(), text, merged, reworded, translated) && reworded == 1 &&
+  Check(MergeStringTable(retail.data(), retail.size(), text, false, merged, reworded, translated) && reworded == 1 &&
             translated == 2,
         "two strings are translated");
   expect = Strg({{0x4652454E, {u"un", u"deux", u"trois"}},
                  {english, {u"one", u"&just=center;second", u"three"}},
-                 {french, {u"one", u"&just=center;seconde", u"troisi\u00e8me"}}});
+                 {french, {u"un", u"&just=center;seconde", u"troisi\u00e8me"}}});
   Check(merged.size() >= expect.size() && std::memcmp(merged.data(), expect.data(), expect.size()) == 0,
-        "a language is added, English where it has no translation");
+        "a language is added, the disc's own French where it has no translation");
+
+  // An explicit name -> index pair (1.00 only) places a string whose English was reworded.
+  std::vector<std::u16string> hyperStrings(22, u"filler");
+  hyperStrings[21] = u"&just=center;Hyper-mode";
+  const std::vector<uint8_t> hyper = Strg({{english, hyperStrings}});
+  TableText named;
+  named.byName["HyperMode"]["USEN"] = u"Hypermode";
+  named.byName["HyperMode"]["EUFR"] = u"Hypermode FR";
+  Check(MergeStringTable(hyper.data(), hyper.size(), named, false, merged, reworded, translated, 0x0552A456) &&
+            translated == 1 && reworded == 1,
+        "HyperMode is placed at index 21 of 0552A456 only...");
+  Check(!MergeStringTable(hyper.data(), hyper.size(), named, false, merged, reworded, translated, 0x500EC6A0),
+        "...and not in another table");
+  Check(!MergeStringTable(hyper.data(), hyper.size(), named, true, merged, reworded, translated, 0x0552A456),
+        "...nor on a disc whose indices move");
 
   // A screen title keeps the disc's brackets.
   const std::vector<uint8_t> titled = Strg({{english, {u"&just=center;[ Inventory ]"}}});
   TableText title;
   title.byName["InventoryScreenTitle"]["USEN"] = u"Inventory";
   title.byName["InventoryScreenTitle"]["EUGE"] = u"Inventar";
-  Check(MergeStringTable(titled.data(), titled.size(), title, merged, reworded, translated) && reworded == 0 &&
+  Check(MergeStringTable(titled.data(), titled.size(), title, false, merged, reworded, translated) && reworded == 0 &&
             translated == 1,
         "a bracketed title is matched by its words");
   expect = Strg({{english, {u"&just=center;[ Inventory ]"}}, {0x45554745, {u"&just=center;[ Inventar ]"}}});
@@ -285,12 +316,37 @@ void TestMerge() {
 
   text.byIndex.erase(1);
   text.byName.clear();
-  Check(!MergeStringTable(retail.data(), retail.size(), text, merged, reworded, translated) && reworded == 0,
+  Check(!MergeStringTable(retail.data(), retail.size(), text, false, merged, reworded, translated) && reworded == 0,
         "a table with nothing new is not written");
   text.byIndex[1]["USEN"] = u"second";
   for (size_t cut = 0; cut < retail.size(); ++cut) {
-    Check(!MergeStringTable(retail.data(), cut, text, merged, reworded, translated), "a table cut short is refused");
+    Check(!MergeStringTable(retail.data(), cut, text, false, merged, reworded, translated), "a table cut short is refused");
   }
+
+  // Another version's table: an inserted string moves 1.00's, and a rewritten one stays the disc's.
+  const std::vector<uint8_t> moved = Strg({{english,
+                                            {u"New", u"Morph Ball stored in the suit",
+                                             u"A log the PAL disc wrote again from the start here"}}});
+  TableText indexed;
+  indexed.byIndex[0]["USEN"] = u"Morph Ball kept in the suit";  // 1.00's index 0 is the disc's 1
+  indexed.byIndex[0]["EUFR"] = u"Boule";
+  indexed.byIndex[2]["USEN"] = u"An entirely different chozo lore entry for this one";
+  indexed.byIndex[2]["EUFR"] = u"Autre";
+  Check(MergeStringTable(moved.data(), moved.size(), indexed, true, merged, reworded, translated) && reworded == 1 &&
+            translated == 1,
+        "checked indices follow the wording");
+  expect = Strg({{english,
+                  {u"New", u"Morph Ball kept in the suit", u"A log the PAL disc wrote again from the start here"}},
+                 {french, {u"New", u"Boule", u"A log the PAL disc wrote again from the start here"}}});
+  Check(merged.size() >= expect.size() && std::memcmp(merged.data(), expect.data(), expect.size()) == 0,
+        "a moved string is found, a rewritten one is left, English where the disc has no French");
+
+  // A table the version kept as it was takes Remastered's renames by index.
+  const std::vector<uint8_t> kept = Strg({{english, {u"Metroid"}}});
+  TableText renamed;
+  renamed.byIndex[0]["USEN"] = u"Tallon Metroid";
+  Check(MergeStringTable(kept.data(), kept.size(), renamed, true, merged, reworded, translated) && reworded == 1,
+        "an unmoved table keeps its indices");
 }
 }  // namespace
 

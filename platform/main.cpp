@@ -16,6 +16,8 @@
 #include "port_env.h"
 #include "port_embedded.h"
 #include "port_crash.h"
+#include "port_disc.h"
+#include "port_gci.h"
 #include "port_debug.h"
 #include "port_paths.h"
 #include "port_actor_collision_bounds.h"
@@ -26,7 +28,9 @@
 #include "port_build_info.h"
 #include "port_log.h"
 #include "port_log_file.h"
+#include "port_memory_log.h"
 #include "port_mods.h"
+#include "port_pal_languages.h"
 #include "port_room_geo.h"
 #include "port_importers.h"
 #include "port_remastered_import.h"
@@ -45,7 +49,7 @@
 #include <android/log.h>
 #include <sys/system_properties.h>
 #endif
-#if defined(__linux__) && !defined(__ANDROID__)
+#if (defined(__linux__) && !defined(__ANDROID__)) || defined(__APPLE__)
 #include <sys/utsname.h>
 #endif
 
@@ -53,6 +57,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <clocale>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -123,6 +128,10 @@ bool IsDiscImage(const std::filesystem::path& path) {
 // .gcm, NKit's .nkit.iso) start with the disc header, so the wrong game or
 // region can be skipped before it fails to boot; the compressed formats keep
 // it elsewhere and are taken on trust, after any plain image that matched.
+bool IsSupportedId(const char* id6, unsigned diskNumber, unsigned version) {
+    return PortDisc::IsAccepted(PortDisc::Identify(id6, diskNumber, version));
+}
+
 enum class DiscMatch { No, Maybe, Yes };
 
 DiscMatch MatchDiscImage(const std::filesystem::path& path) {
@@ -142,8 +151,8 @@ DiscMatch MatchDiscImage(const std::filesystem::path& path) {
     Uint8 header[8] = {};
     const size_t got = SDL_ReadIO(file, header, sizeof(header));
     SDL_CloseIO(file);
-    // Game id, maker, disc number, revision: GM8E01, disc 0, v1.00.
-    return got == sizeof(header) && std::memcmp(header, "GM8E01", 6) == 0 && header[6] == 0 && header[7] == 0
+    // Game id, maker, disc number, revision.
+    return got == sizeof(header) && IsSupportedId(reinterpret_cast<const char*>(header), header[6], header[7])
                ? DiscMatch::Yes
                : DiscMatch::No;
 }
@@ -302,10 +311,6 @@ bool ResolveDiscFromArgs(int argc, char** argv) {
     return env != nullptr && env[0] != '\0';
 }
 
-bool IsSupportedId(const char* id6, unsigned diskNumber, unsigned version) {
-    return std::memcmp(id6, "GM8E01", 6) == 0 && diskNumber == 0 && version == 0;
-}
-
 // The disc id's game name and maker as one six-character id.
 std::array<char, 6> DiscId6(const DVDDiskID& id) {
     std::array<char, 6> id6{};
@@ -359,7 +364,12 @@ std::string FindUnreadableDiscFile() {
     return {};
 }
 
-constexpr const char* kSupportedDisc = "Only Metroid Prime for the GameCube, USA version 1.00\n(GM8E01, revision 0), is supported.";
+constexpr const char* kSupportedDisc =
+    "Metroid Prime for the GameCube is supported: USA 1.00, 1.01\nand 1.02 (GM8E01), and PAL (GM8P01, experimental).";
+
+const char* SupportedDiscText() {
+    return kSupportedDisc;
+}
 
 // What the user picked instead, in words: the usual mistakes are another
 // region or a later revision of the same game.
@@ -430,7 +440,7 @@ bool AskPickDisc(const char* title, const std::string& message, const char* pick
 // like a crash on start) and asks whether to pick another or close the game.
 bool ShowDiscError(const std::string& problem, const std::string& path, bool askNext) {
     // Short lines: some message boxes do not wrap (SDL's X11 one).
-    const std::string message = problem + "\n\n" + path + "\n\n" + kSupportedDisc;
+    const std::string message = problem + "\n\n" + path + "\n\n" + SupportedDiscText();
     return AskPickDisc("Metroid Prime: wrong disc image", message, "Pick another disc", askNext);
 }
 
@@ -534,7 +544,7 @@ std::string CopyDiscFromContentUri(const std::string& uri) {
         const bool container = std::memcmp(header, "RVZ", 3) == 0 || std::memcmp(header, "WIA", 3) == 0 ||
                                std::memcmp(header, "WBFS", 4) == 0 || std::memcmp(header, "CISO", 4) == 0;
         if (!container && !IsSupportedId(reinterpret_cast<const char*>(header), header[6], header[7])) {
-            PortLog::Write("metroid_prime_port: not copying the picked image: %s Expected GM8E01 revision 0.\n",
+            PortLog::Write("metroid_prime_port: not copying the picked image: %s\n",
                            DescribeDisc(reinterpret_cast<const char*>(header), header[7]).c_str());
             SDL_CloseIO(in);
             return {};
@@ -687,7 +697,7 @@ std::string AskForDiscImage(bool* cancelled = nullptr) {
     SDL_SetNumberProperty(props, SDL_PROP_FILE_DIALOG_NFILTERS_NUMBER, 2);
     SDL_SetPointerProperty(props, SDL_PROP_FILE_DIALOG_WINDOW_POINTER, window);
     SDL_SetStringProperty(props, SDL_PROP_FILE_DIALOG_TITLE_STRING,
-                          "Select your Metroid Prime disc image (GameCube, USA, v1.00)");
+                          "Select your Metroid Prime disc image (GameCube, USA v1.00, or PAL: experimental)");
     SDL_ShowFileDialogWithProperties(
         SDL_FILEDIALOG_OPENFILE,
         [](void*, const char* const* files, int) {
@@ -757,7 +767,7 @@ std::string PickDisc() {
         if (!disc.empty() || !cancelled) {
             return disc;
         }
-        if (!AskPickDisc("Metroid Prime: no disc image", std::string("No disc image was picked.\n\n") + kSupportedDisc,
+        if (!AskPickDisc("Metroid Prime: no disc image", std::string("No disc image was picked.\n\n") + SupportedDiscText(),
                          "Pick a disc", true)) {
             return {};
         }
@@ -795,6 +805,9 @@ int main(int argc, char** argv) {
     }
     PortLogFile::AttachParentConsole();
 #endif
+    if (argc == 2 && std::strcmp(argv[1], "--settings-selftest") == 0) {
+        return PortDebug::SettingsSelfTest();
+    }
     if (argc == 2 && std::strcmp(argv[1], "--version") == 0) {
         std::printf("Metroid Prime native port %s (%s)\n", MP_BUILD_VERSION, MP_BUILD_REVISION);
         return 0;
@@ -840,14 +853,22 @@ int main(int argc, char** argv) {
         }
         const DVDDiskID* id = DVDGetCurrentDiskID();
         int result = 1;
-        if (id == nullptr || std::memcmp(id->gameName, "GM8E", 4) != 0 || std::memcmp(id->company, "01", 2) != 0 ||
-            id->diskNumber != 0 || id->gameVersion != 0) {
-            std::fprintf(stderr, "unsupported disc; expected GM8E01 USA revision 0\n");
+        if (!IsSupportedDisc(id)) {
+            std::fprintf(stderr, "unsupported disc: %s\n", DescribeUnsupportedDisc(id).c_str());
         } else {
             result = PortRemastered::RunImportFromCommandLine(argv[2], argc >= 4 ? argv[3] : "", importMovies);
         }
         aurora_dvd_close();
         return result;
+    }
+    // --import-pal-languages <image>: add a PAL disc's languages to a USA game
+    // (port_pal_languages.h), without starting it.
+    if (argc >= 2 && std::strcmp(argv[1], "--import-pal-languages") == 0) {
+        if (argc != 3) {
+            std::fprintf(stderr, "usage: %s %s <PAL disc image>\n", argv[0], argv[1]);
+            return 2;
+        }
+        return PortPalLanguages::RunFromCommandLine(argv[2]);
     }
 #endif
     // The file log starts first so it holds everything after it, build id included.
@@ -928,9 +949,18 @@ int main(int argc, char** argv) {
     if (envFrameBuffers >= 0) {
         frameBufferScale = static_cast<uint32_t>(std::clamp(static_cast<unsigned long>(envFrameBuffers), 1UL, 16UL));
     }
-    if (frameBufferScale > 1) {
-        PortLog::Write("port: frame buffers at %ux (%s)\n", frameBufferScale,
-                       envFrameBuffers >= 0 ? "MP_FRAME_BUFFERS" : "room geometry");
+    // 0 follows frameBufferScale and, in resident mode, grows after an overflow (aurora,
+    // up to 6x); MP_STORAGE_BUFFERS pins it.
+    uint32_t frameStorageScale = 0;
+    const int envStorageBuffers = port::EnvInt("MP_STORAGE_BUFFERS", -1);
+    if (envStorageBuffers >= 0) {
+        frameStorageScale = static_cast<uint32_t>(std::clamp(static_cast<unsigned long>(envStorageBuffers), 1UL, 16UL));
+    }
+    if (frameBufferScale > 1 || frameStorageScale > 1) {
+        PortLog::Write("port: frame buffers at %ux, storage at %ux (%s)\n", frameBufferScale,
+                       frameStorageScale != 0 ? frameStorageScale : frameBufferScale,
+                       envFrameBuffers >= 0 || envStorageBuffers >= 0 ? "MP_FRAME_BUFFERS/MP_STORAGE_BUFFERS"
+                                                                      : "room geometry");
     }
     // Settings, mods, save states and the shader caches sit in user/ beside the
     // executable when that folder can be written to (port_paths.h).
@@ -969,7 +999,7 @@ int main(int argc, char** argv) {
         }
         PortLog::Write("port: device:%s\n", deviceInfo.empty() ? " (no properties)" : deviceInfo.c_str());
     }
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__APPLE__)
     {
         struct utsname uts = {};
         if (uname(&uts) == 0) {
@@ -977,6 +1007,7 @@ int main(int argc, char** argv) {
         }
     }
 #endif
+    PortMemoryLog::LogStartup();
     const std::span<const uint8_t> embeddedSeed = PortEmbedded::Find("initial_pipeline_cache.db");
 #if !defined(__ANDROID__)
     // The window icon, for a bare binary that no desktop entry describes.
@@ -1024,12 +1055,23 @@ int main(int argc, char** argv) {
         .mem1Size = mem1Size,
         .mem2Size = ARAM_DEFAULT_SIZE,
         .frameBufferScale = frameBufferScale,
+        .frameStorageScale = frameStorageScale,
         .residentGeometryMiB = residentMiB,
         // An embedded seed wins over a stale initial_pipeline_cache.db beside the executable.
         .pipelineCacheSeedData = embeddedSeed.data(),
         .pipelineCacheSeedSize = embeddedSeed.size(),
+        // MP_PIPELINE_SEED=0: start from an empty cache (tools/pipeline_seed.py tour records with it).
+        .pipelineCacheNoSeed = !port::EnvFlag("MP_PIPELINE_SEED", true),
         // Set below when a custom Vulkan driver (port_gpu_driver.h) is loaded.
         .vulkanLibraryDir = nullptr,
+        // Aurora's Null backend draws nothing: the game would play its sound behind
+        // a black window (issue #33). Scripted runs, which can't answer a box, keep it.
+        .noGraphicsMessage = port::EnvFlag("MP_NO_DISC_DIALOG")
+                                 ? nullptr
+                                 : "No graphics device could be started, so the game can't show a picture.\n\n"
+                                   "Update your graphics driver. In a virtual machine, turn on 3D acceleration "
+                                   "or run the game on the host instead.\n\n"
+                                   "The log file in the user folder has the details.",
     };
 
 #if defined(__ANDROID__)
@@ -1047,8 +1089,9 @@ int main(int argc, char** argv) {
     // process spins at 100% before the first frame is ever presented. Nothing in
     // the port can fix that, so whenever an X display is available ask for the X11
     // backend instead. SDL_VIDEODRIVER still wins, which is also how anyone who
-    // wants Wayland opts back in.
-#if !defined(_WIN32) && !defined(__ANDROID__)
+    // wants Wayland opts back in. macOS has neither backend (its SDL build has
+    // no x11 driver, and XQuartz sets DISPLAY), so it is left to SDL's default.
+#if !defined(_WIN32) && !defined(__ANDROID__) && !defined(__APPLE__)
     {
         const char* requested = SDL_GetHint(SDL_HINT_VIDEO_DRIVER);
         const char* x11 = std::getenv("DISPLAY");
@@ -1100,10 +1143,10 @@ int main(int argc, char** argv) {
         std::error_code ec;
         if (!driver.empty() && config.desiredBackend != BACKEND_OPENGLES && PortGpuDriver::Supported()) {
             if (std::filesystem::exists(driverMarker, ec)) {
-                PortLog::Write("port: the last start with GPU driver %s crashed or wasn't kept; using the system driver\n",
+                PortLog::Write("port: the last start with GPU driver %s crashed; using the system driver\n",
                                driver.c_str());
                 PortDebug::SetGpuDriver("");
-                PortGpuDriver::SetLoadError("it crashed or wasn't kept last time; switched back to the system driver");
+                PortGpuDriver::SetLoadError("it crashed last time; switched back to the system driver");
                 std::filesystem::remove(driverMarker, ec);
             } else {
                 std::ofstream(driverMarker) << driver << '\n';
@@ -1117,6 +1160,11 @@ int main(int argc, char** argv) {
     }
     PortDebug::ApplyStorageClamp();
     aurora_initialize(argc, argv, &config);
+    // The settings file, JSON and the logs read and write numbers with the C
+    // library, in the "C" format. A toolkit loaded with the window (a GTK
+    // decoration plugin, an input method) may call setlocale(LC_ALL, ""), which
+    // under a comma-decimal locale would make "1.5" read as 1 and print as "1,5".
+    std::setlocale(LC_NUMERIC, "C");
     if (config.desiredBackend == BACKEND_OPENGLES) {
         std::error_code ec;
         std::filesystem::remove(glesMarker, ec);
@@ -1130,16 +1178,15 @@ int main(int argc, char** argv) {
         }
         PortGpuDriver::SetLoadError("Vulkan failed to start with it; switched back to the system driver");
     }
-    // A driver's first run (not yet kept; MP_GPU_DRIVER runs are tests) keeps its
-    // marker until the user keeps it, since one that starts can still draw garbage.
-    if (!PortGpuDriver::Active().empty() && envDriver == nullptr &&
-        PortGpuDriver::Active() != PortDebug::GpuDriverKept()) {
-        PortDebug::BeginGpuDriverTrial(driverMarker.string());
-    } else {
+    // The driver started: only a crash before this point reverts it.
+    {
         std::error_code ec;
         std::filesystem::remove(driverMarker, ec);
     }
     // From what the device gave, which can be less than was asked for.
+    if (aurora_get_frame_storage_scale() != (frameStorageScale != 0 ? frameStorageScale : frameBufferScale)) {
+        PortLog::Write("port: frame storage at %ux, all this device allows\n", aurora_get_frame_storage_scale());
+    }
     if (aurora_get_frame_buffer_scale() != frameBufferScale) {
         PortLog::Write("port: frame buffers at %ux, all this device allows\n", aurora_get_frame_buffer_scale());
     }
@@ -1194,7 +1241,7 @@ int main(int argc, char** argv) {
     if (discImage.empty()) {
         PortLog::Write(
                      "metroid_prime_port: no disc image given.\n"
-                     "  usage: %s <path to Metroid Prime (USA) (v1.00).iso>\n"
+                     "  usage: %s <path to Metroid Prime (USA v1.00, or PAL: experimental).iso>\n"
                      "  or set MP_DISC, or place the image next to the executable.\n", argv[0]);
         aurora_shutdown();
         return 1;
@@ -1214,7 +1261,7 @@ int main(int argc, char** argv) {
             problem = "This file could not be read as a GameCube disc image.";
         } else if (!IsSupportedDisc(DVDGetCurrentDiskID())) {
             problem = DescribeUnsupportedDisc(DVDGetCurrentDiskID());
-            PortLog::Write("metroid_prime_port: unsupported disc: %s Expected GM8E01 revision 0.\n", problem.c_str());
+            PortLog::Write("metroid_prime_port: unsupported disc: %s\n", problem.c_str());
             aurora_dvd_close();
         } else if (DiscReadFailedLastTime(discImage)) {
             PortLog::Write("metroid_prime_port: refused the disc image: a read of it failed last session\n");
@@ -1248,6 +1295,11 @@ int main(int argc, char** argv) {
         discPath = discImage.c_str();
     }
     std::printf("metroid_prime_port: disc mounted: %s\n", discPath);
+    PortLog::Write("metroid_prime_port: disc is %s%s\n", PortDisc::Name(PortDisc::Current()),
+                   PortDisc::Current() == PortDisc::Version::Pal ? " (experimental support)" : "");
+    // Saves are the disc's region's (a PAL save's worlds are laid out
+    // differently): its game code and Dolphin's card for that region.
+    PortGci::SetGameCode(PortDisc::Current() == PortDisc::Version::Pal ? "GM8P" : "GM8E");
     s_mountedDisc = discImage;
     aurora_dvd_set_read_error_callback(NoteDiscReadFailure);
     // A Remastered import finished in the last session becomes the mod now,
@@ -1281,12 +1333,13 @@ int main(int argc, char** argv) {
             std::snprintf(scale, sizeof(scale), "%.2fx", static_cast<double>(PortDebug::RenderScale()));
         }
         PortLog::Write("port: settings: backend %s, msaa %d, anisotropy %d, scale %s, dynamic-res %s, "
-                       "smoothing %s (interp %s), vsync %s, frame-cap %s, remastered-models %s\n",
+                       "smoothing %s (interp %s), vsync %s, frame-cap %d, remastered-models %s\n",
                        config.desiredBackend == BACKEND_OPENGLES ? "opengles" : "auto", PortDebug::Msaa(),
                        PortDebug::Anisotropy(), scale, dynamicRes,
                        PortDebug::SmoothFrames() ? "on" : "off", PortDebug::FrameInterpolation() ? "on" : "off",
-                       PortDebug::VsyncEnabled() ? "on" : "off", PortDebug::FrameLimitEnabled() ? "60" : "off",
+                       PortDebug::VsyncEnabled() ? "on" : "off", PortDebug::FrameRateCap(),
                        remastered ? "on" : "off");
+        PortDebug::LogSettings();
     }
     // The index that gives solid actors their disc model's collision box reads
     // the base disc, so it belongs to the disc's lifecycle rather than to a

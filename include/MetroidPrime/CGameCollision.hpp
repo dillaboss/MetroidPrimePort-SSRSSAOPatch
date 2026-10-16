@@ -16,6 +16,7 @@ class CStateManager;
 class CTransform4f;
 class CRayCastResult;
 class CPhysicsActor;
+class CPlayer;
 class CInternalCollisionStructure;
 class CUnitVector3f;
 class ICollisionFilter;
@@ -72,7 +73,8 @@ public:
                                             const CMaterialFilter&, const TEntityList&, CVector3f,
                                             TUniqueId&, CCollisionInfo&, double&);
   static CRayCastResult RayStaticIntersection(const CStateManager&, const CVector3f&,
-                                              const CVector3f&, float, const CMaterialFilter&);
+                                              const CVector3f&, float, const CMaterialFilter&,
+                                              bool frontOnly = false);
   static bool RayStaticIntersectionBool(const CStateManager&, const CVector3f&, const CVector3f&,
                                         float, const CMaterialFilter&);
   static bool RayStaticIntersectionArea(const CGameArea&, const CVector3f&, const CVector3f&, float,
@@ -91,7 +93,7 @@ public:
   FindNonIntersectingVector(const CStateManager& mgr, CAreaCollisionCache& cache,
                             CPhysicsActor& actor, const CCollisionPrimitive& prim,
                             const TEntityList& nearList); // name?
-  static void CollisionFailsafe(const CStateManager& mgr, CAreaCollisionCache& cache,
+  static bool CollisionFailsafe(const CStateManager& mgr, CAreaCollisionCache& cache,
                                 CPhysicsActor& actor,
                                 const CCollisionPrimitive& prim,
                                 const TEntityList& nearList, float dt,
@@ -104,6 +106,15 @@ public:
                          const TEntityList*);
   static void MoveAndCollide(CStateManager& mgr, CPhysicsActor& actor, float dt,
                              const ICollisionFilter& filter, const TEntityList*);
+#ifdef TARGET_PC
+  static void MoveAirborneStepped(CStateManager& mgr, CPlayer& player, float dt,
+                                  const TEntityList*);
+  // Remastered's grounded mover: CPhysicsGroundMoverColliderMP1::MoveObject
+  // 0xf923d8 with MoveAlongGround 0xf92ccc, CanMoveUpAndDownFromPosition 0xf928c0,
+  // IsOnWallAtPosition 0xf93c9c and SnapToGround 0xf934ec.
+  static void MoveGroundedRemastered(CStateManager& mgr, CPlayer& player, float dt,
+                                     const TEntityList*);
+#endif
 
   static void MakeCollisionCallbacks(CStateManager&, CPhysicsActor&, const TUniqueId&,
                                      const CCollisionInfoList&);

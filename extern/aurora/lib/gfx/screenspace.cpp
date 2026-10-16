@@ -3,6 +3,7 @@
 #include "../logging.hpp"
 #include "../webgpu/gpu.hpp"
 #include "../webgpu/gpu_prof.hpp"
+#include "frame.hpp"
 #include "recording.hpp"
 
 #include <aurora/gfx.hpp>
@@ -31,15 +32,16 @@
 //    world's up reflect, so by default floors, water and ice do and rock walls don't.
 //
 // Both run into work targets (half resolution by default), and one full-screen pass composites
-// them with a depth-aware 4x4 filter that also averages out the noise. The EFB holds gamma-encoded
-// colour; the composite darkens and blends in linear light, as the volumetric fog does.
+// them with a depth-aware 4x4 filter that also averages out the noise. The display EFB holds
+// gamma-encoded colour, which the composite decodes, darkens and blends in linear light and encodes
+// again; the HDR scene (GXPortSceneHdr) is linear light already and is worked on as it is, unclipped.
 namespace aurora::gfx::screenspace {
 namespace {
 Module Log("aurora::gfx::screenspace");
 using webgpu::g_device;
 
 constexpr auto AoFormat = wgpu::TextureFormat::R8Unorm;
-constexpr auto SsrFormat = wgpu::TextureFormat::RGBA8Unorm;
+constexpr auto SsrFormat = wgpu::TextureFormat::RGBA16Float;
 
 constexpr const char* CommonSource = R"(
 struct Params {
@@ -283,6 +285,9 @@ constexpr const char* CompositeSource = R"(
 @group(0) @binding(3) var aoTex: texture_2d<f32>;
 @group(0) @binding(4) var ssrTex: texture_2d<f32>;
 
+// The frame is the HDR scene (RGBA16F linear light) rather than the 8-bit display EFB.
+const Hdr = HDR_DOMAIN;
+
 // The EFB's piecewise sRGB curve, as volfog.cpp has it.
 fn srgb_enc(c: vec3f) -> vec3f {
   let l = clamp(c, vec3f(0.0), vec3f(1.0));
@@ -356,41 +361,88 @@ fn fs_composite(in: VertexOutput) -> @location(0) vec4f {
   if (ao > 0.999 && reflAlpha < 0.001) {
     return f;
   }
+  if (Hdr) {
+    return vec4f(mix(f.rgb * ao, refl, reflAlpha), f.a);
+  }
   let lit = mix(srgb_dec(f.rgb) * ao, srgb_dec(refl), reflAlpha);
   return vec4f(srgb_enc(lit), f.a);
 }
 )";
 
+// Which frame a recorded pass works on: the 8-bit display EFB, or the HDR scene (GXPortSceneHdr).
+enum class Domain : uint32_t { Ldr, Hdr };
+constexpr size_t DomainCount = 2;
+
+// What a recorded pass works on, as volfog.cpp has it: the LDR frame's targets are read at encode (the
+// ones its frame was recorded against); the HDR scene's are captured when the pass is recorded, so a
+// later mode switch, frame reset or resize can't change the domain or the textures it reads.
+struct Capture {
+  Domain domain = Domain::Ldr;
+  webgpu::TextureWithSampler color;    // the HDR scene (MSAA when samples > 1)
+  webgpu::TextureWithSampler resolved; // its resolve target
+  webgpu::TextureWithSampler depth;
+};
+
+// Recorded passes. A frame records at most two (the sharp scan window draws the world twice), and a
+// slot is live from its record to its frame's encode, at most FrameSlotCount frames.
+constexpr size_t RecordedSlots = 8;
+constexpr size_t MaxPassesPerFrame = 2;
+static_assert(MaxPassesPerFrame * detail::FrameSlotCount <= RecordedSlots,
+              "screen-space slots would be overwritten while pending");
+
 struct State {
   EncoderTaskId task = InvalidEncoderTask;
-  wgpu::Buffer uniforms;
+  // One uniform buffer per slot: a frame's passes share one encoder and one submit, and a queue write
+  // lands before the submit, so a shared buffer would give each pass the last one's params.
+  std::array<wgpu::Buffer, RecordedSlots> uniforms;
   wgpu::Sampler sampler;
-  // The pipelines for the frame's format and sample count.
+  // The occlusion and reflection passes draw into the work targets, so they follow only the depth
+  // buffer's sample count.
   wgpu::RenderPipeline ao;
   wgpu::RenderPipeline ssr;
-  wgpu::RenderPipeline composite;
   wgpu::BindGroupLayout aoLayout;
   wgpu::BindGroupLayout ssrLayout;
-  wgpu::BindGroupLayout compositeLayout;
-  wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
-  uint32_t samples = 0;
-  // The frame as it was, and the work targets; remade when the frame's size or format changes.
-  wgpu::Texture frame;
-  wgpu::TextureView frameView;
+  uint32_t workSamples = 0;
+  // The composite for the frame's format and sample count, one per domain.
+  struct Composite {
+    wgpu::RenderPipeline pipeline;
+    wgpu::BindGroupLayout layout;
+    wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
+    uint32_t samples = 0;
+  };
+  std::array<Composite, DomainCount> composite;
+  // The frame as it was, one per domain (the HDR one RGBA16F, never narrowed to 8 bits); remade when
+  // the frame's size or format changes.
+  struct Frame {
+    wgpu::Texture texture;
+    wgpu::TextureView view;
+    wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
+    uint32_t width = 0;
+    uint32_t height = 0;
+  };
+  std::array<Frame, DomainCount> frame;
+  // The work targets, remade when their size changes.
   wgpu::TextureView aoView;
   wgpu::TextureView ssrView;
-  wgpu::TextureFormat frameFormat = wgpu::TextureFormat::Undefined;
-  uint32_t width = 0;
-  uint32_t height = 0;
   uint32_t workWidth = 0;
   uint32_t workHeight = 0;
 };
 State g_state;
 
-wgpu::ShaderModule make_module(const char* label, const char* source, uint32_t samples) {
+std::array<Params, RecordedSlots> g_recorded;
+std::array<Capture, RecordedSlots> g_recordedCapture;
+uint32_t g_nextSlot = 0;
+
+wgpu::ShaderModule make_module(const char* label, const char* source, uint32_t samples, Domain domain) {
   std::string code = std::string(CommonSource) + source;
-  const std::string token = "DEPTH_TYPE";
-  code.replace(code.find(token), token.size(), samples > 1 ? "texture_depth_multisampled_2d" : "texture_depth_2d");
+  const auto replace = [&code](const std::string& token, const char* with) {
+    const size_t at = code.find(token);
+    if (at != std::string::npos) {
+      code.replace(at, token.size(), with);
+    }
+  };
+  replace("DEPTH_TYPE", samples > 1 ? "texture_depth_multisampled_2d" : "texture_depth_2d");
+  replace("HDR_DOMAIN", domain == Domain::Hdr ? "true" : "false");
   wgpu::ShaderSourceWGSL wgsl{};
   wgsl.code = code.c_str();
   const wgpu::ShaderModuleDescriptor descriptor{.nextInChain = &wgsl, .label = label};
@@ -427,10 +479,10 @@ wgpu::BindGroupLayoutEntry float_entry(uint32_t binding, bool filterable) {
 
 template <size_t N>
 wgpu::RenderPipeline make_pipeline(const char* label, const char* source, const char* entry, uint32_t samples,
-                                   wgpu::TextureFormat target, uint32_t targetSamples,
+                                   Domain domain, wgpu::TextureFormat target, uint32_t targetSamples,
                                    const std::array<wgpu::BindGroupLayoutEntry, N>& entries,
                                    wgpu::BindGroupLayout& layoutOut) {
-  const auto module = make_module(label, source, samples);
+  const auto module = make_module(label, source, samples, domain);
   const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
       .label = label,
       .entryCount = entries.size(),
@@ -461,29 +513,35 @@ wgpu::RenderPipeline make_pipeline(const char* label, const char* source, const 
   return g_device.CreateRenderPipeline(&descriptor);
 }
 
-void ensure_pipelines(wgpu::TextureFormat format, uint32_t samples) {
-  if (g_state.composite && g_state.format == format && g_state.samples == samples) {
+void ensure_shared() {
+  if (g_state.sampler) {
     return;
   }
-  if (!g_state.uniforms) {
+  for (size_t i = 0; i < g_state.uniforms.size(); ++i) {
     const wgpu::BufferDescriptor bufferDescriptor{
         .label = "Screen Space Uniforms",
         .usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
         .size = sizeof(Params),
     };
-    g_state.uniforms = g_device.CreateBuffer(&bufferDescriptor);
-    const wgpu::SamplerDescriptor samplerDescriptor{
-        .label = "Screen Space Sampler",
-        .addressModeU = wgpu::AddressMode::ClampToEdge,
-        .addressModeV = wgpu::AddressMode::ClampToEdge,
-        .magFilter = wgpu::FilterMode::Linear,
-        .minFilter = wgpu::FilterMode::Linear,
-    };
-    g_state.sampler = g_device.CreateSampler(&samplerDescriptor);
+    g_state.uniforms[i] = g_device.CreateBuffer(&bufferDescriptor);
   }
-  g_state.ao = make_pipeline("Screen Space AO", AoSource, "fs_ao", samples, AoFormat, 1,
+  const wgpu::SamplerDescriptor samplerDescriptor{
+      .label = "Screen Space Sampler",
+      .addressModeU = wgpu::AddressMode::ClampToEdge,
+      .addressModeV = wgpu::AddressMode::ClampToEdge,
+      .magFilter = wgpu::FilterMode::Linear,
+      .minFilter = wgpu::FilterMode::Linear,
+  };
+  g_state.sampler = g_device.CreateSampler(&samplerDescriptor);
+}
+
+void ensure_work_pipelines(uint32_t samples) {
+  if (g_state.ao && g_state.workSamples == samples) {
+    return;
+  }
+  g_state.ao = make_pipeline("Screen Space AO", AoSource, "fs_ao", samples, Domain::Ldr, AoFormat, 1,
                              std::array{uniform_entry(), depth_entry(samples)}, g_state.aoLayout);
-  g_state.ssr = make_pipeline("Screen Space Reflections", SsrSource, "fs_ssr", samples, SsrFormat, 1,
+  g_state.ssr = make_pipeline("Screen Space Reflections", SsrSource, "fs_ssr", samples, Domain::Ldr, SsrFormat, 1,
                               std::array{uniform_entry(), depth_entry(samples), float_entry(2, true),
                                          wgpu::BindGroupLayoutEntry{
                                              .binding = 3,
@@ -491,12 +549,21 @@ void ensure_pipelines(wgpu::TextureFormat format, uint32_t samples) {
                                              .sampler = {.type = wgpu::SamplerBindingType::Filtering},
                                          }},
                               g_state.ssrLayout);
-  g_state.composite = make_pipeline("Screen Space Composite", CompositeSource, "fs_composite", samples, format, samples,
-                                    std::array{uniform_entry(), depth_entry(samples), float_entry(2, false),
-                                               float_entry(3, false), float_entry(4, false)},
-                                    g_state.compositeLayout);
-  g_state.format = format;
-  g_state.samples = samples;
+  g_state.workSamples = samples;
+}
+
+void ensure_composite(Domain domain, wgpu::TextureFormat format, uint32_t samples) {
+  auto& composite = g_state.composite[static_cast<size_t>(domain)];
+  if (composite.pipeline && composite.format == format && composite.samples == samples) {
+    return;
+  }
+  composite.pipeline = make_pipeline(domain == Domain::Hdr ? "Screen Space Composite (HDR)" : "Screen Space Composite",
+                                     CompositeSource, "fs_composite", samples, domain, format, samples,
+                                     std::array{uniform_entry(), depth_entry(samples), float_entry(2, false),
+                                                float_entry(3, false), float_entry(4, false)},
+                                     composite.layout);
+  composite.format = format;
+  composite.samples = samples;
 }
 
 wgpu::TextureView make_target(const char* label, uint32_t width, uint32_t height, wgpu::TextureFormat format,
@@ -510,28 +577,54 @@ wgpu::TextureView make_target(const char* label, uint32_t width, uint32_t height
   return g_device.CreateTexture(&descriptor).CreateView();
 }
 
-void ensure_targets(uint32_t width, uint32_t height, wgpu::TextureFormat format, uint32_t workWidth,
-                    uint32_t workHeight) {
-  if (g_state.frame && g_state.width == width && g_state.height == height && g_state.frameFormat == format &&
-      g_state.workWidth == workWidth && g_state.workHeight == workHeight) {
+void ensure_frame(Domain domain, uint32_t width, uint32_t height, wgpu::TextureFormat format) {
+  auto& frame = g_state.frame[static_cast<size_t>(domain)];
+  if (frame.texture && frame.width == width && frame.height == height && frame.format == format) {
     return;
   }
-  g_state.width = width;
-  g_state.height = height;
-  g_state.frameFormat = format;
-  g_state.workWidth = workWidth;
-  g_state.workHeight = workHeight;
-  const wgpu::TextureDescriptor frameDescriptor{
-      .label = "Screen Space Frame Copy",
+  frame.width = width;
+  frame.height = height;
+  frame.format = format;
+  const wgpu::TextureDescriptor descriptor{
+      .label = domain == Domain::Hdr ? "Screen Space Frame Copy (HDR)" : "Screen Space Frame Copy",
       .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
       .size = {width, height, 1},
       .format = format,
   };
-  g_state.frame = g_device.CreateTexture(&frameDescriptor);
-  g_state.frameView = g_state.frame.CreateView();
+  frame.texture = g_device.CreateTexture(&descriptor);
+  frame.view = frame.texture.CreateView();
+}
+
+void ensure_work_targets(uint32_t workWidth, uint32_t workHeight) {
+  if (g_state.aoView && g_state.workWidth == workWidth && g_state.workHeight == workHeight) {
+    return;
+  }
+  g_state.workWidth = workWidth;
+  g_state.workHeight = workHeight;
   constexpr auto workUsage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding;
   g_state.aoView = make_target("Screen Space AO", workWidth, workHeight, AoFormat, workUsage);
   g_state.ssrView = make_target("Screen Space Reflections", workWidth, workHeight, SsrFormat, workUsage);
+}
+
+// The HDR targets a slot reads, checked as one whole, as volfog.cpp does: the scene format throughout,
+// the depth buffer's size and sample count those of the colour, a resolve target when multisampled.
+// Anything else fails closed (the frame is left alone).
+bool hdr_capture_valid(const Capture& c, uint32_t& samples) {
+  if (!c.color.texture || !c.color.view || !c.depth.texture || !c.depth.view ||
+      c.color.format != webgpu::SceneHdrFormat || c.color.texture.GetFormat() != webgpu::SceneHdrFormat) {
+    return false;
+  }
+  samples = c.color.texture.GetSampleCount();
+  if (c.depth.texture.GetSampleCount() != samples || c.depth.size.width != c.color.size.width ||
+      c.depth.size.height != c.color.size.height) {
+    return false;
+  }
+  if (samples > 1) {
+    return c.resolved.texture && c.resolved.view && c.resolved.format == webgpu::SceneHdrFormat &&
+           c.resolved.texture.GetFormat() == webgpu::SceneHdrFormat && c.resolved.texture.GetSampleCount() == 1 &&
+           c.resolved.size.width == c.color.size.width && c.resolved.size.height == c.color.size.height;
+  }
+  return true;
 }
 
 wgpu::BindGroup make_group(const char* label, const wgpu::BindGroupLayout& layout, const wgpu::BindGroupEntry* entries,
@@ -571,19 +664,31 @@ void draw_pass(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::T
 
 void encode(const EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, const void* payload, size_t payloadSize,
             void*) {
-  if (payloadSize != sizeof(Params)) {
+  uint32_t slot = 0;
+  if (payloadSize != sizeof(slot)) {
     return;
   }
-  Params params;
-  std::memcpy(&params, payload, sizeof(params));
+  std::memcpy(&slot, payload, sizeof(slot));
+  Params params = g_recorded[slot % g_recorded.size()];
+  const Capture& capture = g_recordedCapture[slot % g_recordedCapture.size()];
   if ((params.flags & (FlagAo | FlagSsr)) == 0) {
     return;
   }
-  const auto& source = webgpu::present_source();
-  const auto& target = webgpu::g_frameBuffer;
-  const auto& depth = webgpu::g_depthBuffer;
-  const uint32_t samples = webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_graphicsConfig.msaaSamples : 1;
-  const auto format = webgpu::g_graphicsConfig.surfaceConfiguration.format;
+  const Domain domain = capture.domain;
+  const bool hdr = domain == Domain::Hdr;
+  uint32_t hdrSamples = 1;
+  if (hdr && !hdr_capture_valid(capture, hdrSamples)) {
+    return;
+  }
+  // The targets this frame was recorded against (a resize may have made newer ones since).
+  const auto efb = webgpu::efb_targets();
+  const auto& source = hdr ? (hdrSamples > 1 ? capture.resolved : capture.color) : webgpu::present_source();
+  const auto& target = hdr ? capture.color : efb.color;
+  const auto& resolveTarget = hdr ? capture.resolved : efb.resolved;
+  const auto& depth = hdr ? capture.depth : efb.depth;
+  const uint32_t samples =
+      hdr ? hdrSamples : (webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_graphicsConfig.msaaSamples : 1);
+  const auto format = hdr ? webgpu::SceneHdrFormat : webgpu::g_graphicsConfig.surfaceConfiguration.format;
   const uint32_t width = source.size.width;
   const uint32_t height = source.size.height;
   if (width == 0 || height == 0 || !source.texture || !target.view || !depth.view) {
@@ -592,18 +697,24 @@ void encode(const EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, cons
   const bool half = (params.flags & FlagHalfRes) != 0;
   const uint32_t workWidth = half ? std::max((width + 1) / 2, 1u) : width;
   const uint32_t workHeight = half ? std::max((height + 1) / 2, 1u) : height;
-  ensure_pipelines(format, samples);
-  ensure_targets(width, height, format, workWidth, workHeight);
+  ensure_shared();
+  ensure_work_pipelines(samples);
+  ensure_composite(domain, format, samples);
+  ensure_frame(domain, width, height, format);
+  ensure_work_targets(workWidth, workHeight);
+  const auto& composite = g_state.composite[static_cast<size_t>(domain)];
+  const auto& frame = g_state.frame[static_cast<size_t>(domain)];
+  const wgpu::Buffer uniforms = g_state.uniforms[slot % g_state.uniforms.size()];
   params.size[0] = workWidth;
   params.size[1] = workHeight;
-  ctx.queue.WriteBuffer(g_state.uniforms, 0, &params, sizeof(params));
+  ctx.queue.WriteBuffer(uniforms, 0, &params, sizeof(params));
 
   const wgpu::TexelCopyTextureInfo copySource{.texture = source.texture};
-  const wgpu::TexelCopyTextureInfo copyTarget{.texture = g_state.frame};
+  const wgpu::TexelCopyTextureInfo copyTarget{.texture = frame.texture};
   const wgpu::Extent3D copySize{width, height, 1};
   cmd.CopyTextureToTexture(&copySource, &copyTarget, &copySize);
 
-  const wgpu::BindGroupEntry uniformEntry{.binding = 0, .buffer = g_state.uniforms, .size = sizeof(Params)};
+  const wgpu::BindGroupEntry uniformEntry{.binding = 0, .buffer = uniforms, .size = sizeof(Params)};
   const wgpu::BindGroupEntry depthEntry{.binding = 1, .textureView = depth.view};
   if ((params.flags & FlagAo) != 0) {
     const std::array entries{uniformEntry, depthEntry};
@@ -614,7 +725,7 @@ void encode(const EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, cons
     const std::array entries{
         uniformEntry,
         depthEntry,
-        wgpu::BindGroupEntry{.binding = 2, .textureView = g_state.frameView},
+        wgpu::BindGroupEntry{.binding = 2, .textureView = frame.view},
         wgpu::BindGroupEntry{.binding = 3, .sampler = g_state.sampler},
     };
     const auto group = make_group("Screen Space Reflections", g_state.ssrLayout, entries.data(), entries.size());
@@ -623,14 +734,13 @@ void encode(const EncoderTaskContext& ctx, const wgpu::CommandEncoder& cmd, cons
   const std::array entries{
       uniformEntry,
       depthEntry,
-      wgpu::BindGroupEntry{.binding = 2, .textureView = g_state.frameView},
+      wgpu::BindGroupEntry{.binding = 2, .textureView = frame.view},
       wgpu::BindGroupEntry{.binding = 3, .textureView = g_state.aoView},
       wgpu::BindGroupEntry{.binding = 4, .textureView = g_state.ssrView},
   };
-  const auto group = make_group("Screen Space Composite", g_state.compositeLayout, entries.data(), entries.size());
-  draw_pass(cmd, "Screen-space composite", target.view,
-            samples > 1 ? webgpu::g_frameBufferResolved.view : wgpu::TextureView{}, g_state.composite, group,
-            {0.0, 0.0, 0.0, 0.0});
+  const auto group = make_group("Screen Space Composite", composite.layout, entries.data(), entries.size());
+  draw_pass(cmd, "Screen-space composite", target.view, samples > 1 ? resolveTarget.view : wgpu::TextureView{},
+            composite.pipeline, group, {0.0, 0.0, 0.0, 0.0});
 }
 } // namespace
 
@@ -654,18 +764,31 @@ bool record(const Params& params) {
   if (g_state.task == InvalidEncoderTask || (params.flags & (FlagAo | FlagSsr)) == 0) {
     return false;
   }
-  const auto& size = webgpu::present_source().size;
+  // The domain is the pass's, here at the FIFO, as the volumetric fog takes it. The HDR scene on but
+  // this pass not its own (offscreen, a colour pass) has no target these know: fail closed.
+  const bool hdr = scene_hdr_pass_active();
+  if (!hdr && scene_hdr_active()) {
+    return false;
+  }
+  const auto& size = hdr ? webgpu::g_sceneHdr.size : webgpu::present_source().size;
   if (size.width == 0 || size.height == 0) {
     return false;
   }
-  static_assert(sizeof(Params) <= InlineDrawPayloadSize);
-  record_encoder_task(g_state.task, &params, sizeof(params));
+  const uint32_t slot = g_nextSlot++ % g_recorded.size();
+  g_recorded[slot] = params;
+  g_recordedCapture[slot] = hdr ? Capture{.domain = Domain::Hdr,
+                                          .color = webgpu::g_sceneHdr,
+                                          .resolved = webgpu::g_sceneHdrResolved,
+                                          .depth = webgpu::g_depthBuffer}
+                                : Capture{};
+  record_encoder_task(g_state.task, &slot, sizeof(slot));
   return true;
 }
 
 void shutdown() {
   const auto task = g_state.task;
   g_state = {};
+  g_recordedCapture = {};
   if (task != InvalidEncoderTask) {
     unregister_encoder_task_type(task);
   }

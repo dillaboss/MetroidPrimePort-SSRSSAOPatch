@@ -8,7 +8,11 @@ logic and tricks; saved as the `rando_settings=` line of the settings file),
 type a seed text or leave it empty for a random one, and press **Generate &
 Play**. The page lists saved seeds with Play, a spoiler view, "Write
 spoiler file" and Delete (the seed, its progress and its save card; not the
-seed being played). The console has the same as `rando gen [seedtext]`,
+seed being played). Energy tank capacity (10-200, default 100) sets the
+energy each tank holds; the suit alone holds one less, so 50 gives 49 + 50
+per tank. Combat logic still counts tanks as if they held 100. Shuffle
+Unlimited Missiles / Power Bombs put that item in the pool (in place of a
+Missile Expansion), as the apworld options do. The console has the same as `rando gen [seedtext]`,
 `rando play <name>`, `rando delete <name>` and `rando list`.
 
 Each seed has its own save card, which the game switches only at the title
@@ -92,10 +96,11 @@ the totem cinematic. Every totem lights (found artifacts) or shows its hint each
 time the room loads, and holding all twelve arms the cinematic's trigger, whose
 end still starts the Meta Ridley fight.
 
-The map and minimap show a plain white dot for every location not yet
-collected (`PortMapPickups`, `CMapWorld::DrawPortPickups`), as randomprime's do.
-It is always white, so the map never gives away what an item is. Normal games
-can turn it on too (`map_pickups`, see `docs/NATIVE_PORT.md`).
+With `map_pickups` set to All, the map and minimap show a plain white dot for
+every location not yet collected (`PortMapPickups`, `CMapWorld::DrawPortPickups`),
+as randomprime's do. It is always white, so the map never gives away what an
+item is. It is a setting like in normal games, off by default (modes: see
+`docs/SETTINGS.md`).
 
 Items are named after `CPlayerState::EItemType` without the `kIT_` prefix:
 `Missiles`, `EnergyTanks`, `MorphBall`, `PowerBombs`, `Newborn` (artifacts), and
@@ -120,10 +125,13 @@ directory. Schema:
 ```
 
 `item` is required; `amount` and `capacity` are optional and leave the vanilla
-values untouched when absent. Unknown keys are ignored. Arrays, `null`, comments
-and trailing commas are rejected — a malformed seed disables the randomizer with
-a `randomizer: seed parse error at byte offset N` line on stderr rather than
-applying half of it.
+values untouched when absent, and must be whole numbers from -9999 to 9999.
+Unknown keys are ignored whatever they hold; a repeated key keeps its last value.
+The file is strict JSON (no comments or trailing commas). A seed that cannot be
+used disables the randomizer rather than applying half of it, and says why in the
+log: `randomizer: seed parse error at byte offset N: ...` for malformed JSON,
+`randomizer: seed error: location "...": ...` for a well-formed file with a bad
+entry.
 
 `models` is optional and maps an item name to the assets a pickup of that item
 is drawn with. A rewritten pickup uses that entry so it looks like the item it

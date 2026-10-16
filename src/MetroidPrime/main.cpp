@@ -1,9 +1,12 @@
 #include "MetroidPrime/CActor.hpp"
 #include "MetroidPrime/CMain.hpp"
+#include "MetroidPrime/CStateManager.hpp"
+#include "MetroidPrime/Player/CPlayer.hpp"
 
 // Port: Aurora owns the application/window/GPU loop; the game entry is renamed
 // and driven by platform/main.cpp.
 #include <algorithm>
+#include <chrono>
 #include <aurora/aurora.h>
 #include <aurora/event.h>
 #include <aurora/phase.hpp>
@@ -11,7 +14,11 @@
 #include <SDL3/SDL_timer.h>
 
 #include "port_debug.h"
+#include "port_photo.h"
+#include "port_pointer.h"
+#include "port_savestate.h"
 #include "port_log.h"
+#include "port_memory_log.h"
 #include "port_disc.h"
 #include "port_mods.h"
 #include "port_textures.h"
@@ -156,6 +163,18 @@ bool COsContext::mProgressiveMode;
 u32 sARAMMemArray[2];
 float sInfiniteLoopTime;
 static uint sTicksAdvanced = 0;
+
+// Port: the player is in (or going into or out of) morph ball during play, with
+// no pause or map screen up.
+static bool MorphBallHoldsMouse() {
+  const CStateManager* mgr = PortDebug::StateManager();
+  if (mgr == nullptr || PortDebug::PauseScreenOpen() || PortDebug::MapScreenOpen() ||
+      mgr->GetGameState() != CStateManager::kGS_Running) {
+    return false;
+  }
+  const CPlayer* player = mgr->GetPlayer();
+  return player != nullptr && player->GetMorphballTransitionState() != CPlayer::kMS_Unmorphed;
+}
 
 // Port: apply the selected aspect ratio to the game's framebuffer and viewport.
 // Aurora derives the internal EFB from the render mode, so this also resizes the
@@ -376,9 +395,28 @@ CGameGlobalObjects::CGameGlobalObjects(COsContext& osContext, CMemorySys& memory
 
 CRasterFont* CGameGlobalObjects::LoadDefaultFont() {
 #ifdef TARGET_PC
-  // Verified GM8E01_00 symbols; see config/GM8E01_00/symbols.txt.
-  const auto fontData = PortReadDolResource(0x803cb3a0, 0x650);
-  const auto fontTexture = PortReadDolResource(0x803cb9f0, 0x45c);
+  // Verified GM8E01_00 symbols; see config/GM8E01_00/symbols.txt. Other
+  // discs have them elsewhere: found by their first bytes (zlib streams).
+  static const uint8_t kFontDataStart[] = {0x78, 0xda, 0x8d, 0x57, 0x5b, 0x6f, 0x54, 0x55,
+                                           0x14, 0x5e, 0xa5, 0x74, 0x3a, 0x9d, 0x96, 0x82};
+  static const uint8_t kFontTextureStart[] = {0x78, 0xda, 0xed, 0x59, 0xdb, 0x92, 0x14, 0x31,
+                                              0x08, 0x05, 0xcb, 0x07, 0x1f, 0xc3, 0x1f, 0xf9};
+  std::vector< uint8_t > fontData, fontTexture;
+  // PAL's has other bytes (FONT v4): the font naming the same texture. Looked up
+  // first there, so a PAL boot doesn't throw (and log) on the way.
+  const bool palFont = PortDisc::Current() == PortDisc::Version::Pal &&
+                       PortFindDolFont(0x6065853f, fontData, fontTexture);
+  if (!palFont) {
+    try {
+      fontData = PortFindDolResource(0x803cb3a0, 0x650, kFontDataStart, sizeof(kFontDataStart));
+      fontTexture =
+          PortFindDolResource(0x803cb9f0, 0x45c, kFontTextureStart, sizeof(kFontTextureStart));
+    } catch (const std::runtime_error&) {
+      if (!PortFindDolFont(0x6065853f, fontData, fontTexture)) {
+        throw;
+      }
+    }
+  }
   CZipInputStream fontDataStream(rs_new CMemoryInStream(fontData.data(), fontData.size()));
   rstl::single_ptr<CRasterFont> font(rs_new CRasterFont(fontDataStream, nullptr));
   CZipInputStream fontTextureStream(rs_new CMemoryInStream(fontTexture.data(), fontTexture.size()));
@@ -442,7 +480,8 @@ CGameArchitectureSupport::CGameArchitectureSupport(COsContext& osContext)
   gpMain->ResetGameState();
   CIOWinManager& ioWinManager = x58_ioWinMgr;
   uint32_t bootWorld, bootArea;
-  if (!gpTweakGame->GetSplashScreensDisabled() && !PortDebug::BootWorld(bootWorld, bootArea)) {
+  if (!gpTweakGame->GetSplashScreensDisabled() && !PortDebug::BootWorld(bootWorld, bootArea) &&
+      PortDebug::BootLogos() != PortDebug::kBootLogos_Off) {
     ioWinManager.AddIOWin(rs_new CSplashScreen(CSplashScreen::kSplashScreen_Nintendo), 1000, 10000);
   }
   ioWinManager.AddIOWin(rs_new CMainFlow(), 0, 0);
@@ -506,7 +545,26 @@ bool CGameArchitectureSupport::UpdateTicks() {
   PortDebug::SetTickPeriod(tickPeriod);
   sTicksAdvanced = 0;
   x4_archQueue.Push(MakeMsg::CreateFrameBegin(kAMT_Game, x78_gameFrameCount));
+  // Catching up must not cost more wall time than it recovers: when ticks are
+  // slower than real time (front-end THP decode on a slow CPU, issue #54), each
+  // long frame queued more ticks and the menu spiralled into multi-second
+  // frames. Past ~2 periods of tick work, drop the rest and run slow instead.
+  const bool budgeted = !PortDebug::Turbo() && !PortDebug::TickHold();
+  const double tickBudget = std::max(2.0 * period, 1.0 / 30.0);
+  const auto tickStart = std::chrono::steady_clock::now();
   for (unsigned tick = 0; tick < ticks; ++tick) {
+    if (budgeted && tick > 0 &&
+        std::chrono::duration< double >(std::chrono::steady_clock::now() - tickStart).count() >
+            tickBudget) {
+      static unsigned sDroppedLogs = 0;
+      if (sDroppedLogs < 5) {
+        ++sDroppedLogs;
+        PortLog::Write("MP ticks: ran %u of %u ticks, dropped the rest "
+                       "(ticks are slower than real time)\n",
+                       tick, ticks);
+      }
+      break;
+    }
     PortDebug::BeginFrameMouse();
     // A tick that doesn't reach CStateManager::Update (paused) leaves every
     // actor's snapshot stale, so actors don't blend between old transforms.
@@ -641,6 +699,8 @@ void CGameGlobalObjects::AddPaksAndFactories() {
   rstl::single_ptr< IController > controller(IController::Create(osContext));
   gpController = controller.get();
 #endif
+  // Quick resume: SDL only calls watchers for the background events.
+  PortSaveState::ResumeInstallEventWatch();
   while (!factory.GetResLoader().AreAllPaksLoaded()) {
     const AuroraEvent* event = aurora_update();
     for (; event != nullptr && event->type != AURORA_NONE; ++event) {
@@ -861,9 +921,10 @@ int CMain::RsMain(int argc, const char* const* argv) {
       gpGameState->GameOptions().EnsureOptions();
       lbl_805A6BC0 = stream.ReadBits(1);
     }
+    // Port: there is no save region across launches; the settings file keeps the options.
+    PortDebug::RestoreGameOptions();
 
     double dt = 1.0 / 60.0;
-    constexpr uint64_t framePeriodNs = 1000000000ull / 60;
     uint64_t nextFrameDeadline = SDL_GetTicksNS();
     // When the first frame was actually presented, and when the process started.
     // Startup is a number people ask about and the frame log is only a counter,
@@ -906,16 +967,33 @@ int CMain::RsMain(int argc, const char* const* argv) {
 #endif
       // Port: pump Aurora's window/input events (it marks the watchdog's phase).
       {
+        // The pump may deliver a background event to the quick resume watch,
+        // which then takes a fresh snapshot: we are between ticks here.
+        PortSaveState::SetEventPumpSafe(true);
         const AuroraEvent* event = aurora_update();
+        PortSaveState::SetEventPumpSafe(false);
+        PortPointer::BeginFrame();
         while (event != nullptr && event->type != AURORA_NONE) {
+          // Menu pointer gestures; ImGui keeps the events it wants itself.
+          if (event->type == AURORA_SDL_EVENT && !PortDebug::Visible()) {
+            PortPointer::HandleEvent(event->sdl);
+          }
           if (event->type == AURORA_EXIT) {
+            // Quick resume: written here, between ticks and before shutdown.
+            // (Android's background events never get here: SDL only calls
+            // watchers for them, see PortSaveState::ResumeInstallEventWatch.)
+            PortSaveState::ResumeSave();
+            PortSaveState::ResumeQuitCleanly();
             x160_24_finished = true;
           } else if (event->type == AURORA_SDL_EVENT && event->sdl.type == SDL_EVENT_KEY_DOWN &&
                      !event->sdl.key.repeat && event->sdl.key.scancode == SDL_SCANCODE_F10) {
             PortDebug::SetFrameLimitEnabled(!PortDebug::FrameLimitEnabled());
             nextFrameDeadline = SDL_GetTicksNS();
-            fprintf(stderr, "Frame limit: %s\n",
-                    PortDebug::FrameLimitEnabled() ? "60 FPS" : "unlimited");
+            if (PortDebug::FrameRateCap() > 0) {
+              fprintf(stderr, "Frame limit: %d FPS\n", PortDebug::FrameRateCap());
+            } else {
+              fprintf(stderr, "Frame limit: unlimited\n");
+            }
           } else if (event->type == AURORA_WINDOW_RESIZED ||
                      event->type == AURORA_DISPLAY_SCALE_CHANGED) {
             ApplyAspectMode();
@@ -954,7 +1032,8 @@ int CMain::RsMain(int argc, const char* const* argv) {
       // SDL/compositor relative capture owns cursor visibility and warp handling.
 #ifdef MP_ENABLE_SMOKE_DRIVER
       if (PortSmokeMouseEnabled()) {
-        PortDebug::SetMouseCaptured(PortDebug::MouseGameplayActive() && !PortDebug::Visible());
+        PortDebug::SetMouseCaptured(PortDebug::MouseGameplayActive() && !PortDebug::Visible() &&
+                                      !PortPhoto::PanelWantsCursor());
       } else
 #endif
       {
@@ -975,14 +1054,32 @@ int CMain::RsMain(int argc, const char* const* argv) {
         }
         if (sCaptureWindow != nullptr) {
           const bool focused = SDL_GetKeyboardFocus() == sCaptureWindow;
-          const bool wantRelative = PortDebug::MouseAim() && PortDebug::MouseGameplayActive() &&
-                                    !PortDebug::Visible() && focused;
+          PortSaveState::ResumeInfo promptInfo;
+          bool promptYes = true;
+          const bool resumePrompt = PortSaveState::ResumePromptShown(promptInfo, promptYes);
+          // A pointer-driven menu or map wants a free, visible cursor.
+          const bool pointerMenu = PortPointer::Enabled() && PortPointer::ScreenActive() && !PortPhoto::Active();
+          // Photo mode's free camera looks with the mouse even without mouse aim.
+          const bool wantRelative =
+              (PortPhoto::Active() ? PortPhoto::MouseLook()
+                                   : PortDebug::MouseAim() && PortDebug::MouseGameplayActive() &&
+                                         !PortPhoto::PanelWantsCursor()) &&
+              !PortDebug::Visible() && !resumePrompt && focused;
 #ifdef __ANDROID__
           // A free (hidden) cursor flung to the screen edge brings up the nav bar
           // or taskbar, so keep the pointer captured unless the overlay is open.
-          const bool wantLock = !PortDebug::Visible() && focused;
+          // Photo mode keeps it free even with the panel hidden: taps arrive as
+          // mouse events, and a captured pointer has no position for its touch bar.
+          const bool wantLock =
+              !PortDebug::Visible() && !PortPhoto::Active() && !(pointerMenu && PortPointer::MouseIsLast()) &&
+              !resumePrompt && focused;
 #else
-          const bool wantLock = wantRelative;
+          // Morph ball has no mouse aim, but its bombs are on the mouse buttons:
+          // keep the pointer locked so a click can't land outside the window.
+          const bool wantLock = !pointerMenu &&
+                                (wantRelative ||
+                                 (PortDebug::MouseAim() && MorphBallHoldsMouse() && !PortDebug::Visible() &&
+                                  !PortPhoto::PanelWantsCursor() && !resumePrompt && focused));
 #endif
           if (SDL_GetWindowRelativeMouseMode(sCaptureWindow) != wantLock) {
             SDL_SetWindowRelativeMouseMode(sCaptureWindow, wantLock);
@@ -992,7 +1089,9 @@ int CMain::RsMain(int argc, const char* const* argv) {
           // which is navigated with the mouse (and the controller), and while the
           // clickable update toast is up and the mouse isn't captured.
           const bool wantCursor =
-              (PortDebug::Visible() || (PortDebug::UpdateToastShowing() && !wantLock)) &&
+              (PortDebug::Visible() || PortPhoto::PanelWantsCursor() || resumePrompt ||
+               (pointerMenu && PortPointer::MouseIsLast()) ||
+               (PortDebug::UpdateToastShowing() && !wantLock)) &&
               SDL_GetKeyboardFocus() == sCaptureWindow;
           if (wantCursor) {
             SDL_ShowCursor();
@@ -1029,6 +1128,7 @@ int CMain::RsMain(int argc, const char* const* argv) {
       CARAMToken::UpdateAllDMAs();
       aurora::phase::set(aurora::phase::Main, "game tick (UpdateTicks)");
       if (!archSupport->UpdateTicks()) {
+        PortSaveState::ResumeQuitCleanly();
         x160_24_finished = true;
       }
       // Track the step UpdateTicks actually used (fixed or adaptive).
@@ -1065,9 +1165,16 @@ int CMain::RsMain(int argc, const char* const* argv) {
           interpolation = -1.f;
         PortDebug::PresentOverride(interpolation);
         CCameraManager::SetPresentationInterpolation(interpolation);
+        // The render clock steps 1/60 s per tick (TickRenderTimings above).
+        CGraphics::SetRenderTimePresentLag(
+            interpolation >= 0.f && interpolation < 1.f && PortDebug::ParticleInterpolation()
+                ? (1.f - interpolation) / 60.f
+                : 0.f);
         aurora::phase::set(aurora::phase::Main, "game draw");
         archSupport->GetIOWinManager().Draw();
         CCameraManager::SetPresentationInterpolation(-1.f);
+        CGraphics::SetSimTimePresentLag(0.f);
+        CGraphics::SetRenderTimePresentLag(0.f);
         PortSpeedrunTimer::Draw();
         DrawDebugMetrics(t1, archSupport->GetStopwatch2());
 
@@ -1143,7 +1250,10 @@ int CMain::RsMain(int argc, const char* const* argv) {
       // when a frame overruns its budget.
       const uint64_t workEndNs = SDL_GetTicksNS();
       aurora::phase::set(aurora::phase::Main, "frame pacing");
-      if (PortDebug::FrameLimitEnabled() && !PortDebug::Turbo()) {
+      // 60 under the 60 FPS cap, else the FPS cap setting (0 = unlimited).
+      const int frameRateCap = PortDebug::FrameRateCap();
+      if (frameRateCap > 0 && !PortDebug::Turbo()) {
+        const uint64_t framePeriodNs = 1000000000ull / static_cast< uint64_t >(frameRateCap);
         nextFrameDeadline += framePeriodNs;
         const uint64_t now = SDL_GetTicksNS();
         if (nextFrameDeadline > now) {
@@ -1165,6 +1275,7 @@ int CMain::RsMain(int argc, const char* const* argv) {
         nextFrameDeadline = SDL_GetTicksNS();
       }
       PortDebug::RecordFrame(workEndNs - loopStartNs, sTicksAdvanced, presented);
+      PortMemoryLog::Tick(SDL_GetTicksNS());
       {
         // The whole iteration, pacing included: what a player sees as a frame.
         const uint64_t frameEndNs = SDL_GetTicksNS();
@@ -1390,10 +1501,18 @@ void CMain::PortLoadGameState(CInputStream& in) {
 
 void CMain::StreamNewGameState(CInputStream& in, int saveIdx) {
   bool hasFusion = gpGameState->SystemState().GetHasFusion();
+#ifdef TARGET_PC
+  // Port: the options are global (the settings file), not the save file's.
+  CGameOptions gameOptions = gpGameState->GameOptions();
+#endif
   x128_gameGlobalObjects->GameState() = nullptr;
   gpGameState = nullptr;
   x128_gameGlobalObjects->GameState() = rs_new CGameState(in, saveIdx);
   gpGameState = x128_gameGlobalObjects->GameState().get();
+#ifdef TARGET_PC
+  gpGameState->GameOptions() = gameOptions;
+  gpGameState->GameOptions().EnsureOptions();
+#endif
   gpGameState->SystemState().SetHasFusion(hasFusion);
   gpGameState->PlayerState()->SetIsFusionEnabled(gpGameState->SystemState().GetHasFusion());
   gpGameState->HintOptions().SetHintNextTime();

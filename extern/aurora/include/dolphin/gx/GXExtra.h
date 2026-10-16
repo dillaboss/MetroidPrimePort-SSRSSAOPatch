@@ -230,6 +230,14 @@ void GXSetPBRLightHdr(GXLightID light, const f32 color[3], const f32 viewPos[3],
 // alpha fades the draws: their alpha is multiplied by it, or is it where alphaReplaces is set
 // (an opaque material drawn blended, whose own alpha means nothing). 1 and GX_FALSE are neutral.
 void GXSetPBRLightScale(f32 diffuse, f32 f0, f32 alpha, GXBool alphaReplaces);
+// Aurora extension: the model colours of the following PBR draws, as full vectors: the diffuse
+// modulation (r, g, b, a), the incandescence (r, g, b, a) and the coverage, a scalar kept apart
+// from the diffuse alpha. Stays in effect until changed. They reach the PBR uniforms
+// (pbr_model_diffuse, pbr_model_incan, pbr_model_coverage); only the pause visor's kinds 36 and
+// 37 read them.
+// Null `diffuse` is (1, 1, 1, 1), null `incan` is (0, 0, 0, 1), each independently; 1 is the
+// neutral coverage.
+void GXSetPBRModelModulation(const f32 diffuse[4], const f32 incan[4], f32 coverage);
 
 // Aurora extension: Remastered's bloom over what the EFB holds now (see lib/gfx/bloom.cpp).
 // The EFB is taken as drawn through the tone curve `tone` (as GXSetPBRTone); light above
@@ -243,6 +251,17 @@ void GXSetPBRLightScale(f32 diffuse, f32 f0, f32 alpha, GXBool alphaReplaces);
 // back through GXPortFrameRadiance a few frames later.
 GXBool GXPortPostProcess(GXBool bloom, f32 threshold, const f32 tints[5][3], const f32 tone[3][4], u32 gradeA,
                          u32 gradeB, f32 gradeWeight, f32 exposure);
+// Port extension: GXPortPostProcess as the end of the HDR scene (GXPortSceneHdr). Same parameters.
+// In the HDR scene's pass it reads the linear RGBA16F scene as it is (no decode, no inverse curve,
+// no cap), tones it once through `tone` (none: clamped to 1), grades and blooms it into the display
+// EFB, and the frame goes on in the display EFB (the HDR scene ends; a later GXPortSceneHdr starts
+// it again). It always records there, with no bloom, grade or exposure too, as the scene must be
+// converted. On the display EFB it is GXPortPostProcess, and nothing when there is nothing to do.
+// At most two posts (either call) a frame. Plain GXPortPostProcess in the HDR scene is not this
+// contract: it does nothing without an effect and leaves the conversion to chance; use this one.
+// Cost test 10 keeps the conversion (bloom and grades off).
+GXBool GXPortPostProcessScene(GXBool bloom, f32 threshold, const f32 tints[5][3], const f32 tone[3][4],
+                              u32 gradeA, u32 gradeB, f32 gradeWeight, f32 exposure);
 // Port extension: Remastered's volumetric fog over the EFB as drawn so far: a froxel grid
 // (16x16 pixels by 64 slices out to `fog[0]`) of height and noise shaped density, lit by the
 // ambient volume's mean light, integrated front to back and applied to every pixel at the
@@ -253,7 +272,7 @@ typedef struct {
   f32 viewToWorld[3][4];   // rows: world = row . (view, 1)
   f32 worldToVolume[3][4]; // rows: world -> the ambient volume's texture coordinates
   f32 frustum[4];          // left, right, bottom, top at a view depth of 1
-  f32 depth[4];            // near, far, and the GX z range the world draws in (min, max)
+  f32 depth[4];            // near, far, and the GX z range the world draws in (min, max), and the scale of the low-resolution target (pass 1)
   f32 fog[4];              // range, scatter, absorb, density
   f32 shape[4];            // height slope, height bias (over world z), noise frequency, noise strength
   f32 noise[4];            // xyz: the noise's offset, w: the light's largest channel
@@ -307,14 +326,39 @@ GXBool GXPortScreenSpaceSupported(void);
 // their blend mode is additive or premultiplied (the static render state's "no fog" flag), when
 // they are not fogged at all and only add to the already fogged frame.
 void GXPortSetParticleFog(GXBool on);
+// Port extension: one of Remastered's X-ray visor post passes (shader 00089f0) over the EFB as
+// drawn so far. `p` is the shader's constants p0..p7; p[0][2] == 1 runs the distortion after the
+// opaque world (it reads the depth, whose GX z range is depthRange), anything else the ramp and
+// vignette after the post effects. `tone` is the curve the EFB was drawn through. False if it
+// could not be recorded.
+GXBool GXPortXRayPass(const f32 p[8][4], const f32 tone[3][4], const f32 depthRange[3]);
+// Port extension: the thermal visor's heat gradient (256x4 RGBA8, as the Remastered import writes it).
+// False if the size is wrong. Call before the first GXPortThermalPass.
+GXBool GXPortSetThermalLut(const u8* rgba, u32 size);
+// Port extension: one of Remastered's thermal visor post passes over the EFB as drawn so far.
+// `v` = (pass: 0 cold / 1 hot, area heat, thermal time in s, ghost: 1 blends the previous hot
+// frame), `r` = the cold pass's two CRandom16 draws. `tone` is the curve the EFB was drawn through.
+// False if it could not be recorded.
+GXBool GXPortThermalPass(const f32 tone[3][4], const f32 v[4], const f32 r[4]);
+// Port extension, debug/test only: the EFB draws that follow go to an RGBA16F linear HDR scene
+// target (same size, MSAA and depth as the EFB) instead of the 8-bit EFB; every frame starts off.
+// Not for game code yet: GX pipelines, EFB copies, post passes and present still read or assume
+// the 8-bit EFB. False (nothing written) if the device has no RGBA16F target or draw-id mode is
+// on; the switch itself is also refused, logged, outside an EFB pass.
+GXBool GXPortSceneHdr(GXBool on);
+// Port extension: GXCopyTex for a copy of the scene that a PBR shader reads as linear light.
+// While the EFB pass draws to the RGBA16F HDR scene the copy is that linear RGBA16F scene, not
+// the display-encoded copy every other GXCopyTex makes; otherwise it is exactly GXCopyTex.
+void GXPortCopyScene(void* dest, GXBool clear);
 // Stores a 33x33x33 RGBA8 colour grade LUT (red fastest) under a non-zero id.
 void GXPortColorGradeLut(u32 id, const u8* rgba);
 // The average radiance (linear rgb) of the latest frame measured by GXPortPostProcess, and a
 // count that goes up with each new one. False before the first.
 GXBool GXPortFrameRadiance(f32 out[3], u32* serial);
-// The sun's shadow. Each frame, GXPortSetShadowFrame gives the view (world -> view rows), the sun's
-// direction (world, the way its light travels), the radius around the camera its map covers (<= 0:
-// none) and an extra light's colour (0 for none: the sun then only shadows the room's directional
+// The sun's shadow. Each frame, GXPortSetShadowFrame gives the view (world -> view rows), the camera's
+// frustum (left, right, top, bottom on the near plane, near, far), the sun's direction (world, the
+// way its light travels), how far from the camera its cascades reach (<= 0: none) and an extra
+// light's colour (0 for none: the sun then only shadows the room's directional
 // light along that direction). Lit PBR draws made with GXPortSetShadowCaster on cast into the map
 // and receive the previous frame's; GXPortRenderShadowMap draws the map after the frame's casters.
 // GXPortSetShadowCasterOnly makes the following draws (with the caster on) cast but not draw, for
@@ -322,12 +366,25 @@ GXBool GXPortFrameRadiance(f32 out[3], u32* serial);
 // the last GXPortSetShadowFrame (the FIFO's, so a frame behind the game thread).
 void GXPortSetShadowCaster(GXBool on);
 void GXPortSetShadowCasterOnly(GXBool on);
-void GXPortSetShadowFrame(const f32 worldToView[3][4], const f32 sunDir[3], f32 radius, const f32 color[3]);
+// The caster mode last set on the game thread: 0 off, 1 casts and draws, 2 casts only.
+u8 GXPortGetShadowCasterMode();
+void GXPortSetShadowFrame(const f32 worldToView[3][4], const f32 frustum[6], const f32 sunDir[3], f32 distance,
+                          const f32 color[3]);
 GXBool GXPortShadowBoxCasts(const f32 min[3], const f32 max[3]);
-// For the console: the last frame's sun direction, colour, radius (0: no map) and the map's centre
-// in world space, and how many draws the last map drawn had.
-void GXPortGetShadowInfo(f32 sunDir[3], f32 color[3], f32* radius, f32 center[3], u32* casters);
+// For the console: the last frame's sun direction, colour, shadow distance (0: no map) and the
+// centre of its last cascade in world space, and how many draws the last map drawn had.
+void GXPortGetShadowInfo(f32 sunDir[3], f32 color[3], f32* distance, f32 center[3], u32* casters);
 GXBool GXPortRenderShadowMap(void);
+// Remastered's actor shadow. Between GXPortActorShadowCasters and GXPortActorShadowEnd the opaque
+// draws cast (and are not drawn) into one layer of the actor depth maps, through `clip` (16 floats:
+// the view -> map clip matrix as four vec4 rows applied dot(vec4(p, 1), row), x y z w). Between
+// GXPortActorShadowDecal and End the draws are the receivers, redrawn as the multiply decal with
+// `params` (16 vec4: see platform/port_actor_shadow.h). GXPortActorShadowRender draws the maps
+// recorded so far, before the decals. False when the port cannot (no task, drawid view).
+void GXPortActorShadowCasters(u32 layer, const f32 clip[16]);
+void GXPortActorShadowDecal(u32 layer, const f32 params[64]);
+void GXPortActorShadowEnd(void);
+GXBool GXPortActorShadowRender(void);
 // The room's Remastered point and spot lights for the rest of the frame, added on every PBR draw
 // (lit, lightmapped or not) as the sun is. Each record is 16 f32: view-space position, A; colour
 // (linear, scaled), B; view-space axis toward the light, cone scale; cone bias, falloff (0 none,
@@ -339,6 +396,11 @@ void GXColor4f32(float r, float g, float b, float a);
 
 #ifdef __cplusplus
 }
+#endif
+#ifdef __cplusplus
+// As GXCreatePBRVolume, taking the texels' buffer (a std::vector<u8>*, freed by the processor)
+// instead of copying it.
+extern "C++" void GXCreatePBRVolumeOwned(u32 id, u32 sizeX, u32 sizeY, u32 sizeZ, void* owned);
 #endif
 #endif
 

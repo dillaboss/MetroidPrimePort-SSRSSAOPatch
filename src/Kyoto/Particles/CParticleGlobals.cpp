@@ -1,5 +1,34 @@
 #include "Kyoto/Particles/CParticleGlobals.hpp"
 
+#ifdef TARGET_PC
+#include "Kyoto/Particles/CPortParticleVars.hpp"
+#include "Kyoto/Streams/CInputStream.hpp"
+
+const CPortVarMemory* CPortVarGlobals::sCurrent = nullptr;
+
+CPortVarTable* PortReadVarTable(CInputStream& in) {
+  const u32 count = in.ReadLong();
+  if (count > 4096) {
+    return nullptr;
+  }
+  auto* table = new CPortVarTable();
+  table->vars.resize(count);
+  for (SPortVar& v : table->vars) {
+    in.ReadBytes(v.guid.bytes.data(), 16);
+    const u32 type = in.ReadLong();
+    if (type > static_cast< u32 >(EPortVarType::Rotation)) {
+      delete table;
+      return nullptr;
+    }
+    v.type = static_cast< EPortVarType >(type);
+    for (float& f : v.def) {
+      f = in.ReadFloat();
+    }
+  }
+  return table;
+}
+#endif
+
 int CParticleGlobals::mParticleLifetime = 0.f;
 float CParticleGlobals::mParticleLifetimeReal = 0.f;
 int CParticleGlobals::mEmitterTime = 0;
@@ -13,6 +42,7 @@ CParticleGlobals::SParticleSystem* CParticleGlobals::mCurrentParticleSystem = nu
 #ifdef TARGET_PC
 CElementGen::CParticle* CParticleGlobals::xPortUVParticle = nullptr;
 const CElementGen::CParticle* CParticleGlobals::xPortIrndParticle = nullptr;
+const CParticleGlobals::SPortSwooshEval* CParticleGlobals::xPortSwooshEval = nullptr;
 
 // splitmix64 of (seed, element address): the same pair always gives the same bits.
 u32 CParticleGlobals::PortIrndBits(const CElementGen::CParticle* particle, const void* element) {

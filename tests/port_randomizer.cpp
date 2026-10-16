@@ -46,6 +46,144 @@ bool Contains(const std::string& text, const std::string& value) {
   return text.find(value) != std::string::npos;
 }
 
+// The seed file grammar, through ParseSeedFile: what is accepted, what each
+// accepted file holds, and what is refused.
+bool ParsesSeed(const std::string& text, PortRandomizer::SeedFile& out) {
+  size_t offset = 0;
+  std::string reason;
+  return PortRandomizer::ParseSeedFile(text, out, offset, reason);
+}
+
+bool RefusesSeed(const std::string& text, std::string* reasonOut = nullptr) {
+  PortRandomizer::SeedFile out;
+  size_t offset = 0;
+  std::string reason;
+  const bool ok = PortRandomizer::ParseSeedFile(text, out, offset, reason);
+  if (reasonOut != nullptr)
+    *reasonOut = reason;
+  return !ok && !reason.empty() &&
+         (offset <= text.size() || offset == PortRandomizer::kSeedNoOffset);
+}
+
+void SeedParserTests() {
+  using PortRandomizer::SeedFile;
+  Phase("seed parser");
+  {
+    SeedFile seed;
+    Check(ParsesSeed(R"( {"seed":"abc","locations":{"0xab-1":{"item":"Missiles","amount":5,"capacity":-5},)"
+                     R"("k2":{"item":"MorphBall"}},"models":{"Missiles":{"model":"0x1234ABCD","character":2,)"
+                     R"("animation":0},"MorphBall":{"acs":"beef"}},"extra":{"x":true,"y":-1,"z":"s","w":{}}} )",
+                     seed),
+          "full seed parses");
+    Check(seed.name == "abc", "seed name");
+    Check(seed.placements.size() == 2, "two placements");
+    const auto missiles = seed.placements.find("0XAB-1");
+    Check(missiles != seed.placements.end(), "location keys are upper-cased");
+    if (missiles != seed.placements.end()) {
+      Check(missiles->second.itemType == CPlayerState::kIT_Missiles, "placement item");
+      Check(missiles->second.hasAmount && missiles->second.amount == 5, "placement amount");
+      Check(missiles->second.hasCapacity && missiles->second.capacity == -5, "placement capacity");
+    }
+    const auto ball = seed.placements.find("K2");
+    Check(ball != seed.placements.end() && ball->second.itemType == CPlayerState::kIT_MorphBall &&
+              !ball->second.hasAmount && !ball->second.hasCapacity,
+          "placement without amount or capacity");
+    const auto model = seed.models.find(CPlayerState::kIT_Missiles);
+    Check(model != seed.models.end() && model->second.model == 0x1234ABCDu &&
+              model->second.acs == 0 && model->second.character == 2 && model->second.animation == 0,
+          "model entry");
+    const auto acs = seed.models.find(CPlayerState::kIT_MorphBall);
+    Check(acs != seed.models.end() && acs->second.acs == 0xBEEFu && acs->second.model == 0,
+          "acs-only model entry");
+  }
+  {
+    SeedFile seed;
+    Check(ParsesSeed("{}", seed) && seed.name.empty() && seed.placements.empty() && seed.models.empty(),
+          "empty seed parses");
+    Check(ParsesSeed("\t{ }\r\n", seed), "whitespace around the object");
+    Check(ParsesSeed(R"({"seed":"café 😀"})", seed) &&
+              seed.name == "caf\xc3\xa9 \xf0\x9f\x98\x80",
+          "unicode escapes become UTF-8");
+    Check(ParsesSeed(R"({"locations":{"a":{"item":"Missiles"},"A":{"item":"IceBeam"}}})", seed) &&
+              seed.placements.size() == 1 && seed.placements["A"].itemType == CPlayerState::kIT_IceBeam,
+          "a repeated location keeps the last one");
+    Check(ParsesSeed(R"({"locations":{"a":{"item":"Missiles","item":"WaveBeam"}}})", seed) &&
+              seed.placements["A"].itemType == CPlayerState::kIT_WaveBeam,
+          "a repeated field keeps the last one");
+    Check(ParsesSeed(R"({"locations":{"a":{"item":"Missiles","amount":-9999,"capacity":9999}}})", seed) &&
+              seed.placements["A"].amount == -9999 && seed.placements["A"].capacity == 9999,
+          "amount and capacity bounds are inclusive");
+    std::string nested = "{\"x\":";
+    for (int i = 0; i < 20; ++i)
+      nested += "{\"x\":";
+    nested += "1";
+    for (int i = 0; i < 21; ++i)
+      nested += "}";
+    Check(ParsesSeed(nested, seed), "moderate nesting in an unknown key");
+  }
+  std::string reason;
+  Check(RefusesSeed(""), "empty text");
+  Check(RefusesSeed("[]"), "top level array");
+  Check(RefusesSeed("\"seed\""), "top level string");
+  Check(RefusesSeed("{} x"), "trailing data");
+  Check(RefusesSeed("{\"seed\":\"a\",}"), "trailing comma");
+  Check(RefusesSeed("{/* c */}"), "comment");
+  Check(RefusesSeed("{\"seed\":1}"), "seed name not a string");
+  Check(RefusesSeed("{\"locations\":[]}"), "locations not an object");
+  Check(RefusesSeed("{\"seed\":\"a\x01\"}"), "control character in a string");
+  Check(RefusesSeed(R"({"seed":"\q"})"), "invalid escape");
+  Check(RefusesSeed(R"({"seed":"\udc00"})"), "lone low surrogate");
+  Check(RefusesSeed(R"({"seed":"\ud800"})"), "lone high surrogate");
+  Check(RefusesSeed(R"({"seed":"abc)"), "unterminated string");
+  Check(RefusesSeed(R"({"locations":{"a":{}}})", &reason) && Contains(reason, "item"),
+        "placement without an item");
+  Check(RefusesSeed(R"({"locations":{"a":{"item":"Banana"}}})", &reason) && Contains(reason, "item"),
+        "unknown item name");
+  Check(RefusesSeed(R"({"locations":{"a":{"item":7}}})"), "item not a string");
+  Check(RefusesSeed(R"({"locations":{"a":{"item":"Missiles","amount":10000}}})", &reason) &&
+            Contains(reason, "9999"),
+        "amount above the bound");
+  Check(RefusesSeed(R"({"locations":{"a":{"item":"Missiles","capacity":-10000}}})"),
+        "capacity below the bound");
+  Check(RefusesSeed(R"({"locations":{"a":{"item":"Missiles","amount":1.5}}})"), "fractional amount");
+  Check(RefusesSeed(R"({"locations":{"a":{"item":"Missiles","amount":"5"}}})"), "amount as a string");
+  Check(RefusesSeed(R"({"locations":{"a":{"item":"Missiles","amount":05}}})"), "leading zero");
+  Check(RefusesSeed(R"({"models":{"Missiles":{"character":1}}})", &reason) && Contains(reason, "model"),
+        "model entry without a model or acs");
+  Check(RefusesSeed(R"({"models":{"Banana":{"model":"1"}}})"), "unknown item name in models");
+  Check(RefusesSeed(R"({"models":{"Missiles":{"model":"0x"}}})"), "empty hex asset");
+  Check(RefusesSeed(R"({"models":{"Missiles":{"model":"123456789"}}})"), "nine hex digits");
+  Check(RefusesSeed(R"({"models":{"Missiles":{"model":"xyz"}}})"), "non-hex asset");
+  Check(RefusesSeed(R"({"models":{"Missiles":{"model":"1","character":-1}}})"), "negative character");
+  Check(RefusesSeed(R"({"models":{"Missiles":{"model":"1","animation":99999999999}}})"),
+        "animation out of range");
+  std::string deep = "{\"x\":";
+  for (int i = 0; i < 300; ++i)
+    deep += "{\"x\":";
+  deep += "1";
+  for (int i = 0; i < 301; ++i)
+    deep += "}";
+  Check(RefusesSeed(deep), "nesting limit");
+
+  // Since the move onto PortJson: unknown keys may hold any JSON value, and a
+  // problem in a well-formed file names where it is rather than a byte offset.
+  {
+    SeedFile seed;
+    Check(ParsesSeed(R"({"note":null,"tags":["a",1,{}],"locations":{"a":{"item":"Missiles","x":[null]}}})",
+                     seed) &&
+              seed.placements.size() == 1,
+          "arrays and null in unknown keys");
+    size_t offset = 0;
+    std::string why;
+    Check(!PortRandomizer::ParseSeedFile(R"({"locations":{"Chozo-1":{"item":"Banana"}}})", seed, offset,
+                                         why) &&
+              offset == PortRandomizer::kSeedNoOffset && Contains(why, "Chozo-1") && Contains(why, "Banana"),
+          "an invalid seed names the location and the item");
+    Check(!PortRandomizer::ParseSeedFile("{} x", seed, offset, why) && offset == 3,
+          "malformed JSON reports the byte offset");
+  }
+}
+
 // These tests set environment variables, which Windows spells differently and
 // which needs the _s form to be safe.
 bool SetEnv(const char* name, const char* value) {
@@ -218,6 +356,8 @@ int main(int argc, char** argv) try {
     }
     return 3;
   }
+
+  SeedParserTests();
 
   struct ExpectedItem {
     const char* name;

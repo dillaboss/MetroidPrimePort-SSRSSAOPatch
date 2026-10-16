@@ -112,6 +112,19 @@ int main() {
     Check(fs::exists(card / "01-GZLE-other.gci"), "other game untouched");
     Check(PortGci::GameFiles(card).size() == 1, "one game file");
   }
+#ifndef _WIN32
+  // An entry that cannot be inspected (a symlink loop) is passed over; it is
+  // not a failure to list the folder.
+  {
+    const fs::path odd = root / "odd-card";
+    fs::create_directories(odd);
+    std::error_code ec;
+    fs::create_symlink("loop.gci", odd / "loop.gci", ec);
+    Check(!ec, "symlink loop created");
+    const auto report = PortGci::ImportFile(source, odd, root / "scratch");
+    Check(report.copied == 1 && report.skipped == 0, "import beside an unreadable entry");
+  }
+#endif
   // Another game's .gci is refused.
   {
     Write(root / "zelda.gci", MakeGci("GZLE", "zelda", 1, 0));
@@ -174,6 +187,35 @@ int main() {
               PortGci::GameFiles(check).size() == 1 &&
               fs::exists(check / "01-GM8E-MetroidPrime A.gci"),
           "stale B dropped from the raw card");
+  }
+
+  // Emulator folder normalisation and the shared card base.
+  {
+    const fs::path emu = root / "emu";
+    const fs::path card = emu / "GC" / "USA" / "Card A";
+    fs::create_directories(card);
+    Check(PortGci::NormalizeEmulatorFolder(emu) == emu, "user folder stays");
+    Check(PortGci::NormalizeEmulatorFolder(emu / "GC") == emu, "GC folder -> user folder");
+    Check(PortGci::NormalizeEmulatorFolder(emu / "GC" / "USA") == emu, "region folder -> user folder");
+    Check(PortGci::NormalizeEmulatorFolder(card) == emu, "Card A folder -> user folder");
+    Check(PortGci::NormalizeEmulatorFolder(fs::path(card.string() + "/")) == emu, "trailing slash");
+
+    PortGci::SetGameCode("GM8E");
+    std::string why;
+    PortGci::SetEmulatorFolder(PortGci::PathString(card));
+    Check(PortGci::EmulatorFolder() == PortGci::PathString(emu), "folder stored normalised");
+    PortGci::SetShareEmulatorCard(false);
+    Check(PortGci::SharedCardBase(&why).empty() && !why.empty(), "sharing off: no base");
+    Check(PortGci::CardTargetDirectory("").empty(), "sharing off: default card");
+    PortGci::SetShareEmulatorCard(true);
+    Check(PortGci::SharedCardBase() == emu / "GC", "sharing on: <emu>/GC");
+    Check(PortGci::CardTargetDirectory("") == PortGci::PathString(emu / "GC"), "shared card is the target");
+    Check(PortGci::CardTargetDirectory("/ap") == "/ap", "Archipelago card wins");
+    fs::remove_all(card, ec);
+    Check(PortGci::SharedCardBase(&why).empty() && why.find("GCI Folder") != std::string::npos,
+          "no Card A: reason names the GCI folder");
+    PortGci::SetEmulatorFolder("");
+    PortGci::SetShareEmulatorCard(false);
   }
 
   fs::remove_all(root, ec);

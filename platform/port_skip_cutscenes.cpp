@@ -1,9 +1,12 @@
 #include "port_skip_cutscenes.h"
+#include "port_skip_streams.h"
 
 #include "port_apclient.h"
 #include "port_debug.h"
+#include "port_disc.h"
 #include "port_log.h"
 #include "port_randomizer.h"
+#include "port_revision_scripts.h"
 
 #include <algorithm>
 
@@ -15,8 +18,6 @@ struct SkipRoom {
   uint32_t offset;
   uint32_t size;
 };
-
-#include "port_skip_cutscenes_data.inc"
 
 using PickupRoom = SkipRoom;
 struct PickupModelEntry {
@@ -59,6 +60,41 @@ void PatchPickups(uint32_t mreaId, const uint8_t* scly, size_t size, std::vector
   }
 }
 
+// Builds an op stream in the generated streams' format (ApplyOps).
+struct OpWriter {
+  std::vector< uint8_t > ops;
+  void u32(uint32_t v) {
+    for (int shift = 24; shift >= 0; shift -= 8)
+      ops.push_back(uint8_t(v >> shift));
+  }
+  void conn(uint8_t op, uint32_t sender, uint32_t state, uint32_t msg, uint32_t target) {
+    ops.push_back(op);
+    u32(sender);
+    u32(state);
+    u32(msg);
+    u32(target);
+  }
+  void remove(uint32_t id) {
+    ops.push_back(6);
+    u32(id);
+  }
+};
+
+const uint32_t kHallOfTheElders = 0xFB54A0CB;
+
+// randomprime's Hall of the Elders skip has the trigger at the wave slot's
+// tube increment "Player Hint Disable Controls" 003402E6, and nothing on that
+// route decrements it (only the energy tank's timer does), so after the
+// statue's throw Samus lost every control but the spring ball until a reload
+// (issue #44). Release it where retail gives control back: at the tube top,
+// or when the throw's cinematic ends (also when it's skipped mid-throw).
+std::vector< uint8_t > HallOfTheEldersOps() {
+  OpWriter w;
+  w.conn(4, 0x0034004D, 3 /* Entered */, 5 /* Decrement */, 0x003402E6);
+  w.conn(4, 0x0034004A, 5 /* Inactive */, 5, 0x003402E6);
+  return std::move(w.ops);
+}
+
 const uint32_t kArtifactTemple = 0x2398E906;
 
 // Randomized games' Artifact Temple (applied after the patches above): the
@@ -66,22 +102,11 @@ const uint32_t kArtifactTemple = 0x2398E906;
 // cinematic, and the totems give every hint. The per-frame half, which wakes
 // the totems when the room loads, is PortArtifactTemple in CStateManager.cpp.
 std::vector< uint8_t > TempleOps() {
-  std::vector< uint8_t > ops;
-  auto u32 = [&](uint32_t v) {
-    for (int shift = 24; shift >= 0; shift -= 8)
-      ops.push_back(uint8_t(v >> shift));
-  };
+  OpWriter w;
   auto conn = [&](uint8_t op, uint32_t sender, uint32_t state, uint32_t msg, uint32_t target) {
-    ops.push_back(op);
-    u32(sender);
-    u32(state);
-    u32(msg);
-    u32(target);
+    w.conn(op, sender, state, msg, target);
   };
-  auto remove = [&](uint32_t id) {
-    ops.push_back(6);
-    u32(id);
-  };
+  auto remove = [&](uint32_t id) { w.remove(id); };
   // The artifact theme, and the music fade around it.
   remove(0x0410033C);
   remove(0x04100269);
@@ -100,8 +125,10 @@ std::vector< uint8_t > TempleOps() {
   for (uint32_t relay : {0x04100127u, 0x0410012Du, 0x04100133u, 0x04100139u, 0x0410013Fu,
                          0x04100145u})
     conn(4, 0x0010017C, 9, 13, relay);
-  return ops;
+  return std::move(w.ops);
 }
+
+bool PatchScripts(uint32_t mreaId, const uint8_t* scly, size_t size, std::vector< uint8_t >& out);
 
 } // namespace
 
@@ -111,35 +138,68 @@ bool Active() { return PortDebug::SkippableCutscenes() || Forced(); }
 
 bool PatchArea(uint32_t mreaId, const uint8_t* scly, size_t size, std::vector< uint8_t >& out) {
   out.clear();
-  if (!Active())
-    return false;
-  const SkipRoom* room =
-      FindRoom(kSkipRooms, kSkipRooms + sizeof(kSkipRooms) / sizeof(kSkipRooms[0]), mreaId);
-  if (room != nullptr) {
-    const int misses = ApplyOps(scly, size, kSkipOps + room->offset, room->size, out);
+  if (Active())
+    PatchScripts(mreaId, scly, size, out);
+  // Revision compatibility (USA 1.00 behaviour on later discs), after the
+  // patches above. Randomized games always want it; otherwise it's the
+  // setting. A miss keeps what the patches above made.
+  if (PortDebug::Revision100Compatibility() || Forced()) {
+    const PortDisc::Version version = PortDisc::Current();
+    const bool patched = !out.empty();
+    std::vector< uint8_t > fixed;
+    int misses = 0;
+    const PortRevisionScripts::Result result = PortRevisionScripts::Apply(
+        version, mreaId, patched ? out.data() : scly, patched ? out.size() : size, fixed, &misses);
+    if (result == PortRevisionScripts::Result::Patched)
+      out.swap(fixed);
+    else if (result == PortRevisionScripts::Result::Missed)
+      PortLog::Write("revision scripts: %s (room %08X) doesn't match (%d), left as is\n",
+                     PortRevisionScripts::Describe(version, mreaId), mreaId, misses);
+  }
+  return !out.empty();
+}
+
+namespace {
+
+bool PatchScripts(uint32_t mreaId, const uint8_t* scly, size_t size, std::vector< uint8_t >& out) {
+  SkipStream stream;
+  const bool hasSkip = SkipStreamFor(PortDisc::Current(), mreaId, stream);
+  bool skipped = false;
+  if (hasSkip) {
+    const int misses = ApplyOps(scly, size, stream.ops, stream.size, out);
     if (misses != 0) {
-      // A mod replaced the room, or the disc isn't GM8E01 v1.00: the patch
-      // could leave the script half-edited, so keep the room as it is. The
-      // pickup patch below assumes this one ran, so it is left off too.
+      // A mod replaced the room, or the disc isn't one the streams were made
+      // from: the patch could leave the script half-edited, so keep the room
+      // as it is. Only the skip is dropped; the patches below still apply.
       PortLog::Write("skippable cutscenes: room %08X doesn't match (%d), left unpatched\n",
                      mreaId, misses);
       out.clear();
-      return false;
+    } else {
+      skipped = true;
     }
   }
+  if (skipped && mreaId == kHallOfTheElders) {
+    const std::vector< uint8_t > ops = HallOfTheEldersOps();
+    std::vector< uint8_t > hall;
+    if (ApplyOps(out.data(), out.size(), ops.data(), ops.size(), hall) == 0)
+      out.swap(hall);
+    else
+      PortLog::Write("skippable cutscenes: Hall of the Elders control release doesn't match, left as is\n");
+  }
   const bool apGame = PortAp::RandomizedGame();
-  if (room != nullptr && mreaId == kLandingSite && apGame) {
+  if (skipped && mreaId == kLandingSite && apGame) {
     // Archipelago games start with Samus already out of the ship, as
     // randomprime's patch_landing_site_cutscene_triggers does.
     std::vector< uint8_t > landed;
-    if (ApplyOps(out.data(), out.size(), kLandingOps, sizeof(kLandingOps), landed) == 0)
+    const SkipStream landing = LandingStream();
+    if (ApplyOps(out.data(), out.size(), landing.ops, landing.size, landed) == 0)
       out.swap(landed);
     else
       PortLog::Write("skippable cutscenes: Landing Site intro skip doesn't match, left as is\n");
   }
   if (apGame) {
     std::vector< uint8_t > pickups;
-    if (room != nullptr)
+    if (skipped)
       PatchPickups(mreaId, out.data(), out.size(), pickups);
     else
       PatchPickups(mreaId, scly, size, pickups);
@@ -189,6 +249,8 @@ bool PatchArea(uint32_t mreaId, const uint8_t* scly, size_t size, std::vector< u
   }
   return !out.empty();
 }
+
+} // namespace
 
 bool PickupModel(int key, PortRandomizer::PickupModel& out) {
   for (const PickupModelEntry& entry : kPickupModels) {

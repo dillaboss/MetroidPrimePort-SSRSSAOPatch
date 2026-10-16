@@ -2,7 +2,11 @@ add_library(aurora_gx STATIC
         lib/gfx/bloom.cpp
         lib/gfx/volfog.cpp
         lib/gfx/screenspace.cpp
+        lib/gfx/thermal.cpp
+        lib/gfx/xray.cpp
         lib/gfx/shadow.cpp
+        lib/gfx/actor_shadow.cpp
+        lib/gfx/shadow_cascade.cpp
         lib/gfx/vfx.cpp
         lib/gfx/water.cpp
         lib/gfx/clear.cpp

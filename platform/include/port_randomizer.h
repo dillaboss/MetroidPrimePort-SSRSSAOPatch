@@ -1,6 +1,9 @@
 #ifndef METROID_PRIME_PORT_PORT_RANDOMIZER_H
 #define METROID_PRIME_PORT_PORT_RANDOMIZER_H
+#include <cstddef>
 #include <cstdint>
+#include <map>
+#include <string>
 
 namespace PortRandomizer {
 
@@ -13,6 +16,36 @@ struct PickupModel {
   uint32_t character = 0;
   uint32_t animation = 0;
 };
+
+// One location of a seed file: the item and, when given, the amount and
+// capacity it grants (each within -9999..9999).
+struct SeedPlacement {
+  int itemType = -1;
+  int amount = 0;
+  int capacity = 0;
+  bool hasAmount = false;
+  bool hasCapacity = false;
+};
+
+// A seed file (randomizer_seed.json, or MP_RANDO_SEED): a top-level object with
+// an optional "seed" name, "locations" (key -> {"item", "amount"?,
+// "capacity"?}, keys upper-cased) and "models" (item name -> {"model"?, "acs"?,
+// "character"?, "animation"?}). Unknown keys are ignored; a repeated key keeps
+// its last value.
+struct SeedFile {
+  std::string name;
+  std::map< std::string, SeedPlacement > placements;
+  std::map< int, PickupModel > models;
+};
+
+// The errorOffset of a seed that is well-formed JSON but not a valid seed.
+constexpr size_t kSeedNoOffset = static_cast< size_t >(-1);
+
+// Parses a seed file's text (PortJson, then the schema above). False on a
+// malformed or invalid seed, with why: errorOffset is the byte offset for
+// malformed JSON, kSeedNoOffset for a well-formed file that is not a seed.
+bool ParseSeedFile(const std::string& text, SeedFile& out, size_t& errorOffset,
+                   std::string& errorReason);
 
 // Loads the configured seed once. Call on the game thread; never throws.
 void EnsureLoaded();
@@ -32,6 +65,11 @@ const char* StatusText();
 bool ApplyPickup(uint32_t worldAssetId, uint32_t areaAssetId, uint32_t entityId,
                  int& itemType, int& capacity, int& amount,
                  const PickupModel& model = PickupModel());
+// The item and capacity the seed puts at a location, for the map's pickup
+// kinds. Leaves them alone and returns false when the randomizer is off or the
+// location keeps its item; a placement without a capacity keeps `capacity`.
+bool Placed(uint32_t worldAssetId, uint32_t areaAssetId, uint32_t entityId, int& itemType,
+            int& capacity);
 // Looks up the model the seed associates with an item type. False when the seed
 // carries no model for it, in which case the original model is kept.
 bool ModelForItem(int itemType, PickupModel& out);

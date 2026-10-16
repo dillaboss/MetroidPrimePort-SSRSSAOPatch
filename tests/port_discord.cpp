@@ -50,7 +50,7 @@ int main() {
 
   // JSON strings and field limits.
   {
-    CHECK(JsonString("a\"b\\c\n\x01") == "\"a\\\"b\\\\c\\u000a\\u0001\"");
+    CHECK(JsonString("a\"b\\c\n\x01") == "\"a\\\"b\\\\c\\n\\u0001\"");
     CHECK(JsonString("Ph\xc3\xa9ndrana") == "\"Ph\xc3\xa9ndrana\"");
     CHECK(FitField("x") == "x ");
     CHECK(FitField("xy") == "xy");

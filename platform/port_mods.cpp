@@ -29,7 +29,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <array>
+#include <cstdio>
 #include <map>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -58,6 +61,13 @@ std::unordered_map<uint32_t, std::string> sRoomGeos;
 std::unordered_map<uint32_t, std::string> sRoomLiquids;
 // <FRME id>.hudbars files, by frame.
 std::unordered_map<uint32_t, std::string> sHudBars;
+// thermal.lut: the thermal visor's heat gradient (port_thermal.h).
+std::string sThermalLut;
+// effectids.map: the retail effect ids a mod gives a second user its own effect for. Loaded on first use.
+std::string sEffectIdMapPath;
+std::mutex sEffectIdsMutex;
+bool sEffectIdsLoaded = false;
+std::map<std::array<uint32_t, 3>, uint32_t> sEffectIds;
 struct BoundTexture {
   aurora::texture::ReplacementRegistration registration;
   uint32_t id = 0;
@@ -351,6 +361,25 @@ std::string HudBarsPath(uint32_t frame) {
   return found != sHudBars.end() ? found->second : std::string();
 }
 
+std::string ThermalLutPath() { return sThermalLut; }
+
+uint32_t RemapEffectId(uint32_t owner, uint32_t field, uint32_t id) {
+  std::lock_guard<std::mutex> lock(sEffectIdsMutex);
+  if (!sEffectIdsLoaded) {
+    sEffectIdsLoaded = true;
+    std::ifstream in(PathFromString(sEffectIdMapPath));
+    std::string line;
+    while (std::getline(in, line)) {
+      unsigned a = 0, b = 0, c = 0, d = 0;
+      if (std::sscanf(line.c_str(), "%x %x %x %x", &a, &b, &c, &d) == 4) {
+        sEffectIds[{a, b, c}] = d;
+      }
+    }
+  }
+  const auto found = sEffectIds.find({owner, field, id});
+  return found != sEffectIds.end() ? found->second : id;
+}
+
 std::string RoomGeoPath(uint32_t mrea) {
   const auto found = sRoomGeos.find(mrea);
   return found != sRoomGeos.end() ? found->second : std::string();
@@ -402,6 +431,13 @@ void Initialize() {
   sRoomGeos.clear();
   sRoomLiquids.clear();
   sHudBars.clear();
+  sThermalLut.clear();
+  {
+    std::lock_guard<std::mutex> lock(sEffectIdsMutex);
+    sEffectIdMapPath.clear();
+    sEffectIds.clear();
+    sEffectIdsLoaded = false;
+  }
   sStatus.folder = Folder();
   sStatus.active = PortDebug::ModsEnabled() && !sSuspended;
   if (sStatus.folder.empty()) {
@@ -506,6 +542,14 @@ void Initialize() {
         sMaterialCubes[id] = PathString(file);
         continue;
       }
+      if (name == "effectids.map") {
+        sEffectIdMapPath = PathString(file);
+        continue;
+      }
+      if (name == "thermal.lut") {
+        sThermalLut = PathString(file);
+        continue;
+      }
       if (PortHudBars::ParseFileName(name, id)) {
         sHudBars[id] = PathString(file);
         continue;
@@ -598,13 +642,16 @@ void Initialize() {
       }
       pending.push_back(std::move(pak));
     }
+    // Resources are found by id alone, so an added id must not repeat under
+    // another type: a model would get the texture's bytes.
     std::vector<const LooseResource*> added;
+    std::set<uint32_t> addedIds;
     for (const auto& [key, resource] : loose) {
       if (used.count(key) != 0) {
         continue;
       }
       const std::string name = PathString(PathFromString(resource.hostPath).filename());
-      if (knownIds.count(key.second) != 0) {
+      if (knownIds.count(key.second) != 0 || !addedIds.insert(key.second).second) {
         Message(resource.mod + ": " + name + " reuses an id another type holds; ignored");
       } else if (homeEntry < 0) {
         Message(resource.mod + ": " + name + " is in no PAK and NoARAM.pak is missing; ignored");

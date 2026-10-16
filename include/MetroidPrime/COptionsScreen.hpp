@@ -25,6 +25,9 @@ public:
   bool ShouldLeftTableAdvance() override;
   bool ShouldRightTableAdvance() override;
   uint GetRightTableCount() const override;
+#ifdef TARGET_PC
+  void PortPointerInput(CFinalInput& input) override;
+#endif
 
   COptionsScreen(const CStateManager& mgr, CGuiFrame& frame, const CStringTable& pauseStrg);
 
@@ -43,6 +46,9 @@ private:
   CRumbleGenerator x1a8_rumble;
   float x29c_optionAlpha;
   bool x2a0_24_inOptionBody : 1;
+#ifdef TARGET_PC
+  uint mPortRowCount; // rows last frame (Twin Stick shows Stick Aim Speed)
+#endif
 };
 CHECK_SIZEOF(COptionsScreen, 0x2a4)
 

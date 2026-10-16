@@ -28,8 +28,29 @@ report*.json
 
 # Miscellaneous
 /*.txt
+!/CMakeLists.txt
 *.exe
 *.dol
+
+# Game data: disc images and dumps are the user's own and must never be committed.
+*.iso
+*.gcm
+*.rvz
+*.ciso
+*.gcz
+*.wbfs
+*.wia
+*.nsp
+*.xci
+*.nca
+prod.keys
+title.keys
+
+# Packaging output from the CI steps when run locally
+/dist/
+/ffmpeg-min/
+/build-mac/
+/build-win/
 
 # Port runtime output
 screenshots/
@@ -46,3 +67,4 @@ android/*.keystore
 /AGENTS.md
 /CLAUDE.md
 /STATUS.md
+/STATUS-archive.md

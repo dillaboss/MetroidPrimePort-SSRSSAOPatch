@@ -1,6 +1,8 @@
 #include "MetroidPrime/Player/CPlayer.hpp"
 
+#include "port_console.h"
 #include "port_debug.h"
+#include "port_mouse.h"
 #include "port_freecam.h"
 
 #include "Collision/CInternalCollisionStructure.hpp"
@@ -765,6 +767,81 @@ void CPlayer::UpdateGunTransform(const CVector3f& gunPos, CStateManager& mgr) {
     break;
   }
 
+#ifdef TARGET_PC
+  // Port: pointer aim. The gun sits off to the side of the eye, so a shot parallel to the
+  // ray through the pointer would miss what the pointer is on. Shots and the gun model aim
+  // from the gun at the point the ray hits instead (or a far point when it hits nothing);
+  // the model turns only so far, so it stays in view. No assist bends the shot off the
+  // pointer (a lock re-centres the pointer and aims as usual).
+  float pointerX = 0.f;
+  float pointerY = 0.f;
+  x490_gun->PortSetPointerAimPoint(false, CVector3f::Zero());
+  if (x498_gunHolsterState == kGH_Drawn && PortDebug::PointerAimPosition(pointerX, pointerY) &&
+      (pointerX != 0.f || pointerY != 0.f)) {
+    const CGameCamera& cam = mgr.GetCameraManager()->GetCurrentCamera(mgr);
+    // The view's own transform: the crosshair is drawn from it, and the gun-follow camera
+    // can trail it by a few degrees.
+    const CTransform4f viewXf = cam.GetTransform();
+    float yaw = 0.f;
+    float pitch = 0.f;
+    PortMouse::PointerAim::RayAngles(pointerX, pointerY, cam.GetRenderFov(),
+                                     cam.GetAspectRatio(), yaw, pitch);
+    const CVector3f rayDir = viewXf.Rotate(
+        CVector3f(sinf(yaw) * cosf(pitch), cosf(yaw) * cosf(pitch), sinf(pitch)));
+    const CVector3f eye = viewXf.GetTranslation();
+    const float kAimRange = 100.f;
+    const float kMinAimDistance = 3.f;
+    float distance = kAimRange;
+    {
+      static const CMaterialFilter filter = CMaterialFilter::MakeIncludeExclude(
+          CMaterialList(kMT_Solid), CMaterialList(kMT_Player, kMT_ProjectilePassthrough));
+      TEntityList nearList;
+      mgr.BuildNearList(nearList, eye, rayDir, kAimRange, filter, this);
+      TUniqueId hitId = kInvalidUniqueId;
+      const CRayCastResult hit =
+          mgr.RayWorldIntersection(hitId, eye, rayDir, kAimRange, filter, nearList);
+      if (hit.IsValid()) {
+        distance = CMath::Max((hit.GetPoint() - eye).Magnitude(), kMinAimDistance);
+      }
+    }
+    CVector3f toAim = eye + rayDir * distance - viewGunPos;
+    if (!toAim.CanBeNormalized()) {
+      toAim = rayDir;
+    }
+    CTransform4f aimXf = CTransform4f::LookAt(CVector3f::Zero(), toAim);
+    aimXf.SetTranslation(viewGunPos);
+    // With the FOV slider off retail the gun is drawn at the retail FOV (CStateManager's
+    // RenderGun pass), so the model aims where the point sits under that projection: the
+    // same screen spot as the crosshair at the same depth.
+    CVector3f toModelAim = toAim;
+    if (mgr.GetCameraManager()->IsInFPCamera() && cam.GetFov() != PortDebug::kFovRetail) {
+      const float gunTan =
+          tanf(CGameCamera::VertPlusFov(PortDebug::kFovRetail, cam.GetAspectRatio()) * 0.5f *
+               (M_PIF / 180.f));
+      const float viewTan = tanf(cam.GetRenderFov() * 0.5f * (M_PIF / 180.f));
+      const CVector3f p = viewXf.TransposeRotate(rayDir * distance);
+      const float k = gunTan / viewTan;
+      toModelAim = eye + viewXf.Rotate(CVector3f(p.GetX() * k, p.GetY(), p.GetZ() * k)) - viewGunPos;
+      if (!toModelAim.CanBeNormalized()) {
+        toModelAim = toAim;
+      }
+    }
+    // The same direction as camera-space yaw (+right) and pitch (+up), for the clamp.
+    const CVector3f local = viewXf.TransposeRotate(toModelAim.AsNormalized());
+    yaw = atan2f(local.GetX(), local.GetY());
+    pitch = atan2f(local.GetZ(), sqrtf(local.GetX() * local.GetX() + local.GetY() * local.GetY()));
+    const float kMaxGunAngle = 50.f * (M_PIF / 180.f);
+    PortMouse::PointerAim::ClampAngles(yaw, pitch, kMaxGunAngle);
+    gunXf = viewXf.GetRotation() * CTransform4f::RotateZ(CRelAngle::FromRadians(-yaw)) *
+            CTransform4f::RotateX(CRelAngle::FromRadians(pitch));
+    gunXf.SetTranslation(viewGunPos);
+    x490_gun->SetTransform(gunXf);
+    UpdateAimTargetPrediction(aimXf, mgr);
+    x490_gun->SetAssistAimTransform(aimXf);
+    x490_gun->PortSetPointerAimPoint(true, eye + rayDir * distance);
+    return;
+  }
+#endif
   x490_gun->SetTransform(gunXf);
   CTransform4f out = gunXf;
   UpdateAimTargetPrediction(out, mgr);
@@ -787,6 +864,17 @@ void CPlayer::UpdateArmAndGunTransforms(float dt, CStateManager& mgr) {
     grappleOffset = x490_gun->GetGrappleArm().IsArmMoving()
                         ? CVector3f::Zero()
                         : gpTweakPlayerGun->x64_grapplingArmPosition;
+#ifdef TARGET_PC
+    // Port: the user's arm cannon offset (issue #72). It moves the real gun, so shots leave from
+    // the moved muzzle; the grapple arm follows so the two stay together.
+    float userOffset[3];
+    PortDebug::GunOffset(userOffset);
+    const CVector3f userGunOffset(userOffset[0], userOffset[1], userOffset[2]);
+    gunOffset += userGunOffset;
+    if (!x490_gun->GetGrappleArm().IsArmMoving()) {
+      grappleOffset += userGunOffset;
+    }
+#endif
     gunOffset[kDZ] += GetEyeHeight();
     grappleOffset[kDZ] += GetEyeHeight();
   }
@@ -844,7 +932,7 @@ void CPlayer::UpdateMouseAim(CStateManager& mgr) {
     // pitch-down under free mouse look, and CheckPostGrapple reads a zero jump
     // timer in the air as a grapple jump, which blocked the sideways dash.
     x3ec_freeLookPitchAngle = PortDebug::AimPitch();
-    x9c4_25_showCrosshairs = PortDebug::MouseCrosshair();
+    x9c4_25_showCrosshairs = PortDebug::AimCrosshair() && MouseLookIsFree(mgr);
   }
 }
 
@@ -866,7 +954,8 @@ static void PublishWheelState(const CPlayer& player, CStateManager& mgr) {
       CPlayerState::kIT_PowerBeam, CPlayerState::kIT_IceBeam, CPlayerState::kIT_WaveBeam,
       CPlayerState::kIT_PlasmaBeam};
   uint mask = usable ? 1u << 12 : 0u;
-  // The overlay shows its R button while morphed, for the Spider Ball.
+  // The overlay shows its R button while morphed, for the Spider Ball, and
+  // relabels its buttons with the morph ball's actions.
   if (player.GetMorphballTransitionState() != CPlayer::kMS_Unmorphed) {
     mask |= 1u << 13;
   }
@@ -1481,7 +1570,7 @@ void CPlayer::UpdateFreeLookState(const CFinalInput& input, float dt, CStateMana
     x3e4_freeLookYawAngle = 0.f;
     x3e8_horizFreeLookAngleVel = 0.f;
     x3f0_vertFreeLookAngleVel = 0.f;
-    x9c4_25_showCrosshairs = PortDebug::MouseCrosshair();
+    x9c4_25_showCrosshairs = PortDebug::AimCrosshair() && MouseLookIsFree(mgr);
     return;
   }
   if (x304_orbitState == kOS_ForcedOrbitObject || IsMorphBallTransitioning() ||
@@ -1764,6 +1853,11 @@ void CPlayer::PreThink(float dt, CStateManager& mgr) {
   x560_prevDamageAmt = 0.f;
   x564_damageLocation = CVector3f::Zero();
   xa04_preThinkDt = dt;
+#ifdef TARGET_PC
+  if (const float hurt = PortConsoleTakePendingHurt(); hurt > 0.f) {
+    TakeDamage(true, GetTranslation(), hurt, kWT_AI, mgr);
+  }
+#endif
 }
 
 void CPlayer::AdjustEyeOffset(CStateManager& mgr) {
@@ -2726,8 +2820,10 @@ void CPlayer::UpdateScanningState(const CFinalInput& input, CStateManager& mgr, 
       if (const CActor* act = TCastToConstPtr< CActor >(mgr.ObjectById(GetOrbitTargetId()))) {
         if (const CScannableObjectInfo* scanInfo = act->GetScannableObjectInfo()) {
           float totalTime = scanInfo->GetTotalDownloadTime();
-          x3ac_scanningTime = rstl::min_val(x3ac_scanningTime + dt, totalTime);
-          x3b0_curScanTime += dt;
+          // Port: F1 Scan speed runs the bar and the scan's minimum time faster.
+          const float scanDt = dt * PortDebug::ScanSpeed();
+          x3ac_scanningTime = rstl::min_val(x3ac_scanningTime + scanDt, totalTime);
+          x3b0_curScanTime += scanDt;
           mgr.PlayerState()->SetScanTime(scanInfo->GetScannableObjectId(),
                                          x3ac_scanningTime / totalTime);
           if (x3ac_scanningTime >= totalTime &&
@@ -3282,7 +3378,7 @@ void CPlayer::DoPostCameraStuff(float dt, CStateManager& mgr) {
     if (PortDebug::MouseAim() && PortDebug::MouseGameplayActive()) x490_gun->CancelMouseInput(mgr);
     PortDebug::SetMouseGameplayActive(false);
   } else {
-    x9c4_25_showCrosshairs = PortDebug::MouseCrosshair();
+    x9c4_25_showCrosshairs = PortDebug::AimCrosshair() && MouseLookIsFree(mgr);
     if (PortDebug::AimInitialized()) x3ec_freeLookPitchAngle = PortDebug::AimPitch();
   }
   UpdateArmAndGunTransforms(dt, mgr);

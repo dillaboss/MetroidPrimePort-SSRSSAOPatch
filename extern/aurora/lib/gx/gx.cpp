@@ -6,11 +6,13 @@
 #include "../webgpu/gpu.hpp"
 #include "../internal.hpp"
 #include "../window.hpp"
+#include "../gfx/hash.hpp"
 #include "../gfx/resources.hpp"
 #include "../gfx/probe.hpp"
 #include "../gfx/recording.hpp"
 #include "../gfx/resource_cache.hpp"
 #include "../gfx/shadow.hpp"
+#include "../gfx/actor_shadow.hpp"
 #include "../gfx/volfog.hpp"
 #include "../gfx/texture.hpp"
 #include "gx_fmt.hpp"
@@ -24,7 +26,9 @@
 #include <cmath>
 #include <mutex>
 #include <algorithm>
+#include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <utility>
 
 static aurora::Module Log("aurora::gx");
@@ -38,6 +42,11 @@ wgpu::BindGroup g_emptyTextureBindGroup;
 
 namespace {
 wgpu::Sampler sEmptySampler;
+// The sampler each texture slot took last, by its descriptor's value fields (build_bind_groups)
+constexpr auto kSamplerKeyOffset = offsetof(wgpu::SamplerDescriptor, addressModeU);
+constexpr auto kSamplerKeySize = offsetof(wgpu::SamplerDescriptor, maxAnisotropy) + sizeof(uint16_t) - kSamplerKeyOffset;
+std::array<std::array<u8, kSamplerKeySize>, MaxTextures> sSlotSamplerKeys{};
+std::array<wgpu::Sampler, MaxTextures> sSlotSamplers;
 wgpu::Texture sEmptyTexture;
 wgpu::TextureView sEmptyTextureView;
 std::mutex sBindGroupLayoutMutex;
@@ -220,7 +229,15 @@ wgpu::PrimitiveState to_primitive_state(GXCullMode gx_cullMode) {
       .cullMode = cullMode,
   };
 }
+std::atomic_bool sPerPixelLighting{false};
+std::atomic_bool sBlockingPipelines{false};
 } // namespace
+
+void set_per_pixel_lighting(bool enabled) noexcept { sPerPixelLighting.store(enabled, std::memory_order_relaxed); }
+bool per_pixel_lighting() noexcept { return sPerPixelLighting.load(std::memory_order_relaxed); }
+
+void set_blocking_pipelines(bool enabled) noexcept { sBlockingPipelines.store(enabled, std::memory_order_relaxed); }
+bool blocking_pipelines() noexcept { return sBlockingPipelines.load(std::memory_order_relaxed); }
 
 void set_viewport_policy(AuroraViewportPolicy policy) noexcept {
   sPendingViewportPolicy.store(policy, std::memory_order_release);
@@ -280,12 +297,15 @@ gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept 
   const float right = static_cast<float>(logicalScissor.x + logicalScissor.width) * scaleX;
   const float bottom = static_cast<float>(logicalScissor.y + logicalScissor.height) * scaleY;
 
-  const auto mappedLeft = std::clamp(static_cast<int32_t>(std::floor(left)), 0, static_cast<int32_t>(targetWidth));
-  const auto mappedTop = std::clamp(static_cast<int32_t>(std::floor(top)), 0, static_cast<int32_t>(targetHeight));
+  // Every edge rounds the same way, so rects that share a logical edge share a target one. Flooring
+  // the left and ceiling the right overlapped them by a pixel at non-integer scales, and a model
+  // drawn in abutting scissored slices (the widescreen HUD warp) blended that column twice.
+  const auto mappedLeft = std::clamp(static_cast<int32_t>(std::lround(left)), 0, static_cast<int32_t>(targetWidth));
+  const auto mappedTop = std::clamp(static_cast<int32_t>(std::lround(top)), 0, static_cast<int32_t>(targetHeight));
   const auto mappedRight =
-      std::clamp(static_cast<int32_t>(std::ceil(right)), mappedLeft, static_cast<int32_t>(targetWidth));
+      std::clamp(static_cast<int32_t>(std::lround(right)), mappedLeft, static_cast<int32_t>(targetWidth));
   const auto mappedBottom =
-      std::clamp(static_cast<int32_t>(std::ceil(bottom)), mappedTop, static_cast<int32_t>(targetHeight));
+      std::clamp(static_cast<int32_t>(std::lround(bottom)), mappedTop, static_cast<int32_t>(targetHeight));
 
   return {
       .x = mappedLeft,
@@ -333,26 +353,36 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
                                     wgpu::ShaderModule shader, const char* label) noexcept {
   ZoneScoped;
   if (config.shadowPass != 0) {
-    // The sun's shadow map: depth only, both faces, with a slope bias against acne.
+    // The sun's shadow map: depth only, culled as the draw is, with Remastered's shadow pass bias
+    // (2 units, slope 4, no clamp).
     const wgpu::DepthStencilState depthStencil{
         .format = gfx::shadow::MapFormat,
         .depthWriteEnabled = true,
         .depthCompare = wgpu::CompareFunction::Less,
         .depthBias = 2,
-        .depthBiasSlopeScale = 2.0f,
+        .depthBiasSlopeScale = 4.0f,
+    };
+    // Pass 2 alpha-tests (a Remastered cutout): its fragment stage samples the draw's own textures, so it
+    // takes the colour pass's plain texture layout (never the receiver one, which holds this map) and has no colour target.
+    const bool cut = config.shadowPass == 2;
+    const wgpu::FragmentState cutFragment{
+        .module = shader,
+        .entryPoint = "fs_shadow",
+        .targetCount = 0,
     };
     const wgpu::RenderPipelineDescriptor descriptor{
         .label = label,
-        .layout = sShadowPipelineLayout,
+        .layout = cut ? sPipelineLayout : sShadowPipelineLayout,
         .vertex =
             {
                 .module = shader,
-                .entryPoint = "vs_shadow",
+                .entryPoint = cut ? "vs_shadow_cut" : "vs_shadow",
                 .bufferCount = static_cast<uint32_t>(vtxBuffers.size()),
                 .buffers = vtxBuffers.data(),
             },
-        .primitive = to_primitive_state(GX_CULL_NONE),
+        .primitive = to_primitive_state(config.cullMode),
         .depthStencil = &depthStencil,
+        .fragment = cut ? &cutFragment : nullptr,
     };
     return g_device.CreateRenderPipeline(&descriptor);
   }
@@ -370,7 +400,8 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
   const auto blendState =
       to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp, config.dstAlpha);
   const std::array colorTargets{wgpu::ColorTargetState{
-      .format = g_graphicsConfig.surfaceConfiguration.format,
+      // The HDR scene's RGBA16F target is a different format from every other pass's.
+      .format = config.shaderConfig.sceneHdr ? webgpu::SceneHdrFormat : g_graphicsConfig.surfaceConfiguration.format,
       .blend = &blendState,
       .writeMask = to_write_mask(config.colorUpdate, config.alphaUpdate),
   }};
@@ -439,6 +470,9 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
 
   const auto& vtxFmt = g_gxState.vtxFmts[fmt];
   config.shaderConfig = {};
+  // From the pass being recorded (the replayed FIFO's), so an offscreen pass or the next frame's
+  // LDR scene never takes an HDR pipeline.
+  config.shaderConfig.sceneHdr = gfx::scene_hdr_pass_active();
   config.shaderConfig.fogType = g_gxState.fog.type;
   config.shaderConfig.fogRangeEnabled = g_gxState.fog.rangeEnabled;
   config.shaderConfig.pbr = g_gxState.pbr;
@@ -528,6 +562,7 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
       };
     }
   }
+  config.shaderConfig.perPixelLight = wants_per_pixel_light(config.shaderConfig);
   for (u8 i = 0; i < g_gxState.numTexGens; ++i) {
     config.shaderConfig.tcgs[i] = g_gxState.tcgs[i];
   }
@@ -553,24 +588,65 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   }
   config.shaderConfig.volFog = drawId ? VolFogNone : vol_fog_mode(depthOnly);
   config.shaderConfig.shadow = g_gxState.shadowCaster && g_gxState.shadowActive && config.shaderConfig.lineMode == 0;
-  config = {
-      .msaaSamples = gfx::get_sample_count(),
-      .shaderConfig = config.shaderConfig,
-      .depthFunc = depthEqual ? GX_EQUAL : g_gxState.depthFunc,
-      .cullMode = cullMode,
-      .blendMode = drawId ? GX_BM_NONE : g_gxState.blendMode,
-      .blendFacSrc = g_gxState.blendFacSrc,
-      .blendFacDst = g_gxState.blendFacDst,
-      .blendOp = g_gxState.blendOp,
-      .dstAlpha = g_gxState.dstAlpha,
-      .polygonOffsetBits = std::bit_cast<uint32_t>(polygonOffset),
-      .polygonOffsetScaleBits = std::bit_cast<uint32_t>(polygonOffsetScale),
-      .polygonOffsetClampBits = std::bit_cast<uint32_t>(g_gxState.clamp),
-      .depthCompare = g_gxState.depthCompare,
-      .depthUpdate = g_gxState.depthUpdate && !depthEqual,
-      .alphaUpdate = g_gxState.alphaUpdate && !depthOnly,
-      .colorUpdate = g_gxState.colorUpdate && !depthOnly,
-  };
+  if (g_gxState.actorDecal && config.shaderConfig.shadow && !drawId && !depthOnly) {
+    // Remastered's actor shadow decal: the receiver's geometry multiplies the frame by the shadow
+    // alone, so none of the draw's own shading, fog or PBR reaches the shader.
+    auto& sc = config.shaderConfig;
+    sc.actorDecal = 1;
+    sc.pbr = 0;
+    sc.pbrKind = 0;
+    sc.pbrBindPos = false;
+    sc.pbrBindLe = false;
+    sc.pbrLightmapAttr = GX_VA_NULL;
+    sc.sdf = 0;
+    sc.hudSample = 0;
+    sc.perPixelLight = 0;
+    sc.fogType = GX_FOG_NONE;
+    sc.fogRangeEnabled = false;
+    sc.volFog = VolFogNone;
+    sc.alphaCompare = {};
+    sc.numIndStages = 0;
+    sc.indStages = {};
+    for (auto& ts : sc.tevStages) {
+      ts = {};
+    }
+    sc.tevStageCount = 1;
+  } else if (g_gxState.actorDecal) {
+    config.shaderConfig.shadow = false;
+  }
+  // Field by field: an aggregate assignment would copy the 2.7 KB shader config twice more on
+  // every pipeline switch. Every field outside shaderConfig is written here.
+  config.version = GXPipelineConfigVersion;
+  config.msaaSamples = gfx::get_sample_count();
+  config.depthFunc = depthEqual ? GX_EQUAL : g_gxState.depthFunc;
+  config.cullMode = cullMode;
+  config.blendMode = drawId ? GX_BM_NONE : g_gxState.blendMode;
+  config.blendFacSrc = g_gxState.blendFacSrc;
+  config.blendFacDst = g_gxState.blendFacDst;
+  config.blendOp = g_gxState.blendOp;
+  config.dstAlpha = g_gxState.dstAlpha;
+  config.polygonOffsetBits = std::bit_cast<uint32_t>(polygonOffset);
+  config.polygonOffsetScaleBits = std::bit_cast<uint32_t>(polygonOffsetScale);
+  config.polygonOffsetClampBits = std::bit_cast<uint32_t>(g_gxState.clamp);
+  config.shadowPass = 0;
+  config.depthCompare = g_gxState.depthCompare;
+  config.depthUpdate = g_gxState.depthUpdate && !depthEqual;
+  if (config.shaderConfig.actorDecal != 0) {
+    // Framebuffer *= the decal (DstColor, Zero), LEQUAL against the world's depth without writing,
+    // back faces culled; the pipeline state of Remastered's actor shadow draw.
+    config.blendMode = GX_BM_BLEND;
+    config.blendFacSrc = GX_BL_SRCCLR;
+    config.blendFacDst = GX_BL_ZERO;
+    config.depthFunc = GX_LEQUAL;
+    config.depthCompare = true;
+    config.depthUpdate = false;
+    // The receiver keeps its own cull (back faces for the world's geometry), as Remastered's
+    // decal draw does.
+  }
+  config.alphaUpdate = g_gxState.alphaUpdate && !depthOnly;
+  config.colorUpdate = g_gxState.colorUpdate && !depthOnly;
+  static_assert(sizeof(PipelineConfig) == sizeof(ShaderConfig) + 13 * sizeof(uint32_t) + 4 * sizeof(bool),
+                "a new PipelineConfig field must be written above");
 }
 
 // The lightmap's slot is the last binding, left out of group 2 when the device has no room for it.
@@ -603,7 +679,10 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
   textureEntries[kVolFogFroxelBinding].textureView = gfx::volfog::froxel_view().Get();
   textureEntries[kVolFogSamplerBinding].binding = kVolFogSamplerBinding;
   textureEntries[kVolFogSamplerBinding].sampler = gfx::volfog::sampler().Get();
-  if (info.shadowReceive) {
+  if (info.shadowReceive && info.actorDecal) {
+    textureEntries[kShadowMapBinding].textureView = gfx::actor_shadow::map_view().Get();
+    textureEntries[kShadowSamplerBinding].sampler = gfx::actor_shadow::sampler().Get();
+  } else if (info.shadowReceive) {
     textureEntries[kShadowMapBinding].textureView = gfx::shadow::map_view().Get();
     textureEntries[kShadowSamplerBinding].sampler = gfx::shadow::sampler().Get();
   }
@@ -633,7 +712,14 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
           samplerDescriptor.mipmapFilter = wgpu::MipmapFilterMode::Nearest;
         }
       }
-      samplerEntry.sampler = gfx::sampler_ref(samplerDescriptor).Get();
+      // Each slot keeps the sampler it took last: slots mostly see the same sampler state, and the cache
+      // never drops a sampler before shutdown, so this saves the hash and the lock.
+      const auto* samplerKey = reinterpret_cast<const u8*>(&samplerDescriptor) + kSamplerKeyOffset;
+      if (!sSlotSamplers[i] || std::memcmp(sSlotSamplerKeys[i].data(), samplerKey, kSamplerKeySize) != 0) {
+        sSlotSamplers[i] = gfx::sampler_ref(samplerDescriptor);
+        std::memcpy(sSlotSamplerKeys[i].data(), samplerKey, kSamplerKeySize);
+      }
+      samplerEntry.sampler = sSlotSamplers[i].Get();
     } else {
       textureEntry.textureView = sEmptyTextureView.Get();
       samplerEntry.sampler = sEmptySampler.Get();
@@ -645,8 +731,16 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
       .entryCount = texture_binding_count(),
       .entries = textureEntries.data(),
   };
+  // Every entry holds only a texture view or a sampler at a fixed binding, so those handles and the layout
+  // identify the bind group; hashing them is far cheaper than hashing the whole entries.
+  std::array<const void*, kTextureBindings + 1> key{};
+  key[0] = textureBindGroupDescriptor.layout;
+  for (size_t i = 0; i < textureBindGroupDescriptor.entryCount; ++i) {
+    key[i + 1] = textureEntries[i].textureView ? static_cast<const void*>(textureEntries[i].textureView)
+                                               : static_cast<const void*>(textureEntries[i].sampler);
+  }
   return {
-      .textureBindGroup = gfx::bind_group_ref(textureBindGroupDescriptor),
+      .textureBindGroup = gfx::bind_group_ref(xxh3_hash(key), textureBindGroupDescriptor),
   };
 }
 
@@ -744,7 +838,7 @@ void initialize() noexcept {
         .texture =
             {
                 .sampleType = wgpu::TextureSampleType::Depth,
-                .viewDimension = wgpu::TextureViewDimension::e2D,
+                .viewDimension = wgpu::TextureViewDimension::e2DArray,
             },
     };
     textureEntries[kShadowSamplerBinding] = {
@@ -873,6 +967,7 @@ void shutdown() noexcept {
   sShadowTextureBindGroupLayout = {};
   sShadowRecvPipelineLayout = {};
   sShadowPipelineLayout = {};
+  sSlotSamplers.fill({});
   {
     std::lock_guard lock{sBindGroupLayoutMutex};
     sUniformBindGroupLayouts.clear();
@@ -884,6 +979,7 @@ void shutdown() noexcept {
   g_gxState.loadedTextures.fill({});
   g_gxState.loadedTluts.fill({});
   clear_copy_texture_cache();
+  g_gxState.copySceneLinear = false;
   texture::shutdown();
 }
 } // namespace aurora::gx

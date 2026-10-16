@@ -4,6 +4,9 @@
 #include "../gx/gx.hpp"
 #include "../gx/texture.hpp"
 #include "../logging.hpp"
+#include "../webgpu/gpu.hpp"
+#include "fx_pipelines.hpp"
+#include "pipeline_cache.hpp"
 #include "probe.hpp"
 #include "recording.hpp"
 #include "resource_cache.hpp"
@@ -403,7 +406,11 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
 }
 )";
 
+// Pool threads of the pipeline cache create pipelines too.
+std::mutex g_staticMutex;
+
 void ensure_static(const wgpu::Device& device) {
+  std::scoped_lock lock{g_staticMutex};
   if (g_state.pipelineLayout) {
     return;
   }
@@ -452,14 +459,43 @@ void ensure_static(const wgpu::Device& device) {
   g_state.pipelineLayout = device.CreatePipelineLayout(&pipelineLayoutDescriptor);
 }
 
-wgpu::RenderPipeline make_pipeline(const DrawContext& ctx, const Payload& p) {
-  std::string source = std::string("const BOTTOM: bool = ") + ((p.flags & 1) != 0 ? "true" : "false") +
-                       ";\nconst RAIN: bool = " + ((p.flags & 2) != 0 ? "true" : "false") + ";\n";
-  source += ShaderSource;
+PipelineConfig make_config(const RenderTargetLayout& layout, const Payload& p) {
+  PipelineConfig config{
+      .depthStencilFormat = layout.depthStencilFormat,
+      .colorAttachmentCount = layout.colorAttachmentCount,
+      .msaaSamples = layout.sampleCount,
+      .flags = p.flags,
+      .cull = p.cull,
+      .compare = p.compare,
+  };
+  for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
+    config.colorFormats[i] = layout.colorAttachments[i].format;
+  }
+  return config;
+}
+
+// The LDR blend's tail, and the HDR scene's in its place. In the HDR scene the snapshot is exposed
+// linear light already (RGBA16F): it is read raw, blended in the light as before and written back as
+// light, with no decode, inverse curve, clip or encode; the post-tone after the scene does those. The
+// floor at 0 is the LDR blend's own. Alpha is the snapshot's, as in LDR.
+constexpr std::string_view LdrBlend = R"(  let y = srgb_dec(snap.rgb);
+  let dst = min(vec3f(untone(y.r), untone(y.g), untone(y.b)), vec3f(4.0));
+  let x = max(o0 + dst * (1.0 - o1), vec3f(0.0));
+  let drawn = vec3f(tone(x.r), tone(x.g), tone(x.b));
+  return vec4f(srgb_enc(drawn), snap.a);
+)";
+constexpr std::string_view HdrBlend = R"(  let x = max(o0 + snap.rgb * (1.0 - o1), vec3f(0.0));
+  return vec4f(x, snap.a);
+)";
+
+wgpu::RenderPipeline make_pipeline(const PipelineConfig& p) {
+  const wgpu::Device& device = webgpu::g_device;
+  ensure_static(device);
+  const std::string source = pipeline_source(p);
   wgpu::ShaderSourceWGSL wgsl{};
   wgsl.code = source.c_str();
   const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl, .label = "Water Module"};
-  const wgpu::ShaderModule module = ctx.device.CreateShaderModule(&moduleDescriptor);
+  const wgpu::ShaderModule module = device.CreateShaderModule(&moduleDescriptor);
 
   static constexpr std::array<wgpu::VertexAttribute, 3> attributes{{
       {.format = wgpu::VertexFormat::Float32x3, .offset = offsetof(Vertex, pos), .shaderLocation = 0},
@@ -473,21 +509,21 @@ wgpu::RenderPipeline make_pipeline(const DrawContext& ctx, const Payload& p) {
       .attributes = attributes.data(),
   };
   std::array<wgpu::ColorTargetState, MaxColorAttachments> targets{};
-  for (uint32_t i = 0; i < ctx.layout.colorAttachmentCount; ++i) {
+  for (uint32_t i = 0; i < p.colorAttachmentCount; ++i) {
     const bool scene = i == SceneColorAttachmentIndex;
     targets[i] = {
-        .format = ctx.layout.colorAttachments[i].format,
+        .format = p.colorFormats[i],
         .writeMask = scene ? wgpu::ColorWriteMask::All : wgpu::ColorWriteMask::None,
     };
   }
   const wgpu::FragmentState fragment{
       .module = module,
       .entryPoint = "fs_main",
-      .targetCount = ctx.layout.colorAttachmentCount,
+      .targetCount = p.colorAttachmentCount,
       .targets = targets.data(),
   };
   const wgpu::DepthStencilState depth{
-      .format = ctx.layout.depthStencilFormat,
+      .format = p.depthStencilFormat,
       .depthWriteEnabled = false,
       .depthCompare = static_cast<wgpu::CompareFunction>(p.compare),
   };
@@ -498,11 +534,11 @@ wgpu::RenderPipeline make_pipeline(const DrawContext& ctx, const Payload& p) {
       .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList,
                     .frontFace = wgpu::FrontFace::CCW,
                     .cullMode = static_cast<wgpu::CullMode>(p.cull)},
-      .depthStencil = ctx.layout.depthStencilFormat != wgpu::TextureFormat::Undefined ? &depth : nullptr,
-      .multisample = {.count = ctx.layout.sampleCount, .mask = UINT32_MAX},
+      .depthStencil = p.depthStencilFormat != wgpu::TextureFormat::Undefined ? &depth : nullptr,
+      .multisample = {.count = p.msaaSamples, .mask = UINT32_MAX},
       .fragment = &fragment,
   };
-  return ctx.device.CreateRenderPipeline(&descriptor);
+  return device.CreateRenderPipeline(&descriptor);
 }
 
 // 1x1 stand-ins: black (no flow simulation, and the scene targets when missing), a flat normal
@@ -557,6 +593,10 @@ void draw_payload(const DrawContext& ctx, const wgpu::RenderPassEncoder& pass, c
   }
   Payload p;
   std::memcpy(&p, data, sizeof(p));
+  if (!scene_format_matches(ctx.layout, p.flags)) {
+    // Fail closed: an HDR blend into an LDR target (or the reverse) would read and write the wrong domain.
+    return;
+  }
   ensure_static(ctx.device);
   ensure_dummies(ctx);
   std::array<wgpu::TextureView, BCount> views{};
@@ -600,7 +640,12 @@ void draw_payload(const DrawContext& ctx, const wgpu::RenderPassEncoder& pass, c
   const std::array<uint64_t, 5> pipelineKey{p.flags, p.cull, p.compare, ctx.layout.key, ctx.layout.sampleCount};
   auto pipeline = g_state.pipelines.find(pipelineKey);
   if (pipeline == g_state.pipelines.end()) {
-    pipeline = g_state.pipelines.emplace(pipelineKey, make_pipeline(ctx, p)).first;
+    const PipelineConfig config = make_config(ctx.layout, p);
+    auto created = require_pipeline(ShaderType::Water, config, [config] { return make_pipeline(config); });
+    if (!created) {
+      return;
+    }
+    pipeline = g_state.pipelines.emplace(pipelineKey, std::move(created)).first;
   }
   std::array<const void*, BCount> groupKey{};
   for (uint32_t i = 0; i < BCount; ++i) {
@@ -707,6 +752,32 @@ void normal_matrix(const float m[12], float out[12]) {
 }
 } // namespace
 
+wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) { return make_pipeline(config); }
+
+bool scene_format_matches(const RenderTargetLayout& layout, uint32_t flags) noexcept {
+  const bool hdrTarget = layout.colorAttachmentCount > SceneColorAttachmentIndex &&
+                         layout.colorAttachments[SceneColorAttachmentIndex].format == webgpu::SceneHdrFormat;
+  return hdrTarget == ((flags & WaterSceneHdr) != 0);
+}
+
+std::string pipeline_source(const PipelineConfig& p) {
+  std::string source = std::string("const BOTTOM: bool = ") + ((p.flags & 1) != 0 ? "true" : "false") +
+                       ";\nconst RAIN: bool = " + ((p.flags & 2) != 0 ? "true" : "false") + ";\n";
+  if ((p.flags & WaterSceneHdr) == 0) {
+    // LDR: the source as it always was, byte for byte.
+    source += ShaderSource;
+    return source;
+  }
+  std::string body = ShaderSource;
+  const size_t at = body.find(LdrBlend);
+  if (at == std::string::npos) {
+    Log.fatal("water: no LDR blend to replace for the HDR scene");
+  }
+  body.replace(at, LdrBlend.size(), HdrBlend);
+  source += body;
+  return source;
+}
+
 void draw(const DrawDesc& desc, const Vertex* verts, uint32_t vertexCount, const uint32_t* indices,
           uint32_t indexCount) {
   if (verts == nullptr || indices == nullptr || vertexCount == 0 || indexCount < 3 || !ensure_registered()) {
@@ -728,6 +799,12 @@ void draw(const DrawDesc& desc, const Vertex* verts, uint32_t vertexCount, const
   // The scene so far, to blend against and to read the depth behind the surface from.
   ResolvedTargets targets;
   if (!resolve_pass(ResolveDesc{.color = true, .depth = true}, targets) || !targets.color) {
+    return;
+  }
+  // The domain is the snapshot's actual format (the pass's scene attachment), not a later global. An
+  // RGBA16F snapshot outside the HDR scene pass, or the reverse, has no domain this blend knows: skip.
+  const bool hdr = targets.colorFormat == webgpu::SceneHdrFormat;
+  if (hdr != scene_hdr_pass_active()) {
     return;
   }
   const uint32_t colorId = register_view(targets.color.Get(), targets.color, {});
@@ -773,7 +850,7 @@ void draw(const DrawDesc& desc, const Vertex* verts, uint32_t vertexCount, const
   u.cube[1] = desc.cubeMips;
 
   Payload p{};
-  p.flags = (desc.bottom ? 1u : 0u) | (rain ? 2u : 0u);
+  p.flags = (desc.bottom ? 1u : 0u) | (rain ? 2u : 0u) | (hdr ? WaterSceneHdr : 0u);
   p.cull = uint32_t(desc.cull == Cull::Front  ? wgpu::CullMode::Front
                     : desc.cull == Cull::Back ? wgpu::CullMode::Back
                                               : wgpu::CullMode::None);

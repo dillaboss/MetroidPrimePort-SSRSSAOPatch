@@ -14,8 +14,10 @@ sdk: org.freedesktop.Sdk
 command: metroid_prime_port
 
 finish-args:
-  # Vulkan goes through the DRM device.
-  - --device=dri
+  # Vulkan goes through the DRM device; controllers need /dev/input and, for
+  # SDL's HIDAPI drivers (gyro, rumble, issue #82), /dev/hidraw*. Only
+  # --device=all covers hidraw.
+  - --device=all
   - --share=ipc
   - --socket=wayland
   - --socket=fallback-x11
@@ -50,7 +52,7 @@ modules:
       - -DFETCHCONTENT_SOURCE_DIR_DAWN_PREBUILT=/run/build/metroid-prime-port/dawn_prebuilt
       - -DFETCHCONTENT_SOURCE_DIR_NOD_PREBUILT=/run/build/metroid-prime-port/nod_prebuilt
       - -DFETCHCONTENT_SOURCE_DIR_SDL=/run/build/metroid-prime-port/sdl-src
-      - -DFETCHCONTENT_SOURCE_DIR_ABSEIL_CPP=/run/build/metroid-prime-port/abseil-cpp
+      - -DFETCHCONTENT_SOURCE_DIR_ABSEIL-CPP=/run/build/metroid-prime-port/abseil-cpp
       - -DFETCHCONTENT_SOURCE_DIR_XXHASH=/run/build/metroid-prime-port/xxhash
       - -DFETCHCONTENT_SOURCE_DIR_FMT=/run/build/metroid-prime-port/fmt
       - -DFETCHCONTENT_SOURCE_DIR_ZLIB=/run/build/metroid-prime-port/zlib
@@ -76,6 +78,13 @@ modules:
       - install -Dm644 ../extern/aurora/LICENSE /app/share/licenses/metroid-prime-port/aurora.txt
       - install -Dm644 ../extern/musyx/LICENSE /app/share/licenses/metroid-prime-port/musyx.txt
       - install -Dm644 ../extern/astcenc/LICENSE.txt /app/share/licenses/metroid-prime-port/astcenc.txt
+
+      - install -Dm644 ../extern/GamepadMotionHelpers/LICENSE /app/share/licenses/metroid-prime-port/gamepadmotionhelpers.txt
+      # Dawn and nod come as prebuilt archives with no licence file, and the
+      # generated data tables' licences live in other repositories, so their
+      # texts are kept in the tree.
+      - install -Dm644 -t /app/share/licenses/metroid-prime-port ../packaging/licenses/*.txt
+      - install -Dm644 ../freetype/docs/FTL.TXT /app/share/licenses/metroid-prime-port/freetype-FTL.txt
       # The fetched dependencies were unpacked by this manifest into their own
       # directories at the source root, so that is where their notices are. The
       # previous loop looked in _deps/*-src, which is where FetchContent would

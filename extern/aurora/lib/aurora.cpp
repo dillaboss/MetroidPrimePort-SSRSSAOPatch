@@ -5,6 +5,7 @@
 #ifdef AURORA_ENABLE_GX
 #include "gfx/resources.hpp"
 #include "gfx/frame.hpp"
+#include "gfx/pipeline_cache.hpp"
 #include "gfx/recording.hpp"
 #include "gfx/render_worker.hpp"
 #include "gx/command_processor.hpp"
@@ -12,6 +13,7 @@
 #include "gx/gx.hpp"
 #include "gx/texture.hpp"
 #include "imgui.hpp"
+#include "io.hpp"
 #include "webgpu/gpu.hpp"
 #include "webgpu/gpu_prof.hpp"
 #include <webgpu/webgpu_cpp.h>
@@ -27,13 +29,18 @@
 #include "thread.hpp"
 #include "window.hpp"
 
+#include <SDL3/SDL_init.h>
 #include <SDL3/SDL_filesystem.h>
+#include <SDL3/SDL_messagebox.h>
 #include <SDL3/SDL_surface.h>
 #include <magic_enum.hpp>
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
+#include <string>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 
 #include "system_info.hpp"
@@ -51,6 +58,12 @@ constexpr Module Log{"aurora"};
 
 #ifdef AURORA_ENABLE_GX
 std::atomic_bool g_screenshotRequested;
+// A PNG request names its file and is answered through g_pngState (0 pending, 1 saved, -1 failed).
+std::mutex g_pngMutex;
+std::string g_pngPath;
+std::atomic_int g_pngState{0};
+std::atomic_uint32_t g_pngWidth{0};
+std::atomic_uint32_t g_pngHeight{0};
 
 // GPU
 using webgpu::g_device;
@@ -58,6 +71,13 @@ using webgpu::g_queue;
 using webgpu::g_surface;
 
 void record_screenshot(wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback>& callbacks) {
+  std::string pngPath;
+  {
+    std::lock_guard lock{g_pngMutex};
+    pngPath = std::move(g_pngPath);
+    g_pngPath.clear();
+  }
+  const bool png = !pngPath.empty();
   const auto& source = webgpu::present_source();
   const bool bgra = source.format == wgpu::TextureFormat::BGRA8Unorm ||
                     source.format == wgpu::TextureFormat::BGRA8UnormSrgb;
@@ -65,6 +85,9 @@ void record_screenshot(wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubm
                     source.format == wgpu::TextureFormat::RGBA8UnormSrgb;
   if (!bgra && !rgba) {
     Log.warn("Screenshot unsupported for texture format {}", magic_enum::enum_name(source.format));
+    if (png) {
+      g_pngState.store(-1, std::memory_order_release);
+    }
     return;
   }
 
@@ -89,25 +112,48 @@ void record_screenshot(wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubm
   };
   encoder.CopyTextureToBuffer(&src, &dst, &source.size);
 
-  callbacks.emplace_back([readback, width, height, bytesPerRow, byteSize, bgra]() {
+  callbacks.emplace_back([readback, width, height, bytesPerRow, byteSize, bgra, png, pngPath]() {
     readback.MapAsync(
         wgpu::MapMode::Read, 0, byteSize, wgpu::CallbackMode::AllowSpontaneous,
-        [readback, width, height, bytesPerRow, byteSize, bgra](wgpu::MapAsyncStatus status,
-                                                               wgpu::StringView message) {
+        [readback, width, height, bytesPerRow, byteSize, bgra, png, pngPath](wgpu::MapAsyncStatus status,
+                                                                          wgpu::StringView message) {
           if (status != wgpu::MapAsyncStatus::Success) {
             if (status != wgpu::MapAsyncStatus::CallbackCancelled && status != wgpu::MapAsyncStatus::Aborted) {
               Log.warn("Screenshot readback failed {}: {}", magic_enum::enum_name(status), message);
+            }
+            if (png) {
+              g_pngState.store(-1, std::memory_order_release);
             }
             return;
           }
 
           const void* pixels = readback.GetConstMappedRange(0, byteSize);
+          // The present source's alpha is not meaningful and is usually 0, so a surface with an
+          // alpha channel saves an image every viewer shows as fully transparent (a 32-bit BMP
+          // with an alpha mask, or a PNG whose alpha is 0). The X formats drop it: SDL writes a
+          // 24-bit BMP and converts to opaque RGBA for PNG.
           SDL_Surface* surface = SDL_CreateSurfaceFrom(
               static_cast<int>(width), static_cast<int>(height),
-              bgra ? SDL_PIXELFORMAT_BGRA32 : SDL_PIXELFORMAT_RGBA32, const_cast<void*>(pixels),
+              bgra ? SDL_PIXELFORMAT_BGRX32 : SDL_PIXELFORMAT_RGBX32, const_cast<void*>(pixels),
               static_cast<int>(bytesPerRow));
           if (surface == nullptr) {
             Log.warn("Unable to create screenshot surface: {}", SDL_GetError());
+            if (png) {
+              g_pngState.store(-1, std::memory_order_release);
+            }
+          } else if (png) {
+            std::error_code ec;
+            std::filesystem::create_directories(std::filesystem::path(pngPath).parent_path(), ec);
+            if (!SDL_SavePNG(surface, pngPath.c_str())) {
+              Log.warn("Unable to save screenshot {}: {}", pngPath, SDL_GetError());
+              g_pngState.store(-1, std::memory_order_release);
+            } else {
+              Log.info("Screenshot saved to {}", pngPath);
+              g_pngWidth.store(width, std::memory_order_relaxed);
+              g_pngHeight.store(height, std::memory_order_relaxed);
+              g_pngState.store(1, std::memory_order_release);
+            }
+            SDL_DestroySurface(surface);
           } else {
             std::error_code ec;
             std::filesystem::create_directories("screenshots", ec);
@@ -224,13 +270,21 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
     }
   }
 
-  if (!windowCreated) {
+  // Without a usable GPU (a virtual machine without 3D acceleration, a broken driver), a software
+  // adapter such as llvmpipe or WARP still draws a picture, slowly; the Null backend draws nothing.
+  // So unless CPU adapters are allowed from the start, a second pass takes them before Null.
+  const int passes = config.allowCpuAdapter ? 1 : 2;
+  for (int pass = 0; pass < passes && !windowCreated; ++pass) {
+    const bool allowCpu = config.allowCpuAdapter || pass == 1;
     for (const auto backendType : PreferredBackendOrder) {
+      if (pass + 1 < passes && backendType == BACKEND_NULL) {
+        continue;
+      }
       selectedBackend = backendType;
       if (!window::create_window(selectedBackend)) {
         continue;
       }
-      if (webgpu::initialize(selectedBackend, config.allowCpuAdapter)) {
+      if (webgpu::initialize(selectedBackend, allowCpu)) {
         windowCreated = true;
         break;
       } else {
@@ -240,6 +294,15 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   }
 
   AURORA_ASSERT(windowCreated, "Error creating window: {}", SDL_GetError());
+
+  if (webgpu::g_backendType == wgpu::BackendType::Null && config.noGraphicsMessage != nullptr) {
+    Log.error("No graphics device could be started; exiting");
+    // No parent: the window isn't shown yet, and a box owned by a hidden window may not show either.
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, config.appName, config.noGraphicsMessage, nullptr);
+    window::destroy_window();
+    SDL_Quit();
+    std::exit(1);
+  }
 
   // Initialize SDL_Renderer for ImGui when we can't use a Dawn backend
   if (webgpu::g_backendType == wgpu::BackendType::Null) {
@@ -387,6 +450,19 @@ bool begin_frame() noexcept {
 
 void end_frame() noexcept {
   ZoneScoped;
+  // The frames just after an EFB resize, timed for its log line (webgpu::resize_swapchain).
+  struct ResizeFrameTimer {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    bool timed = webgpu::g_resizeFramesToTime > 0;
+    ~ResizeFrameTimer() {
+      if (timed) {
+        const int index = 3 - webgpu::g_resizeFramesToTime--;
+        const double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        Log.info("EFB resize: frame {} after it took {:.1f} ms to record, submit and present", index, ms);
+      }
+    }
+  } resizeFrameTimer;
 #ifdef AURORA_ENABLE_GX
   phase::set(phase::Main, "end_frame (recording and queueing the frame)");
   gx::fifo::drain();
@@ -576,6 +652,41 @@ void request_screenshot() noexcept {
   g_screenshotRequested.store(true, std::memory_order_release);
 #endif
 }
+void request_screenshot_png(const char* path) noexcept {
+#ifdef AURORA_ENABLE_GX
+  {
+    std::lock_guard lock{g_pngMutex};
+    g_pngPath = path != nullptr ? path : "";
+  }
+  g_pngState.store(0, std::memory_order_release);
+  g_screenshotRequested.store(true, std::memory_order_release);
+#endif
+}
+
+int screenshot_png_state(uint32_t* width, uint32_t* height) noexcept {
+#ifdef AURORA_ENABLE_GX
+  const int state = g_pngState.load(std::memory_order_acquire);
+  if (state > 0) {
+    if (width != nullptr) *width = g_pngWidth.load(std::memory_order_relaxed);
+    if (height != nullptr) *height = g_pngHeight.load(std::memory_order_relaxed);
+  }
+  return state;
+#else
+  return -1;
+#endif
+}
+
+bool frame_buffer_size_for_scale(float scale, uint32_t* width, uint32_t* height) noexcept {
+  return window::get_frame_buffer_size_for_scale(scale, width, height);
+}
+
+uint32_t max_texture_dimension() noexcept {
+  wgpu::Limits limits{};
+  if (!webgpu::g_device || !webgpu::g_device.GetLimits(&limits)) {
+    return 0;
+  }
+  return limits.maxTextureDimension2D;
+}
 } // namespace aurora
 
 // C API bindings
@@ -591,6 +702,8 @@ bool aurora_is_suspended() {
          aurora::window::is_surface_changing();
 }
 void aurora_end_frame() { aurora::end_frame(); }
+void aurora_set_background_pipelines_paused(bool paused) { aurora::gfx::set_background_pipelines_paused(paused); }
+void aurora_disable_config_persistence() { aurora::io::disable_config_persistence(); }
 AuroraBackend aurora_get_backend() { return aurora::g_config.desiredBackend; }
 const char* aurora_get_gpu_driver() {
   static std::string driver;
@@ -618,8 +731,23 @@ void aurora_set_resampler(AuroraSampler sampler) {
   (void)sampler;
 #endif
 }
+
+void aurora_set_present_sharpness(float sharpness) {
+#ifdef AURORA_ENABLE_GX
+  aurora::webgpu::set_present_sharpness(sharpness);
+#else
+  (void)sharpness;
+#endif
+}
 void aurora_set_graphics_quality(uint32_t msaa, uint16_t maxTextureAnisotropy) {
   aurora::g_pendingQuality.store(std::min(msaa, 4u) << 16 | maxTextureAnisotropy, std::memory_order_release);
+}
+void aurora_set_per_pixel_lighting(bool enabled) {
+#ifdef AURORA_ENABLE_GX
+  aurora::gx::set_per_pixel_lighting(enabled);
+#else
+  (void)enabled;
+#endif
 }
 void aurora_set_timescale(float scale) { aurora::time::set_scale(scale); }
 float aurora_get_timescale() { return aurora::time::scale(); }

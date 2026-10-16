@@ -15,6 +15,14 @@
 #include "rstl/auto_ptr.hpp"
 #include "rstl/vector.hpp"
 
+#ifdef TARGET_PC
+#include <cstdint>
+
+// The port's retained Remastered physics object state (platform seam): see
+// RetainedResult in port_remastered_ground_policy.h for the source contract.
+#include "port_remastered_ground_policy.h"
+#endif
+
 class CPlayerGun;
 class CMorphBall;
 class CPlayerCameraBob;
@@ -292,6 +300,35 @@ public:
   void UpdateGunTransform(const CVector3f& gunPos, CStateManager& mgr);
 #ifdef TARGET_PC
   CVector3f PortAnchorGunDown(const CVector3f& pos, CStateManager& mgr) const;
+  TUniqueId PortPlayerHint() const { return x830_playerHint; }
+  int PortPlayerHintCount() const { return x838_playerHints.size(); }
+  bool PortControlDirOverride() const { return x9c4_30_controlDirOverride; }
+  const CVector3f& PortControlDirFlat() const { return x54c_controlDirFlat; }
+  // The retained Remastered persisted physics object state (state+0x13c). Port-only, never
+  // serialized: the source never restores it either (CPhysicsState's ctor writes 0 and no
+  // load path touches it, MOVER-SELECTION.md §3), so a rebuilt player starts at the default
+  // 0/valid below and nothing stale survives a save-state load.
+  const PortRemasteredGround::RetainedResult& PortRetainedObjectState() const {
+    return xa34_retainedObjectState;
+  }
+  void PortSetRetainedObjectState(const PortRemasteredGround::RetainedResult& state) {
+    xa34_retainedObjectState = state;
+  }
+  void PortInvalidateRetainedObjectState() {
+    xa34_retainedObjectState = PortRemasteredGround::RetainedInvalidate();
+  }
+  // Read-only mover-entry counter: how many ticks actually entered
+  // CGameCollision::MoveGroundedRemastered for THIS player (docs/REMASTERED_MOVEMENT.md). It is
+  // the only way to tell "ground replacement is wired" from "ground replacement is silently
+  // disabled": the dynamic-contact fallback, a morph-ball tick, a save-state load or the
+  // retained-state dispatch all stand the Remastered ground mover aside without any
+  // visible symptom. Monotonic, cumulative, per player, for the process lifetime (a
+  // save-state load rebuilds/teleports the player but does not reset it), never
+  // serialized and never read by the mover. NOT a source quantity and NOT a simulation
+  // tick: the source has no such counter, it does not advance on retail, airborne,
+  // morph-ball, dyn-fallback or paused ticks, and it must never be used as a clock.
+  uint32_t PortGroundMoverRuns() const { return xa38_groundMoverRuns; }
+  void PortNoteGroundMoverRun() { ++xa38_groundMoverRuns; }
 #endif
   const CTransform4f& GetFirstPersonCameraTransform(CStateManager& mgr) const;
   void UpdateDebugCamera(CStateManager& mgr);
@@ -345,6 +382,7 @@ public:
   void UpdateCameraTimers(float dt, const CFinalInput& input);
   void UpdateSubmerged(const CStateManager& mgr);
   bool CheckSubmerged() const;
+  float GetFallingTime() const { return x300_fallingTime; }
   void SetMoveState(NPlayer::EPlayerMovementState state, CStateManager& mgr);
   void StartLandingControlFreeze(); // name?
   void EndLandingControlFreeze();   // name?
@@ -736,6 +774,14 @@ private:
   float xa28_attachedActorStruggle;
   int xa2c_damageLoopSfxDelayTicks;
   float xa30_samusExhaustedVoiceTimer;
+#ifdef TARGET_PC
+  // Port: the retained Remastered physics object state (see PortRetainedObjectState above).
+  // Default-initialised (0 / valid) by every constructor, as the source ctor does.
+  PortRemasteredGround::RetainedResult xa34_retainedObjectState;
+  // Port: the trial ground-mover run counter (see PortGroundMoverRuns above). Default 0;
+  // the source layout is not affected (every check below is inert off-MWERKS).
+  uint32_t xa38_groundMoverRuns = 0;
+#endif
 };
 NESTED_CHECK_SIZEOF(CPlayer, CPlayerStuckTracker, 0x2e0);
 CHECK_SIZEOF(CPlayer, (VERSION >= VERSION_GM8P_00 ? 0xa48 : 0xa38))
