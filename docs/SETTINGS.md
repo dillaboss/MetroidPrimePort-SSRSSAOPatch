@@ -468,6 +468,28 @@
   straight to where you aim instead of turning toward the enemy nearest the screen
   centre (the decomp's `gkAutoAimAtOrbitedObject` behaviour). On under Original
   experience.
+- Third person, experimental (Video > Display > Third person; persisted as
+  `third_person`, `third_person_distance` 1-6 default 2.6, `third_person_height`
+  0-1.5 default 0.35, `third_person_shoulder` -1.5 to 1.5 default 0.6,
+  `third_person_body_motion` and `third_person_torso_aim`, both default on; the
+  Third person action, F6 by default, toggles it in game; off under Original
+  experience). The world is drawn from behind Samus's shoulder while the game
+  plays in first person underneath (`platform/port_third_person.cpp`): aiming,
+  lock-on, scanning and shots are the first-person camera's, and the camera looks
+  at the point its crosshair ray meets (the world, or a locked-on target), so the
+  centre of the screen is where a shot goes. The camera's arm stops short of
+  walls; pulled within 0.9 units of her, the body is left out. Only the game's own
+  first-person camera is replaced: the morph ball, cutscenes, the interpolations
+  between cameras and the free camera keep their views. The helmet, faceplate,
+  Samus's reflection, on-visor effects and the first-person arm cannon (and its
+  beam particles) are left out; the HUD stays. Samus has no walk or aim
+  animations, so her standing pose is moved by hand, per tick and interpolated
+  like the rest of the frame: she leans into turns and strafes, tips forward with
+  speed and back on the way up a jump, bobs and sways with a 1.8-unit stride and
+  dips on landing (drawn through the view, so her collision is untouched). Torso
+  follows aim bends up to two spine bones, found by name ("spine", "chest",
+  "torso") and logged at the first use with every bone of the skeleton, by half
+  the view's pitch.
 - Hide helmet and hide visor effects (Video > Display and pause Options > Visor,
   persisted as `hide_helmet` and `hide_visor_effects`, off by default): the
   first drops the helmet frame (the dome and the lights at the bottom); the

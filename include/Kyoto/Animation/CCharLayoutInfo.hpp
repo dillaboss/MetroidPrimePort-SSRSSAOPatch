@@ -45,6 +45,10 @@ public:
   }
   const CCharLayoutNode& GetSegmentData(const CSegId& seg) const { return (*mNodes)[seg]; }
   CSegId GetOriginalParent(const CSegId& seg) const { return GetSegmentData(seg).GetParent(); }
+#ifdef TARGET_PC
+  // Port: every bone by name (the third-person view finds the spine in it).
+  const rstl::map< rstl::string, CSegId >& PortNameMap() const { return mNameMap; }
+#endif
 
 private:
   rstl::object_owner< TSegIdMap< CCharLayoutNode > > mNodes;

@@ -398,6 +398,7 @@ void BindPortControls(Profile& p) {
   Bind(p, Action::LoadState, Make(Device::Key, SDL_SCANCODE_F9));
   Bind(p, Action::Screenshot, Make(Device::Key, SDL_SCANCODE_F12));
   Bind(p, Action::PhotoMode, Make(Device::Key, SDL_SCANCODE_F8));
+  Bind(p, Action::ThirdPerson, Make(Device::Key, SDL_SCANCODE_F6));
   // Hold to aim / hold to pause for the gyro (F1 > Controller > Gyro aim).
   Bind(p, Action::GyroAim, NativeInput(SDL_GAMEPAD_BUTTON_RIGHT_STICK));
   Bind(p, Action::GyroAim, Make(Device::Key, SDL_SCANCODE_LCTRL));
@@ -650,8 +651,9 @@ void RouteDirectActions(const PortInput::Output& out) {
 // The port's own actions: polled every frame by PollPortActions, not with the game
 // ticks, so they work while the game is paused or the F1 overlay is open.
 bool IsPortAction(Action a) {
-  return a == Action::PortMenu || a == Action::SaveState || a == Action::LoadState || a == Action::Screenshot ||
-         a == Action::ToggleOriginal || a == Action::PhotoMode || a == Action::GyroAim;
+  return a == Action::PortMenu || a == Action::SaveState || a == Action::LoadState ||
+         a == Action::Screenshot || a == Action::ToggleOriginal || a == Action::PhotoMode ||
+         a == Action::ThirdPerson || a == Action::GyroAim;
 }
 
 // Keys pressed since the last PollPortActions, added by an SDL event watch: a short
@@ -1201,6 +1203,8 @@ void PollPortActions() {
   if (out.Pressed(Action::LoadState)) PortDebug::RequestSaveStateHotkey(2);
   if (out.Pressed(Action::Screenshot)) aurora::request_screenshot();
   if (out.Pressed(Action::PhotoMode)) PortPhoto::RequestToggle();
+  if (out.Pressed(Action::ThirdPerson))
+    PortDebug::SetThirdPerson(!PortDebug::ThirdPerson().enabled);
   if (out.Pressed(Action::ToggleOriginal)) PortDebug::SetOriginalExperience(!PortDebug::OriginalExperience());
 }
 

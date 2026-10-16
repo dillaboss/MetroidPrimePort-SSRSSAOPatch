@@ -262,6 +262,21 @@ const float kSsaoIntensityMax = 3.f;
 const float kSsaoRadiusMin = 0.25f;
 const float kSsaoRadiusMax = 3.f;
 ScreenSpaceSettings ScreenSpace();
+// Experimental third-person view (port_third_person.h). Off under Original experience.
+struct ThirdPersonSettings {
+  bool enabled;
+  float distance;  // behind the eyes, world units
+  float height;    // above the eyes
+  float shoulder;  // to the right (negative: left)
+  bool bodyMotion; // lean, bob and sway
+  bool torsoAim;   // the spine bends towards the aim
+};
+const float kThirdPersonDistanceMin = 1.f;
+const float kThirdPersonDistanceMax = 6.f;
+const float kThirdPersonHeightMax = 1.5f;
+const float kThirdPersonShoulderMax = 1.5f;
+ThirdPersonSettings ThirdPerson();
+void SetThirdPerson(bool enabled);
 // Every world's map shows as if its map station had been used; the save is
 // not changed.
 bool RevealMap();

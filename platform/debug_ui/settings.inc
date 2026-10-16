@@ -161,6 +161,36 @@ const SettingKey kSettingKeys[] = {
      [](std::ostream& out) { WriteBool(out, sSsrFloorsOnly); }, false, "0", "1"},
     {"screen_space_half_res", [](const std::string& value) { sScreenSpaceHalfRes = ParseBool(value); },
      [](std::ostream& out) { WriteBool(out, sScreenSpaceHalfRes); }, false, "0", "1"},
+    {"third_person", [](const std::string& value) { sThirdPerson = ParseBool(value); },
+     [](std::ostream& out) { WriteBool(out, sThirdPerson); }, false, "1", "0"},
+    {"third_person_distance",
+     [](const std::string& value) {
+       const float f = static_cast< float >(std::atof(value.c_str()));
+       if (std::isfinite(f)) {
+         sThirdPersonDistance = std::clamp(f, PortDebug::kThirdPersonDistanceMin, PortDebug::kThirdPersonDistanceMax);
+       }
+     },
+     [](std::ostream& out) { out << sThirdPersonDistance; }, false, "1.5", "4"},
+    {"third_person_height",
+     [](const std::string& value) {
+       const float f = static_cast< float >(std::atof(value.c_str()));
+       if (std::isfinite(f)) {
+         sThirdPersonHeight = std::clamp(f, 0.f, PortDebug::kThirdPersonHeightMax);
+       }
+     },
+     [](std::ostream& out) { out << sThirdPersonHeight; }, false, "0", "1.25"},
+    {"third_person_shoulder",
+     [](const std::string& value) {
+       const float f = static_cast< float >(std::atof(value.c_str()));
+       if (std::isfinite(f)) {
+         sThirdPersonShoulder = std::clamp(f, -PortDebug::kThirdPersonShoulderMax, PortDebug::kThirdPersonShoulderMax);
+       }
+     },
+     [](std::ostream& out) { out << sThirdPersonShoulder; }, false, "-0.5", "1"},
+    {"third_person_body_motion", [](const std::string& value) { sThirdPersonBodyMotion = ParseBool(value); },
+     [](std::ostream& out) { WriteBool(out, sThirdPersonBodyMotion); }, false, "0", "1"},
+    {"third_person_torso_aim", [](const std::string& value) { sThirdPersonTorsoAim = ParseBool(value); },
+     [](std::ostream& out) { WriteBool(out, sThirdPersonTorsoAim); }, false, "0", "1"},
     {"reveal_map", [](const std::string& value) { sRevealMap = ParseBool(value); },
      [](std::ostream& out) { WriteBool(out, sRevealMap); }, false, "1", "0"},
     {"map_pickups",

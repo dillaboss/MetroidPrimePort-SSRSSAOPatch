@@ -14,6 +14,7 @@
 #include "rstl/math.hpp"
 
 #include "port_debug.h"
+#include "port_third_person.h"
 
 int CHUDBillboardEffect::g_BillboardCount = 0;
 int CHUDBillboardEffect::g_IndirectTexturedBillboardCount = 0;
@@ -79,7 +80,7 @@ void CHUDBillboardEffect::AddToRenderer(const CFrustumPlanes& frustum,
 
 void CHUDBillboardEffect::PreRender(CStateManager& mgr, const CFrustumPlanes& frustum) {
   if (mgr.GetPlayer()->GetCameraState() == CPlayer::kCS_FirstPerson &&
-      !PortDebug::HideVisorEffects()) {
+      !PortDebug::HideVisorEffects() && !PortThirdPerson::Active()) {
     CTransform4f camXf = mgr.GetCameraManager()->GetCurrentCameraTransform(mgr);
     xe8_generator->SetGlobalTranslation(camXf * xec_translation);
     xe8_generator->SetGlobalOrientation(camXf);

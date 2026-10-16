@@ -6,6 +6,7 @@
 #include "port_debug.h"
 #include "port_env.h"
 #include "port_freecam.h"
+#include "port_third_person.h"
 #include "port_photo.h"
 #include "port_discord.h"
 #include "port_hold_toggle.h"
@@ -2639,9 +2640,11 @@ void CStateManager::PreRender() {
 #endif
   BuildDynamicLightListForWorld();
 
+  // The third-person view for this frame, before anything below reads the view.
+  PortThirdPerson::UpdateFrame(*this);
   const CGameCamera& curCam = x870_cameraManager->GetCurrentCamera(*this);
-  const CTransform4f curCamXf =
-      PortFreeCam::View(x870_cameraManager->GetCurrentCameraTransform(*this));
+  const CTransform4f curCamXf = PortThirdPerson::View(
+      PortFreeCam::View(x870_cameraManager->GetCurrentCameraTransform(*this)));
 #ifdef TARGET_PC
   const float curRenderFov = PortFreeCam::PresentedFovOverride() > 0.f
                                  ? CGameCamera::VertPlusFov(PortFreeCam::PresentedFovOverride(), curCam.GetAspectRatio())
@@ -2685,8 +2688,8 @@ void CStateManager::PreRender() {
 
 CFrustumPlanes CStateManager::SetupViewForDraw(const CViewport& viewport) const {
   const CGameCamera& cam = x870_cameraManager->GetCurrentCamera(*this);
-  const CTransform4f camXf =
-      PortFreeCam::View(x870_cameraManager->GetCurrentCameraTransform(*this));
+  const CTransform4f camXf = PortThirdPerson::View(
+      PortFreeCam::View(x870_cameraManager->GetCurrentCameraTransform(*this)));
   gpRender->SetWorldViewpoint(camXf);
 
   const CVector3f playerPos = x84c_player->GetTranslation();
@@ -3140,7 +3143,9 @@ void CStateManager::PortCaptureProbeFace() const {
   {
     // The room's reflection probes blend around the camera, as Remastered's do.
     const CVector3f eye =
-        PortFreeCam::View(x870_cameraManager->GetCurrentCameraTransform(*this)).GetTranslation();
+        PortThirdPerson::View(
+            PortFreeCam::View(x870_cameraManager->GetCurrentCameraTransform(*this)))
+            .GetTranslation();
     const float at[3] = {eye.GetX(), eye.GetY(), eye.GetZ()};
     PortRoomEnv::SetViewPoint(at);
   }
@@ -3199,7 +3204,8 @@ void CStateManager::PortCaptureProbeFace() const {
   const int kSize = 128;
   const CGameCamera& cam = x870_cameraManager->GetCurrentCamera(*this);
   const CVector3f pos =
-      PortFreeCam::View(x870_cameraManager->GetCurrentCameraTransform(*this)).GetTranslation();
+      PortThirdPerson::View(PortFreeCam::View(x870_cameraManager->GetCurrentCameraTransform(*this)))
+          .GetTranslation();
   // Each face redraws the world around the camera. Once the probe is filled and the camera
   // is holding still, a face every fourth frame keeps it as fresh as the scene needs.
   static CVector3f lastPos = CVector3f::Zero();
@@ -3729,7 +3735,7 @@ void CStateManager::DrawWorld() const {
     }
 #endif
 #ifdef TARGET_PC
-    if (!PortViewModel::Active() && !PortFreeCam::Active())
+    if (!PortViewModel::Active() && !PortFreeCam::Active() && !PortThirdPerson::Active())
 #endif
     x84c_player->RenderGun(*this, x870_cameraManager->GetGlobalCameraTranslation(*this));
 #ifdef TARGET_PC

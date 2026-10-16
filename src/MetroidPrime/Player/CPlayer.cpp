@@ -4,6 +4,7 @@
 #include "port_debug.h"
 #include "port_mouse.h"
 #include "port_freecam.h"
+#include "port_third_person.h"
 
 #include "Collision/CInternalCollisionStructure.hpp"
 #include "Kyoto/CDependencyGroup.hpp"
@@ -1135,6 +1136,9 @@ void CPlayer::Update(float dt, CStateManager& mgr) {
     StartSamusVoiceSfx(SFXsam_r_neardeth_00, 127, 7);
     xa30_samusExhaustedVoiceTimer = 4.f;
   }
+#ifdef TARGET_PC
+  PortThirdPerson::Tick(dt, *this, mgr);
+#endif
 }
 
 // TODO nonmatching
@@ -2449,7 +2453,12 @@ void CPlayer::AddToRenderer(const CFrustumPlanes& frustum, const CStateManager& 
       x768_morphball->TouchModel(mgr);
     }
   } else {
-    x490_gun->AddToRenderer(frustum, mgr);
+#ifdef TARGET_PC
+    // The first-person cannon's beam particles sit where that cannon is drawn: beside the eyes,
+    // which third person leaves out with the cannon.
+    if (!PortThirdPerson::Active())
+#endif
+      x490_gun->AddToRenderer(frustum, mgr);
     CActor::AddToRenderer(frustum, mgr);
   }
 }
@@ -2490,7 +2499,7 @@ void CPlayer::PreRender(CStateManager& mgr, const CFrustumPlanes& frustum) {
 
   if (x2f4_cameraState != kCS_FirstPerson
 #ifdef TARGET_PC
-      || PortFreeCam::ShowPlayer()
+      || PortFreeCam::ShowPlayer() || PortThirdPerson::ShowBody()
 #endif
   ) {
     CActor::PreRender(mgr, frustum);
@@ -2535,7 +2544,7 @@ void CPlayer::Render(const CStateManager& mgr) const {
   bool firstPerson = x2f4_cameraState == kCS_FirstPerson;
 #ifdef TARGET_PC
   // Port: the free camera shows the body the first-person view leaves out.
-  if (PortFreeCam::ShowPlayer()) {
+  if (PortFreeCam::ShowPlayer() || PortThirdPerson::ShowBody()) {
     firstPerson = false;
   }
 #endif
@@ -2543,15 +2552,30 @@ void CPlayer::Render(const CStateManager& mgr) const {
     bool doTransitionRender = false;
     bool doBallRender = false;
     switch (x2f8_morphBallState) {
-    case kMS_Unmorphed:
+    case kMS_Unmorphed: {
       GetModelData()->Touch(mgr, 0);
+#ifdef TARGET_PC
+      // Third person: the standing body leans and bobs through its view, its physics untouched.
+      const CTransform4f portView = CGraphics::GetViewMatrix();
+      CTransform4f portBodyView = portView;
+      const bool portBody = PortThirdPerson::BodyView(*this, portView, portBodyView);
+      if (portBody) {
+        CGraphics::SetViewPointMatrix(portBodyView);
+      }
+#endif
       CPhysicsActor::Render(mgr);
+#ifdef TARGET_PC
+      if (portBody) {
+        CGraphics::SetViewPointMatrix(portView);
+      }
+#endif
       if (HasTransitionBeamModel()) {
         x7f0_ballTransitionBeamModel->Touch(mgr, 0);
         x7f0_ballTransitionBeamModel->Render(mgr, x7f4_gunWorldXf, GetActorLights(),
                                              CModelFlags::Normal());
       }
       break;
+    }
     case kMS_Morphing:
       x768_morphball->TouchModel(mgr);
       doTransitionRender = true;

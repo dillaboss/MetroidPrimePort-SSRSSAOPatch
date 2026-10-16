@@ -36,6 +36,7 @@
 #ifdef TARGET_PC
 #include "port_debug.h"
 #include "port_mouse.h"
+#include "port_third_person.h"
 #endif
 
 #include <float.h>
@@ -595,6 +596,9 @@ void CCompoundTargetReticle::Draw(const CStateManager& mgr, bool hideLockon) con
   if (mgr.GetPlayer()->GetMorphballTransitionState() == CPlayer::kMS_Unmorphed &&
       !mgr.GetCameraManager()->IsInCinematicCamera()) {
     CTransform4f camXf = mgr.GetCameraManager()->GetCurrentCameraTransform(mgr);
+#ifdef TARGET_PC
+    camXf = PortThirdPerson::View(camXf);
+#endif
     CGraphics::SetViewPointMatrix(camXf);
     CMatrix3f rot = camXf.BuildMatrix3f();
 

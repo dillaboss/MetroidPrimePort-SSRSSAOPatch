@@ -544,6 +544,24 @@ void SetHideVisorEffects(bool enabled) {
   MarkDirty();
 }
 
+ThirdPersonSettings ThirdPerson() {
+  EnsureInitialized();
+  ThirdPersonSettings s{};
+  s.enabled = sThirdPerson && !sOriginalExperience;
+  s.distance = sThirdPersonDistance;
+  s.height = sThirdPersonHeight;
+  s.shoulder = sThirdPersonShoulder;
+  s.bodyMotion = sThirdPersonBodyMotion;
+  s.torsoAim = sThirdPersonTorsoAim;
+  return s;
+}
+
+void SetThirdPerson(bool enabled) {
+  EnsureInitialized();
+  sThirdPerson = enabled;
+  MarkDirty();
+}
+
 ScreenSpaceSettings ScreenSpace() {
   EnsureInitialized();
   ScreenSpaceSettings s{};

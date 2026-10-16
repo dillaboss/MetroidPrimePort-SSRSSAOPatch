@@ -190,6 +190,7 @@ set(MP_PORT_SOURCES
     platform/port_viewmodel.cpp
     platform/port_actor_shadow.cpp
     platform/port_freecam.cpp
+    platform/port_third_person.cpp
     platform/port_photo.cpp
     platform/port_console.cpp
     platform/port_log_file.cpp

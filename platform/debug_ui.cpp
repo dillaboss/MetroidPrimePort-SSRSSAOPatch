@@ -237,6 +237,13 @@ bool sScreenSpaceHalfRes = true;
 int sScreenSpaceDebugView = 0;
 int sSsaoRun = -1;
 int sSsrRun = -1;
+// Experimental third-person view (PortDebug::ThirdPerson).
+bool sThirdPerson = false;
+float sThirdPersonDistance = 2.6f;
+float sThirdPersonHeight = 0.35f;
+float sThirdPersonShoulder = 0.6f;
+bool sThirdPersonBodyMotion = true;
+bool sThirdPersonTorsoAim = true;
 bool sRevealMap = false;
 int sMapPickups = PortDebug::kMapPickups_Off;
 bool sMapLogicColors = true;

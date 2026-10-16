@@ -130,6 +130,56 @@ void DrawVideoDisplay() {
   }
   EndOriginalLocked(locked);
 
+  ImGui::SeparatorText("Third person (experimental)");
+  const bool thirdPersonLocked = BeginOriginalLocked();
+  {
+    bool thirdPerson = sThirdPerson;
+    if (ImGui::Checkbox("Third-person camera", &thirdPerson)) {
+      SetThirdPerson(thirdPerson);
+    }
+    const std::string keys = PortInputRemap::BindingsText(PortInput::Action::ThirdPerson, " / ");
+    ImGui::SetItemTooltip("Plays from behind Samus's shoulder. Aiming, lock-on and scanning work as in\n"
+                          "first person, and the crosshair stays on what a shot hits. Samus has no walk\n"
+                          "animations, so she keeps one pose, moved by the body motion below.\n"
+                          "Toggle in game: %s.",
+                          keys.empty() ? "unbound" : keys.c_str());
+    if (sThirdPerson) {
+      ImGui::Indent();
+      if (ImGui::SliderFloat("Camera distance", &sThirdPersonDistance, kThirdPersonDistanceMin,
+                             kThirdPersonDistanceMax, "%.1f m")) {
+        MarkDirty();
+      }
+      if (ImGui::SliderFloat("Camera height", &sThirdPersonHeight, 0.f, kThirdPersonHeightMax, "%.2f m")) {
+        MarkDirty();
+      }
+      if (ImGui::SliderFloat("Shoulder offset", &sThirdPersonShoulder, -kThirdPersonShoulderMax,
+                             kThirdPersonShoulderMax, "%.2f m")) {
+        MarkDirty();
+      }
+      ImGui::SetItemTooltip("To the right of Samus; negative for over the left shoulder.");
+      if (ImGui::Checkbox("Body motion", &sThirdPersonBodyMotion)) {
+        MarkDirty();
+      }
+      ImGui::SetItemTooltip("Leans into turns and strafes, bobs and sways with each stride, and dips on\n"
+                            "landing.");
+      ImGui::SameLine();
+      if (ImGui::Checkbox("Torso follows aim", &sThirdPersonTorsoAim)) {
+        MarkDirty();
+      }
+      ImGui::SetItemTooltip("Bends Samus at the spine towards where you aim up or down. The most\n"
+                            "experimental part: turn it off if the pose looks wrong.");
+      if (ImGui::Button("Defaults##thirdperson")) {
+        sThirdPersonDistance = 2.6f;
+        sThirdPersonHeight = 0.35f;
+        sThirdPersonShoulder = 0.6f;
+        sThirdPersonBodyMotion = true;
+        sThirdPersonTorsoAim = true;
+        MarkDirty();
+      }
+      ImGui::Unindent();
+    }
+  }
+  EndOriginalLocked(thirdPersonLocked);
 }
 
 // Custom Vulkan drivers (port_gpu_driver.h, Android only). The file dialog answers

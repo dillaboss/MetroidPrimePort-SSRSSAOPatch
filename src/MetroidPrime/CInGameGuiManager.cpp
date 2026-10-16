@@ -44,6 +44,7 @@
 #include "rstl/algorithm.hpp"
 
 #include "port_debug.h"
+#include "port_third_person.h"
 
 #include <algorithm>
 
@@ -398,7 +399,7 @@ void CInGameGuiManager::Draw(const CStateManager& mgr) const {
     const bool scanVisor = mgr.GetPlayerState()->GetActiveVisor(mgr) == CPlayerState::kPV_Scan;
     if (drawVisor && x1f0_enablePlayerVisor != 0) {
       if (mgr.GetPlayer()->GetCameraState() == CPlayer::kCS_FirstPerson &&
-          !PortDebug::HideVisorEffects()) {
+          !PortDebug::HideVisorEffects() && !PortThirdPerson::Active()) {
         x20_faceplateDecor.Draw(mgr);
       }
       const bool targetingEnabled = x1e4_enableTargetingManager != 0;
@@ -406,7 +407,7 @@ void CInGameGuiManager::Draw(const CStateManager& mgr) const {
           scanVisor && targetingEnabled ? &x34_samusHud->GetTargetingManager() : nullptr;
       x30_playerVisor->Draw(mgr, targeting);
     }
-    if (!PortDebug::HideVisorEffects()) {
+    if (!PortDebug::HideVisorEffects() && !PortThirdPerson::Active()) {
       x40_samusReflection->Draw(mgr);
     }
     if (drawVisor) {
@@ -479,7 +480,8 @@ void CInGameGuiManager::Draw(const CStateManager& mgr) const {
   if (!preDrawBlur) {
     x3c_pauseScreenBlur->Draw(mgr);
   }
-  if (x1e0_helmetVisMode != 0u && notInCine && !PortDebug::HideHelmet()) {
+  if (x1e0_helmetVisMode != 0u && notInCine && !PortDebug::HideHelmet() &&
+      !PortThirdPerson::Active()) {
     const float cameraOffset = x48_pauseScreen.null() ? 0.f : x48_pauseScreen->GetHelmetCamYOff();
     x34_samusHud->DrawHelmet(mgr, cameraOffset);
   }
