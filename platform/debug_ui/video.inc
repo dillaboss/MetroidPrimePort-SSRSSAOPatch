@@ -178,6 +178,8 @@ void DrawVideoDisplay() {
         static std::string sEchoesStartError;
         if (!picked.empty()) {
           sEchoesStartError = PortEchoesProbe::Start(picked) ? "" : "A report is already being written.";
+          sEchoesImagePath = picked;
+          MarkDirty();
         }
         const PortEchoesProbe::State echoes = PortEchoesProbe::Status();
         ImGui::BeginDisabled(echoes.running);
@@ -201,6 +203,48 @@ void DrawVideoDisplay() {
           }
         } else if (!sEchoesStartError.empty()) {
           ImGui::TextColored(ThemeWarnColor(), "%s", sEchoesStartError.c_str());
+        }
+
+        ImGui::BeginDisabled(sEchoesImagePath.empty());
+        if (ImGui::Checkbox("Echoes animations", &sThirdPersonEchoesAnims)) {
+          MarkDirty();
+        }
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Plays Metroid Prime 2: Echoes' Samus animations on Prime's Samus: standing,\n"
+                              "walking, jogging and running forwards and backwards, strafing, jumping and\n"
+                              "landing, blended by how she moves. Read from your own Echoes image (pick it\n"
+                              "with the button above once). Very experimental.");
+        if (sEchoesImagePath.empty()) {
+          ImGui::SameLine();
+          ImGui::TextDisabled("(pick your Echoes image above first)");
+        }
+        if (sThirdPersonEchoesAnims && !sEchoesImagePath.empty()) {
+          const auto& conventions = PortEchoesAnim::Conventions();
+          const std::string current =
+              sThirdPersonEchoesConvention <= 0 || size_t(sThirdPersonEchoesConvention) > conventions.size()
+                  ? std::string("Best ranked")
+                  : PortEchoesAnim::ConventionName(conventions[size_t(sThirdPersonEchoesConvention - 1)]);
+          if (ImGui::BeginCombo("How keys apply", current.c_str())) {
+            if (ImGui::Selectable("Best ranked", sThirdPersonEchoesConvention == 0)) {
+              sThirdPersonEchoesConvention = 0;
+              MarkDirty();
+            }
+            for (size_t i = 0; i < conventions.size(); ++i) {
+              const std::string name = std::to_string(i) + ": " + PortEchoesAnim::ConventionName(conventions[i]);
+              if (ImGui::Selectable(name.c_str(), sThirdPersonEchoesConvention == int(i) + 1)) {
+                sThirdPersonEchoesConvention = int(i) + 1;
+                MarkDirty();
+              }
+            }
+            ImGui::EndCombo();
+          }
+          ImGui::SetItemTooltip("How Echoes' animation data turns into a pose is still being worked out. The\n"
+                                "port ranks every candidate by how well Samus keeps her feet on the floor; if\n"
+                                "she looks broken, try the others here.");
+          const std::string status = PortThirdPerson::EchoesAnimationStatus();
+          if (!status.empty()) {
+            ImGui::TextWrapped("%s", status.c_str());
+          }
         }
       }
 #endif

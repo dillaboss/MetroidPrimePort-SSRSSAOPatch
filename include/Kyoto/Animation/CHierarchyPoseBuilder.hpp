@@ -60,6 +60,10 @@ public:
   void Insert(const CSegId& id, const CVector3f& off) { x38_treeMap[id].SetOffset(off); }
 #endif
   CQuaternion GetSegRotation(const CSegId& id) const { return x38_treeMap[id].GetRotation(); }
+#ifdef TARGET_PC
+  // Port: the third-person view puts the body's own offsets back after posing it.
+  CVector3f PortGetSegOffset(const CSegId& id) const { return x38_treeMap[id].GetOffset(); }
+#endif
   const TLockedToken< CCharLayoutInfo >& CharLayoutInfo() const {
     return x0_layoutDesc.ScaledLayout();
   }

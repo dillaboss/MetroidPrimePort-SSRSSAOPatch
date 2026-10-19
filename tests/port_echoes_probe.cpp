@@ -2,6 +2,7 @@
 // compressor), Prime and Echoes skeletons, Prime- and Echoes-version character sets, the report,
 // and Echoes' animations: the animation set, compressed ANIMs, poses and the retarget onto Prime.
 #include "port_echoes_anim.h"
+#include "port_echoes_locomotion.h"
 #include "port_echoes_probe.h"
 #include "port_lzo.h"
 
@@ -863,63 +864,242 @@ PortEchoesProbe::Bone MakeBone(uint32_t id, uint32_t parent, const char* name, V
   return b;
 }
 
+// A small body with Echoes-style bind rotations, stored inverted as Echoes stores them, and
+// Prime's copy of it (no rotations, an extra Pelvis).
+struct Rig {
+  PortEchoesProbe::Skeleton echoes;
+  PortEchoesProbe::Skeleton prime;
+  std::vector<Quat> bind; // bone-to-world bind rotations, by Echoes bone
+};
+
+Rig MakeRig() {
+  struct B {
+    uint32_t id, parent;
+    const char* name;
+    Vec3 p;
+    Quat r;
+  };
+  const B bones[] = {
+      {0, 97, "root", {0, 0, 0}, AxisAngle(0, 0, 1, 180)},
+      {1, 0, "Skeleton_Root", {0, 0.04f, 1.18f}, AxisAngle(1, 0, 0, 120)},
+      {2, 1, "L_hip", {-0.1f, 0.03f, 1.1f}, AxisAngle(0, 1, 0, 120)},
+      {3, 1, "R_hip", {0.1f, 0.03f, 1.1f}, AxisAngle(0, 1, 0, -120)},
+      {4, 2, "L_knee", {-0.1f, 0.06f, 0.63f}, AxisAngle(1, 1, 0, 100)},
+      {5, 3, "R_knee", {0.1f, 0.06f, 0.63f}, AxisAngle(1, -1, 0, 100)},
+      {6, 4, "L_ankle", {-0.1f, 0, 0.12f}, AxisAngle(0, 0, 1, 95)},
+      {7, 5, "R_ankle", {0.1f, 0, 0.12f}, AxisAngle(0, 0, 1, -95)},
+      {8, 6, "L_ball", {-0.1f, 0.1f, 0}, AxisAngle(1, 0, 0, 90)},
+      {9, 7, "R_ball", {0.1f, 0.1f, 0}, AxisAngle(1, 0, 0, 90)},
+      {10, 1, "Spine_1", {0, 0.04f, 1.18f}, AxisAngle(0, 1, 1, 170)},
+      {11, 10, "Head_1", {0, 0.06f, 1.62f}, AxisAngle(1, 0, 1, 180)},
+  };
+  Rig rig;
+  for (const B& b : bones) {
+    const Quat parent = b.parent == 97 ? Quat{} : rig.bind[b.parent];
+    rig.bind.push_back(PortEchoesAnim::Normalized(b.r));
+    // Stored inverted: world-to-bone, and local = bind * parent^-1 in that form.
+    const Quat storedBind = PortEchoesAnim::Conj(rig.bind.back());
+    const Quat storedLocal = PortEchoesAnim::Mul(storedBind, parent);
+    rig.echoes.bones.push_back(MakeBone(b.id, b.parent, b.name, b.p, storedBind, storedLocal));
+    const uint32_t primeParent = b.parent == 97 ? 50 : (b.name[2] == 'h' ? 60 : b.parent + 100);
+    rig.prime.bones.push_back(MakeBone(b.id + 100, primeParent, b.name, b.p));
+  }
+  rig.prime.bones.push_back(MakeBone(60, 101, "Pelvis", {0, 0.04f, 1.1f}));
+  return rig;
+}
+
+// The keys that make `target` (unbound orientations, by Echoes bone) under `c`, with the root
+// moved to `rootAt`.
+PortEchoesAnim::Clip Encode(const Rig& rig, const std::vector<Quat>& target, Vec3 rootAt,
+                            const PortEchoesAnim::Convention& c) {
+  using namespace PortEchoesAnim;
+  Clip clip;
+  clip.version = 2;
+  clip.interval = 1.f / 30.f;
+  clip.duration = 1.f / 30.f;
+  clip.keyFrames = {0, 1};
+  const bool prime = c.mode == KeyMode::Prime;
+  std::vector<Quat> world(target.size());
+  for (size_t i = 0; i < target.size(); ++i) {
+    world[i] = prime ? target[i] : Mul(target[i], rig.bind[i]);
+  }
+  for (size_t i = 0; i < target.size(); ++i) {
+    const auto& b = rig.echoes.bones[i];
+    const Quat wp = b.parent == 97 ? Quat{} : world[b.parent];
+    const Quat bindLocal = b.parent == 97 ? rig.bind[i] : Mul(Conj(rig.bind[b.parent]), rig.bind[i]);
+    const Quat e = Mul(Conj(wp), world[i]);
+    Quat k = e;
+    if (c.mode == KeyMode::BindThenKey) {
+      k = Mul(Conj(bindLocal), e);
+    } else if (c.mode == KeyMode::KeyThenBind) {
+      k = Mul(e, Conj(bindLocal));
+    }
+    if (c.conjugate) {
+      k = Conj(k);
+    }
+    Channel ch;
+    ch.bone = b.id;
+    ch.rotations = {k, k};
+    if (b.parent == 97) {
+      ch.translations = {rootAt, rootAt};
+    }
+    clip.channels.push_back(ch);
+  }
+  return clip;
+}
+
 void TestPoses() {
   using namespace PortEchoesAnim;
-  const Quat r0 = AxisAngle(0, 0, 1, 90);
-  const Quat r1 = Mul(AxisAngle(1, 0, 0, 90), AxisAngle(0, 0, 1, 30));
-  const Quat r2 = AxisAngle(0, 1, 0, -40);
-  PortEchoesProbe::Skeleton echoes;
-  echoes.bones.push_back(MakeBone(1, 0, "root", {0, 0, 0}, r0, r0));
-  echoes.bones.push_back(MakeBone(2, 1, "Spine", {0, 0.1f, 1}, r1, Mul(Conj(r0), r1)));
-  echoes.bones.push_back(MakeBone(3, 2, "Head", {0, 0.2f, 2}, r2, Mul(Conj(r1), r2)));
-  echoes.bones.push_back(MakeBone(4, 3, "Echoes_only", {0.3f, 0.2f, 2}, r2, Quat{}));
-  PortEchoesProbe::Skeleton prime;
-  prime.bones.push_back(MakeBone(10, 10, "root", {0, 0, 0}));
-  prime.bones.push_back(MakeBone(11, 10, "Pelvis", {0, 0, 0.5f}));
-  prime.bones.push_back(MakeBone(12, 11, "Spine", {0, 0.1f, 1}));
-  prime.bones.push_back(MakeBone(13, 12, "Head", {0, 0.2f, 2}));
+  const Rig rig = MakeRig();
+  Check(BindStoredInverse(rig.echoes), "bind rotations stored inverted are recognised");
+  Check(Conventions().size() == 14, "every candidate convention is listed");
 
-  Clip still;
-  still.interval = 1.f / 30.f;
-  still.duration = 1.f;
-  still.keyFrames = {0};
-  const WorldPose rest = EchoesPose(echoes, still, 0.f, {});
-  Check(Near(rest.positions[2], Vec3{0, 0.2f, 2}) && AngleBetween(rest.orientations[2], r2) < 0.01f,
-        "with no keys the pose is the bind pose");
+  // A pose with every joint turned: each convention reads back what it was written with.
+  std::vector<Quat> target;
+  for (size_t i = 0; i < rig.echoes.bones.size(); ++i) {
+    target.push_back(AxisAngle(float(i % 3 == 0), float(i % 3 == 1), float(i % 3 == 2), 10.f + float(i) * 7.f));
+  }
+  bool allRoundTrip = true;
+  bool allOnPrime = true;
+  for (const Convention& c : Conventions()) {
+    const Clip clip = Encode(rig, target, Vec3{0.f, 0.5f, 0.f}, c);
+    const WorldPose pose = EchoesPose(rig.echoes, clip, 0.f, c);
+    for (size_t i = 0; i < target.size(); ++i) {
+      if (AngleBetween(pose.orientations[i], target[i]) > 0.05f) {
+        allRoundTrip = false;
+        std::fprintf(stderr, "  %s: %s off by %.3f deg\n", ConventionName(c).c_str(),
+                     rig.echoes.bones[i].name.c_str(), AngleBetween(pose.orientations[i], target[i]));
+      }
+    }
+    const PrimePose onPrime = RetargetToPrime(rig.echoes, pose, rig.prime);
+    for (size_t i = 0; i < rig.echoes.bones.size(); ++i) {
+      if (!Near(onPrime.positions[i], pose.positions[i], 1e-3f) ||
+          AngleBetween(onPrime.orientations[i], pose.orientations[i]) > 0.05f) {
+        allOnPrime = false;
+      }
+    }
+    // Pelvis (Prime only) follows Skeleton_Root; the hips under it still land on Echoes' hips.
+    allOnPrime = allOnPrime && AngleBetween(onPrime.locals.back(), Quat{}) < 0.05f;
+  }
+  Check(allRoundTrip, "each convention reads back the pose its keys were written for");
+  Check(allOnPrime, "on Prime's skeleton every shared joint lands where it is on Echoes'");
 
-  Clip turn = still;
-  Channel ch;
-  ch.bone = 2;
-  ch.rotations = {AxisAngle(0, 1, 0, 90)};
-  turn.channels.push_back(ch);
-  const WorldPose fromBind = EchoesPose(echoes, turn, 0.f, {RotationMode::FromBind, TranslationMode::Replace});
-  const Quat spineWorld = Mul(r1, AxisAngle(0, 1, 0, 90));
-  const Vec3 head = Rotate(spineWorld, Rotate(Conj(r1), Vec3{0, 0.1f, 1}));
-  Check(AngleBetween(fromBind.orientations[1], spineWorld) < 0.01f &&
-            Near(fromBind.positions[2], Vec3{head.x, 0.1f + head.y, 1 + head.z}),
-        "a key taken from the bind pose turns the bone and moves its children");
-  const WorldPose replace = EchoesPose(echoes, turn, 0.f, {RotationMode::Replace, TranslationMode::Replace});
-  Check(AngleBetween(replace.orientations[1], Mul(r0, AxisAngle(0, 1, 0, 90))) < 0.01f,
-        "a key taken as the whole local rotation replaces it");
+  // The root's translation key moves the body; the Prime root takes it as an offset.
+  {
+    const Convention c = Conventions()[0];
+    const Clip clip = Encode(rig, std::vector<Quat>(target.size(), Quat{}), Vec3{0.f, 0.5f, 0.f}, c);
+    const WorldPose pose = EchoesPose(rig.echoes, clip, 0.f, c);
+    const PrimePose onPrime = RetargetToPrime(rig.echoes, pose, rig.prime);
+    Check(Near(pose.positions[11], Vec3{0, 0.56f, 1.62f}) && onPrime.hasOffset[0] &&
+              Near(onPrime.offsets[0], Vec3{0, 0.5f, 0}),
+          "a translation key moves the bone and becomes its offset on Prime");
+  }
 
-  WorldPose onPrime;
-  const std::vector<Quat> locals = RetargetToPrime(echoes, fromBind, prime, onPrime);
-  Check(locals.size() == 4 && AngleBetween(locals[1], Quat{}) < 0.01f, "Prime's extra bones stay at rest");
-  Check(Near(onPrime.positions[0], fromBind.positions[0]) && Near(onPrime.positions[2], fromBind.positions[1]) &&
-            Near(onPrime.positions[3], fromBind.positions[2]),
-        "on Prime's skeleton every shared joint lands where it is in Echoes' pose");
-  WorldPose restOnPrime;
-  RetargetToPrime(echoes, rest, prime, restOnPrime);
-  Check(Near(restOnPrime.positions[3], Vec3{0, 0.2f, 2}) && AngleBetween(restOnPrime.orientations[3], Quat{}) < 0.01f,
-        "Echoes' bind pose is Prime's rest pose");
+  // Standing in the bind pose, written under each convention: the ranking picks one that reads it
+  // back as a standing body.
+  bool rankingFindsIt = true;
+  for (const Convention& c : Conventions()) {
+    const Clip clip = Encode(rig, std::vector<Quat>(target.size(), Quat{}), Vec3{}, c);
+    const auto ranking = RankConventions(rig.echoes, {{"B_ready_samus", &clip}});
+    const WorldPose best = EchoesPose(rig.echoes, clip, 0.f, Conventions()[ranking.front().index]);
+    for (size_t i = 0; i < rig.echoes.bones.size(); ++i) {
+      const float* p = rig.echoes.bones[i].position;
+      if (!Near(best.positions[i], Vec3{p[0], p[1], p[2]}, 2e-3f)) {
+        rankingFindsIt = false;
+      }
+    }
+    if (ranking.front().score > 0.02f) {
+      rankingFindsIt = false;
+    }
+  }
+  Check(rankingFindsIt, "the ranking finds the convention a standing pose was written with");
 
-  const std::string report = BuildAnimationCheck(echoes, prime, {{"B_run_samus", MakeCompressedClip(false)},
-                                                                 {"B_missing", {}}});
-  Check(report.find("local = parent^-1 * bind off by 0.00") != std::string::npos,
-        "the check measures the skeleton's own rotations");
+  const std::string report = BuildAnimationCheck(rig.echoes, rig.prime, {{"B_run_samus", MakeCompressedClip(false)},
+                                                                         {"B_missing", {}}});
+  Check(report.find("stored inverted") != std::string::npos, "the check says how the bind rotations are stored");
   Check(report.find("B_run_samus: version 2") != std::string::npos && report.find("86 of 96 bits") != std::string::npos,
         "the check decodes the clips");
   Check(report.find("B_missing: not found") != std::string::npos, "a missing clip is reported");
+  Check(report.find("ranked") != std::string::npos && report.find("pose #") != std::string::npos,
+        "the check ranks the conventions and shows the best poses");
+}
+
+
+// A clip that holds `pose` (unbound orientations) and carries the root `travel` a second.
+PortEchoesAnim::Clip Hold(const Rig& rig, const std::vector<Quat>& pose, float travel, float duration) {
+  using namespace PortEchoesAnim;
+  Clip clip = Encode(rig, pose, Vec3{}, Conventions()[0]);
+  clip.duration = duration;
+  clip.interval = duration;
+  for (Channel& ch : clip.channels) {
+    if (!ch.translations.empty()) {
+      ch.translations = {Vec3{0, 0, 0}, Vec3{0, travel * duration, 0}};
+    }
+  }
+  return clip;
+}
+
+void TestLocomotion() {
+  using namespace PortEchoesAnim;
+  using namespace PortEchoesLocomotion;
+  const Rig rig = MakeRig();
+  auto lib = std::make_shared<Library>();
+  lib->echoes = rig.echoes;
+  std::vector<Quat> stand(rig.echoes.bones.size(), Quat{});
+  std::vector<Quat> stride = stand;
+  stride[4] = AxisAngle(1, 0, 0, 40); // L_knee bent
+  lib->clips["B_ready_samus"] = Hold(rig, stand, 0.f, 1.f);
+  lib->clips["B_walk_samus"] = Hold(rig, stride, 2.f, 1.f);
+  lib->clips["B_run_samus"] = Hold(rig, stride, 6.f, 0.5f);
+  lib->clips["B_jumploop_samus"] = Hold(rig, stand, 0.f, 0.6f);
+  Player player;
+  player.SetLibrary(lib);
+  player.SetPrime(rig.prime);
+  player.SetConvention(0);
+  Check(player.Ready(), "the player is ready with a library and Prime's skeleton");
+
+  PortEchoesLocomotion::Input in;
+  in.dt = 1.f / 60.f;
+  in.scale = 1.f;
+  const PrimePose* pose = &player.Update(in);
+  auto top = player.Weights();
+  Check(!top.empty() && top.front().first == "B_ready_samus" && top.front().second > 0.99f,
+        "standing still plays the standing animation");
+  Check(pose->hasOffset[0] && Near(pose->offsets[0].x, 0.f) && Near(pose->offsets[0].y, 0.f),
+        "the root stays where the player puts the body");
+
+  in.forwardSpeed = 2.f;
+  for (int i = 0; i < 60; ++i) {
+    pose = &player.Update(in);
+  }
+  top = player.Weights();
+  Check(!top.empty() && top.front().first == "B_walk_samus" && top.front().second > 0.9f,
+        "walking speed plays the walk");
+  Check(AngleBetween(pose->locals[4], AxisAngle(1, 0, 0, 40)) < 0.5f, "the walk's pose reaches Prime's knee");
+
+  in.forwardSpeed = 4.f;
+  for (int i = 0; i < 60; ++i) {
+    player.Update(in);
+  }
+  top = player.Weights();
+  Check(top.size() == 2 && std::fabs(top[0].second - 0.5f) < 0.05f && std::fabs(top[1].second - 0.5f) < 0.05f,
+        "between walking and running speeds the two blend");
+
+  in.forwardSpeed = 0.f;
+  in.sideSpeed = 3.f; // no strafe clips: falls back to forward
+  for (int i = 0; i < 60; ++i) {
+    player.Update(in);
+  }
+  Check(!player.Weights().empty() && player.Weights().front().first != "B_ready_samus",
+        "a direction without animations still moves the legs");
+
+  in.onGround = false;
+  for (int i = 0; i < 60; ++i) {
+    player.Update(in);
+  }
+  top = player.Weights();
+  Check(!top.empty() && top.front().first == "B_jumploop_samus" && top.front().second > 0.95f,
+        "in the air the jump loop plays");
 }
 
 } // namespace
@@ -932,6 +1112,7 @@ int main() {
   TestAnimationSet();
   TestCompressedClip();
   TestPoses();
+  TestLocomotion();
   if (sFailures == 0) {
     std::printf("port_echoes_probe: all checks passed\n");
   }

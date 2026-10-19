@@ -16,6 +16,7 @@
 #include "port_echoes_anim.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -151,7 +152,7 @@ private:
 constexpr float kPi = 3.14159265358979f;
 
 void Line(std::string& out, const char* format, ...) {
-  char buf[512];
+  char buf[2048];
   va_list args;
   va_start(args, format);
   std::vsnprintf(buf, sizeof(buf), format, args);
@@ -641,150 +642,349 @@ Sample SampleChannel(const Clip& clip, const Channel& channel, float time) {
   return s;
 }
 
-WorldPose EchoesPose(const Skeleton& skeleton, const Clip& clip, float time,
-                     const PoseOptions& options) {
-  const auto index = IndexById(skeleton);
-  std::map< uint32_t, const Channel* > channels;
-  for (const Channel& c : clip.channels) {
-    channels[c.bone] = &c;
+const std::vector< Convention >& Conventions() {
+  static const std::vector< Convention > list = [] {
+    std::vector< Convention > v;
+    for (bool conj : {false, true}) {
+      v.push_back({KeyMode::Prime, conj, TranslationFrame::Unrotated});
+    }
+    for (KeyMode m : {KeyMode::Absolute, KeyMode::BindThenKey, KeyMode::KeyThenBind}) {
+      for (bool conj : {false, true}) {
+        for (TranslationFrame t : {TranslationFrame::Unrotated, TranslationFrame::ParentBind}) {
+          v.push_back({m, conj, t});
+        }
+      }
+    }
+    return v;
+  }();
+  return list;
+}
+
+std::string ConventionName(const Convention& c) {
+  std::string name;
+  switch (c.mode) {
+  case KeyMode::Prime:
+    name = "prime";
+    break;
+  case KeyMode::Absolute:
+    name = "absolute";
+    break;
+  case KeyMode::BindThenKey:
+    name = "bind*key";
+    break;
+  case KeyMode::KeyThenBind:
+    name = "key*bind";
+    break;
   }
+  if (c.conjugate) {
+    name += " (key^-1)";
+  }
+  if (c.mode != KeyMode::Prime) {
+    name += c.translation == TranslationFrame::Unrotated ? ", moves unrotated" : ", moves bound";
+  }
+  return name;
+}
+
+namespace {
+
+void SelfCheck(const Skeleton& s, float& asStored, float& asInverse) {
+  const auto index = IndexById(s);
+  asStored = 0.f;
+  asInverse = 0.f;
+  for (const Bone& b : s.bones) {
+    const auto p = index.find(b.parent);
+    const Quat pb = p != index.end() ? ToQuat(s.bones[p->second].rotation) : Quat{};
+    const Quat bb = ToQuat(b.rotation);
+    const Quat lb = ToQuat(b.localRotation);
+    asStored = std::max(asStored, AngleBetween(lb, Mul(Conj(pb), bb)));
+    asInverse = std::max(asInverse, AngleBetween(lb, Mul(bb, Conj(pb))));
+  }
+}
+
+// The bind rotations as bone-to-world rotations, whichever way they are stored.
+struct BindFrames {
+  std::vector< Quat > world;
+  std::vector< Quat > local;
+};
+BindFrames Binds(const Skeleton& s) {
+  const bool inverse = BindStoredInverse(s);
+  BindFrames f;
+  for (const Bone& b : s.bones) {
+    const Quat w = ToQuat(b.rotation);
+    const Quat l = ToQuat(b.localRotation);
+    f.world.push_back(inverse ? Conj(w) : w);
+    f.local.push_back(inverse ? Conj(l) : l);
+  }
+  return f;
+}
+
+float Horizontal(const Vec3& v) { return std::sqrt(v.x * v.x + v.y * v.y); }
+
+int FindBone(const Skeleton& s, const char* name) {
+  for (size_t i = 0; i < s.bones.size(); ++i) {
+    if (s.bones[i].name == name) {
+      return int(i);
+    }
+  }
+  return -1;
+}
+
+bool Contains(const std::string& haystack, const char* needle) {
+  std::string h = haystack;
+  for (char& c : h) {
+    c = char(std::tolower(static_cast< unsigned char >(c)));
+  }
+  return h.find(needle) != std::string::npos;
+}
+
+// The frames a clip spans: its keys' last frame, or its duration's.
+uint32_t FrameCount(const Clip& clip) {
+  uint32_t frames = clip.keyFrames.empty() ? 1 : clip.keyFrames.back() + 1;
+  if (clip.interval > 0.f) {
+    frames = std::max(frames, uint32_t(std::lround(clip.duration / clip.interval)) + 1);
+  }
+  return std::min< uint32_t >(frames, 2000);
+}
+
+} // namespace
+
+bool BindStoredInverse(const Skeleton& skeleton) {
+  float asStored = 0.f;
+  float asInverse = 0.f;
+  SelfCheck(skeleton, asStored, asInverse);
+  return asInverse < asStored;
+}
+
+WorldPose EchoesPose(const Skeleton& skeleton, const Clip& clip, float time, const Convention& c) {
+  const auto index = IndexById(skeleton);
+  const BindFrames bind = Binds(skeleton);
+  std::map< uint32_t, const Channel* > channels;
+  for (const Channel& ch : clip.channels) {
+    channels[ch.bone] = &ch;
+  }
+  const size_t n = skeleton.bones.size();
+  const bool prime = c.mode == KeyMode::Prime;
   WorldPose pose;
-  pose.positions.assign(skeleton.bones.size(), Vec3{});
-  pose.orientations.assign(skeleton.bones.size(), Quat{});
+  pose.positions.assign(n, Vec3{});
+  pose.orientations.assign(n, Quat{});
+  pose.moved.assign(n, false);
+  std::vector< Quat > world(n, Quat{}); // with the bind rotations in (prime: the same as unbound)
   for (size_t i : ParentsFirst(skeleton)) {
     const Bone& b = skeleton.bones[i];
     const auto p = index.find(b.parent);
     const bool hasParent = p != index.end() && p->second != i;
-    const Quat parentBind = hasParent ? ToQuat(skeleton.bones[p->second].rotation) : Quat{};
-    const Vec3 parentPos = hasParent ? ToVec(skeleton.bones[p->second].position) : Vec3{};
-    // The bind offset, in the parent's bind frame.
-    Vec3 offset = Rotate(Conj(parentBind), Sub(ToVec(b.position), parentPos));
-    Quat local = ToQuat(b.localRotation);
+    const Quat wp = hasParent ? world[p->second] : Quat{};
+    const Quat qp = hasParent ? pose.orientations[p->second] : Quat{};
+    const Vec3 pp = hasParent ? pose.positions[p->second] : Vec3{};
+    Quat local = prime ? Quat{} : bind.local[i];
+    Sample s;
     const auto ch = channels.find(b.id);
     if (ch != channels.end()) {
-      const Sample s = SampleChannel(clip, *ch->second, time);
-      if (s.hasRotation) {
-        local = options.rotation == RotationMode::Replace ? s.rotation
-                                                          : Normalized(Mul(local, s.rotation));
-      }
-      if (s.hasTranslation) {
-        offset = options.translation == TranslationMode::Replace ? s.translation
-                                                                 : Add(offset, s.translation);
+      s = SampleChannel(clip, *ch->second, time);
+    }
+    if (s.hasRotation) {
+      const Quat k = c.conjugate ? Conj(s.rotation) : s.rotation;
+      switch (c.mode) {
+      case KeyMode::Prime:
+      case KeyMode::Absolute:
+        local = k;
+        break;
+      case KeyMode::BindThenKey:
+        local = Mul(bind.local[i], k);
+        break;
+      case KeyMode::KeyThenBind:
+        local = Mul(k, bind.local[i]);
+        break;
       }
     }
-    if (hasParent) {
-      const Quat& pw = pose.orientations[p->second];
-      pose.orientations[i] = Normalized(Mul(pw, local));
-      pose.positions[i] = Add(pose.positions[p->second], Rotate(pw, offset));
+    world[i] = Normalized(Mul(wp, local));
+    pose.orientations[i] = prime ? world[i] : Normalized(Mul(world[i], Conj(bind.world[i])));
+    if (s.hasTranslation) {
+      const bool bound = !prime && c.translation == TranslationFrame::ParentBind;
+      pose.positions[i] = Add(pp, Rotate(bound ? wp : qp, s.translation));
+      pose.moved[i] = true;
     } else {
-      pose.orientations[i] = local;
-      pose.positions[i] = offset;
+      const Vec3 d = hasParent ? Sub(ToVec(b.position), ToVec(skeleton.bones[p->second].position))
+                               : ToVec(b.position);
+      pose.positions[i] = Add(pp, Rotate(qp, d));
     }
   }
   return pose;
 }
 
-std::vector< Quat > RetargetToPrime(const Skeleton& echoes, const WorldPose& echoesPose,
-                                    const Skeleton& prime, WorldPose& world) {
-  const auto primeIndex = IndexById(prime);
-  world.positions.assign(prime.bones.size(), Vec3{});
-  world.orientations.assign(prime.bones.size(), Quat{});
-  std::vector< Quat > locals(prime.bones.size(), Quat{});
-  // Each Prime bone's skeleton-space orientation: Echoes' with its bind turned out of it (Prime's
-  // bones rest unrotated), or its parent's where Echoes has no such bone.
-  std::vector< bool > mapped(prime.bones.size(), false);
-  std::vector< Quat > target(prime.bones.size(), Quat{});
-  for (size_t i = 0; i < prime.bones.size(); ++i) {
-    for (size_t j = 0; j < echoes.bones.size(); ++j) {
-      if (echoes.bones[j].name == prime.bones[i].name) {
-        target[i] =
-            Normalized(Mul(echoesPose.orientations[j], Conj(ToQuat(echoes.bones[j].rotation))));
-        mapped[i] = true;
-        break;
-      }
-    }
+PrimePose RetargetToPrime(const Skeleton& echoes, const WorldPose& pose, const Skeleton& prime) {
+  const auto index = IndexById(prime);
+  const size_t n = prime.bones.size();
+  PrimePose out;
+  out.locals.assign(n, Quat{});
+  out.orientations.assign(n, Quat{});
+  out.positions.assign(n, Vec3{});
+  out.hasOffset.assign(n, false);
+  out.offsets.assign(n, Vec3{});
+  std::map< std::string, size_t > byName;
+  for (size_t j = 0; j < echoes.bones.size(); ++j) {
+    byName[echoes.bones[j].name] = j;
   }
   for (size_t i : ParentsFirst(prime)) {
     const Bone& b = prime.bones[i];
-    const auto p = primeIndex.find(b.parent);
-    const bool hasParent = p != primeIndex.end() && p->second != i;
-    const Quat parentWorld = hasParent ? world.orientations[p->second] : Quat{};
-    world.orientations[i] = mapped[i] ? target[i] : parentWorld;
-    locals[i] = Normalized(Mul(Conj(parentWorld), world.orientations[i]));
-    // Prime's offsets are unrotated skeleton-space differences, turned by the parent.
-    if (hasParent) {
-      const Vec3 offset = Sub(ToVec(b.position), ToVec(prime.bones[p->second].position));
-      world.positions[i] = Add(world.positions[p->second], Rotate(parentWorld, offset));
+    const auto p = index.find(b.parent);
+    const bool hasParent = p != index.end() && p->second != i;
+    const Quat qp = hasParent ? out.orientations[p->second] : Quat{};
+    const Vec3 pp = hasParent ? out.positions[p->second] : Vec3{};
+    const auto e = byName.find(b.name);
+    const bool mapped = e != byName.end() && e->second < pose.orientations.size();
+    out.orientations[i] = mapped ? pose.orientations[e->second] : qp;
+    out.locals[i] = Normalized(Mul(Conj(qp), out.orientations[i]));
+    const Vec3 d = hasParent ? Sub(ToVec(b.position), ToVec(prime.bones[p->second].position))
+                             : ToVec(b.position);
+    if (mapped && pose.moved[e->second]) {
+      out.positions[i] = pose.positions[e->second];
+      out.offsets[i] = Rotate(Conj(qp), Sub(out.positions[i], pp));
+      out.hasOffset[i] = true;
     } else {
-      // The root follows Echoes' root, wherever its animation put it.
-      for (size_t j = 0; j < echoes.bones.size(); ++j) {
-        if (echoes.bones[j].name == b.name) {
-          world.positions[i] = echoesPose.positions[j];
-        }
-      }
+      out.positions[i] = Add(pp, Rotate(qp, d));
+      out.offsets[i] = d;
     }
   }
-  return locals;
+  return out;
+}
+
+std::vector< ConventionScore > RankConventions(const Skeleton& echoes,
+                                               const std::vector< NamedClip >& clips) {
+  const int balls[2] = {FindBone(echoes, "L_ball"), FindBone(echoes, "R_ball")};
+  const int ankles[2] = {FindBone(echoes, "L_ankle"), FindBone(echoes, "R_ankle")};
+  const int knees[2] = {FindBone(echoes, "L_knee"), FindBone(echoes, "R_knee")};
+  const int head = FindBone(echoes, "Head_1");
+  const int hips = FindBone(echoes, "Skeleton_Root");
+  const float bindHead = head >= 0 ? echoes.bones[size_t(head)].position[2] : 0.f;
+  std::vector< ConventionScore > scores;
+  const auto& conventions = Conventions();
+  for (size_t ci = 0; ci < conventions.size(); ++ci) {
+    ConventionScore sc;
+    sc.index = ci;
+    float groundSum = 0.f;
+    int groundN = 0;
+    float headSum = 0.f;
+    int headN = 0;
+    float skateSum = 0.f;
+    int skateN = 0;
+    int samplesAll = 0;
+    for (const NamedClip& nc : clips) {
+      if (nc.clip == nullptr) {
+        continue;
+      }
+      const bool standing = Contains(nc.name, "ready");
+      const bool moving = Contains(nc.name, "walk") || Contains(nc.name, "jog") ||
+                          Contains(nc.name, "run") || Contains(nc.name, "strafe");
+      if (!standing && !moving) {
+        continue;
+      }
+      const uint32_t frames = FrameCount(*nc.clip);
+      float minFoot = 1e9f;
+      float headZ = 0.f;
+      float footSlide = 0.f;
+      float bodyTravel = 0.f;
+      WorldPose prev;
+      for (uint32_t f = 0; f < frames; ++f) {
+        const WorldPose pose =
+            EchoesPose(echoes, *nc.clip, float(f) * nc.clip->interval, conventions[ci]);
+        ++samplesAll;
+        for (int k = 0; k < 2; ++k) {
+          for (int bone : {balls[k], ankles[k]}) {
+            if (bone >= 0) {
+              minFoot = std::min(minFoot, pose.positions[size_t(bone)].z);
+            }
+          }
+          if (ankles[k] >= 0 && knees[k] >= 0 &&
+              pose.positions[size_t(ankles[k])].z > pose.positions[size_t(knees[k])].z + 0.05f) {
+            ++sc.broken;
+          }
+        }
+        if (head >= 0 && hips >= 0 &&
+            pose.positions[size_t(head)].z < pose.positions[size_t(hips)].z) {
+          ++sc.broken;
+        }
+        if (head >= 0) {
+          headZ += pose.positions[size_t(head)].z;
+        }
+        if (moving && f > 0 && balls[0] >= 0 && balls[1] >= 0 && hips >= 0) {
+          // The foot lower at both ends of the step is the planted one.
+          const size_t lb = size_t(balls[0]);
+          const size_t rb = size_t(balls[1]);
+          const bool leftDown = prev.positions[lb].z <= prev.positions[rb].z;
+          const size_t planted = leftDown ? lb : rb;
+          const size_t other = leftDown ? rb : lb;
+          if (pose.positions[planted].z <= pose.positions[other].z) {
+            footSlide += Horizontal(Sub(pose.positions[planted], prev.positions[planted]));
+            bodyTravel +=
+                Horizontal(Sub(pose.positions[size_t(hips)], prev.positions[size_t(hips)]));
+          }
+        }
+        prev = pose;
+      }
+      if (minFoot < 1e8f) {
+        groundSum += std::fabs(minFoot);
+        ++groundN;
+      }
+      if (standing && head >= 0) {
+        headSum += std::fabs(headZ / float(frames) - bindHead);
+        ++headN;
+      }
+      if (moving && bodyTravel > 0.05f) {
+        skateSum += footSlide / bodyTravel;
+        ++skateN;
+      }
+    }
+    sc.ground = groundN != 0 ? groundSum / float(groundN) : 0.f;
+    sc.head = headN != 0 ? headSum / float(headN) : 0.f;
+    sc.skate = skateN != 0 ? skateSum / float(skateN) : 0.f;
+    const float brokenShare = samplesAll != 0 ? float(sc.broken) / float(samplesAll) : 0.f;
+    sc.score = sc.ground * 4.f + sc.head * 2.f + sc.skate + brokenShare * 2.f;
+    scores.push_back(sc);
+  }
+  std::stable_sort(
+      scores.begin(), scores.end(),
+      [](const ConventionScore& a, const ConventionScore& b) { return a.score < b.score; });
+  return scores;
 }
 
 std::string BuildAnimationCheck(const Skeleton& echoes, const Skeleton& prime,
                                 const std::vector< ClipInput >& clips) {
   std::string out;
   Line(out, "== Animation decode check ==");
-  // The skeleton's own rotations against each other: each bone's local rotation should be its
-  // parent's bind turned out of its own, in one of the two multiplication orders.
-  {
-    const auto index = IndexById(echoes);
-    float worstA = 0.f;
-    float worstB = 0.f;
-    for (const Bone& b : echoes.bones) {
-      const auto p = index.find(b.parent);
-      const Quat pb = p != index.end() ? ToQuat(echoes.bones[p->second].rotation) : Quat{};
-      const Quat bb = ToQuat(b.rotation);
-      const Quat lb = ToQuat(b.localRotation);
-      worstA = std::max(worstA, AngleBetween(lb, Mul(Conj(pb), bb)));
-      worstB = std::max(worstB, AngleBetween(lb, Mul(bb, Conj(pb))));
-    }
-    Line(out,
-         "Skeleton self-check: local = parent^-1 * bind off by %.2f deg at most; bind * parent^-1 "
-         "off by %.2f deg",
-         worstA, worstB);
-  }
-  const auto find = [&](const Skeleton& s, const char* name) -> int {
-    for (size_t i = 0; i < s.bones.size(); ++i) {
-      if (s.bones[i].name == name) {
-        return int(i);
-      }
-    }
-    return -1;
-  };
-  const int root = find(echoes, "Skeleton_Root");
-  const int head = find(echoes, "Head_1");
-  const int feet[4] = {find(echoes, "L_ball"), find(echoes, "R_ball"), find(echoes, "L_ankle"),
-                       find(echoes, "R_ankle")};
-  const char* modeNames[4] = {"replace/replace", "bind*key/replace", "replace/add", "bind*key/add"};
-  const PoseOptions modes[4] = {{RotationMode::Replace, TranslationMode::Replace},
-                                {RotationMode::FromBind, TranslationMode::Replace},
-                                {RotationMode::Replace, TranslationMode::Add},
-                                {RotationMode::FromBind, TranslationMode::Add}};
-  for (const ClipInput& in : clips) {
+  float asStored = 0.f;
+  float asInverse = 0.f;
+  SelfCheck(echoes, asStored, asInverse);
+  Line(out,
+       "Skeleton self-check: local = parent^-1 * bind off by %.2f deg at most; bind * parent^-1 "
+       "off by %.2f deg",
+       asStored, asInverse);
+  Line(out, "Bind rotations read as %s",
+       BindStoredInverse(echoes) ? "stored inverted (world-to-bone)" : "stored as they are");
+
+  std::vector< Clip > decoded(clips.size());
+  std::vector< bool > ok(clips.size(), false);
+  for (size_t ci = 0; ci < clips.size(); ++ci) {
+    const ClipInput& in = clips[ci];
     Line(out, "");
     if (in.data.empty()) {
       Line(out, "%s: not found", in.name.c_str());
       continue;
     }
-    Clip clip;
+    Clip& clip = decoded[ci];
     std::string error;
     if (!ParseClip(in.data.data(), in.data.size(), clip, error)) {
-      Line(out,
-           "%s: could not decode (%s); %zu bytes, first words %02X%02X%02X%02X %02X%02X%02X%02X",
-           in.name.c_str(), error.c_str(), in.data.size(), in.data.size() > 0 ? in.data[0] : 0,
-           in.data.size() > 1 ? in.data[1] : 0, in.data.size() > 2 ? in.data[2] : 0,
-           in.data.size() > 3 ? in.data[3] : 0, in.data.size() > 4 ? in.data[4] : 0,
-           in.data.size() > 5 ? in.data[5] : 0, in.data.size() > 6 ? in.data[6] : 0,
-           in.data.size() > 7 ? in.data[7] : 0);
+      std::string head;
+      char buf[4];
+      for (size_t k = 0; k < in.data.size() && k < 8; ++k) {
+        std::snprintf(buf, sizeof(buf), "%02X", in.data[k]);
+        head += buf;
+      }
+      Line(out, "%s: could not decode (%s); %zu bytes, starting %s", in.name.c_str(), error.c_str(),
+           in.data.size(), head.c_str());
       continue;
     }
+    ok[ci] = true;
     size_t rot = 0;
     size_t trans = 0;
     size_t scale = 0;
@@ -801,74 +1001,137 @@ std::string BuildAnimationCheck(const Skeleton& echoes, const Skeleton& prime,
          scale);
     if (clip.version == 2) {
       Line(out,
-           "  bitstream: %llu of %llu bits used; %u frames in the key bitmap (duration/interval "
-           "%.1f), %u keys after "
-           "frame 0, channels count up to %u; table: %u word(s) after the bitmap, %u-byte bone "
-           "ids%s",
+           "  bitstream: %llu of %llu bits used; %u keys after frame 0, channels count up to %u; "
+           "table: %u word(s) "
+           "after the bitmap, %u-byte bone ids%s",
            static_cast< unsigned long long >(clip.bitsUsed),
-           static_cast< unsigned long long >(clip.bitsAvailable), clip.bitmapFrames,
-           clip.interval > 0.f ? clip.duration / clip.interval : 0.f, clip.keyBitmapKeys,
+           static_cast< unsigned long long >(clip.bitsAvailable), clip.keyBitmapKeys,
            clip.descriptorKeys, clip.wordsAfterBitmap, clip.boneIdBytes,
            clip.layoutTies != 0 ? " (another layout fit as well)" : "");
-      std::string bones;
-      for (const Channel& c : clip.channels) {
-        const Bone* b = echoes.Find(c.bone);
-        char item[64];
-        std::snprintf(item, sizeof(item), "%s%s%s%s", b != nullptr ? b->name.c_str() : "?",
-                      c.rotations.empty() ? "" : "/r", c.translations.empty() ? "" : "/t",
-                      c.scales.empty() ? "" : "/s");
-        bones += (bones.empty() ? "" : " ") + std::string(item);
-      }
-      Line(out, "  channels: %s", bones.c_str());
     }
-    for (int m = 0; m < 4; ++m) {
-      float footMin = 1e9f;
-      float footMax = -1e9f;
-      float headMin = 1e9f;
-      float headMax = -1e9f;
-      float retargetError = 0.f;
-      Vec3 rootStart;
-      Vec3 rootEnd;
-      const int steps = 24;
-      for (int s = 0; s <= steps; ++s) {
-        const float t = clip.duration * float(s) / float(steps) * (clip.looping ? 0.9999f : 1.f);
-        const WorldPose pose = EchoesPose(echoes, clip, t, modes[m]);
-        for (int f : feet) {
-          if (f >= 0) {
-            footMin = std::min(footMin, pose.positions[size_t(f)].z);
-            footMax = std::max(footMax, pose.positions[size_t(f)].z);
+  }
+
+  // The first standing clip's first frame against the bind pose: which reading of a key gives a
+  // standing body back is told by which of these the keys sit near.
+  const BindFrames bind = Binds(echoes);
+  const auto index = IndexById(echoes);
+  for (size_t ci = 0; ci < clips.size(); ++ci) {
+    if (!ok[ci] || !Contains(clips[ci].name, "ready")) {
+      continue;
+    }
+    Line(out, "");
+    Line(out, "Keys of %s at frame 0 against the bind pose (angles in degrees; translations in m):",
+         clips[ci].name.c_str());
+    Line(out, "  %-20s %8s %8s %10s %8s", "bone", "identity", "bindloc", "bindloc^-1", "bindworld");
+    for (const Channel& ch : decoded[ci].channels) {
+      const auto bi = index.find(ch.bone);
+      if (bi == index.end()) {
+        continue;
+      }
+      const size_t i = bi->second;
+      const Bone& b = echoes.bones[i];
+      if (!ch.rotations.empty()) {
+        const Quat k = ch.rotations.front();
+        Line(out, "  %-20s %8.1f %8.1f %10.1f %8.1f", b.name.c_str(), AngleBetween(k, Quat{}),
+             AngleBetween(k, bind.local[i]), AngleBetween(k, Conj(bind.local[i])),
+             AngleBetween(k, bind.world[i]));
+      }
+      if (!ch.translations.empty()) {
+        const Vec3 t = ch.translations.front();
+        const auto p = index.find(b.parent);
+        const bool hasParent = p != index.end() && p->second != i;
+        const Vec3 d = hasParent ? Sub(ToVec(b.position), ToVec(echoes.bones[p->second].position))
+                                 : ToVec(b.position);
+        const Quat pw = hasParent ? bind.world[p->second] : Quat{};
+        const Vec3 boundD = Rotate(Conj(pw), d);
+        Line(out,
+             "  %-20s t (%6.3f %6.3f %6.3f)  bind offset unrotated (%6.3f %6.3f %6.3f)  in "
+             "parent's bind frame "
+             "(%6.3f %6.3f %6.3f)",
+             b.name.c_str(), t.x, t.y, t.z, d.x, d.y, d.z, boundD.x, boundD.y, boundD.z);
+      }
+    }
+    break;
+  }
+
+  std::vector< NamedClip > named;
+  for (size_t ci = 0; ci < clips.size(); ++ci) {
+    if (ok[ci]) {
+      named.push_back({clips[ci].name, &decoded[ci]});
+    }
+  }
+  const std::vector< ConventionScore > ranking = RankConventions(echoes, named);
+  const auto& conventions = Conventions();
+  Line(out, "");
+  Line(out, "How the keys apply, ranked (feet on the floor, head at its height standing, planted "
+            "feet not sliding):");
+  Line(out, "  %3s %-36s %7s %7s %7s %7s %6s", "#", "convention", "score", "floor", "head", "slide",
+       "folded");
+  for (const ConventionScore& sc : ranking) {
+    Line(out, "  %3zu %-36s %7.3f %7.3f %7.3f %7.3f %6d", sc.index,
+         ConventionName(conventions[sc.index]).c_str(), sc.score, sc.ground, sc.head, sc.skate,
+         sc.broken);
+  }
+
+  // The two best as joint positions, for a look at the figure itself.
+  static const char* const kJoints[] = {
+      "Skeleton_Root", "Spine_2", "Collar",  "Head_1",     "L_hip",   "L_knee",
+      "L_ankle",       "L_ball",  "R_hip",   "R_knee",     "R_ankle", "R_ball",
+      "L_shoulder",    "L_elbow", "L_wrist", "R_shoulder", "R_elbow", "GUN_LCTR"};
+  for (size_t rank = 0; rank < 2 && rank < ranking.size(); ++rank) {
+    const Convention& c = conventions[ranking[rank].index];
+    for (size_t ci = 0; ci < clips.size(); ++ci) {
+      if (!ok[ci] || !(Contains(clips[ci].name, "ready") || clips[ci].name == "B_run_samus" ||
+                       clips[ci].name == "B_strafe_Left_samus")) {
+        continue;
+      }
+      const Clip& clip = decoded[ci];
+      for (int q = 0; q < 4; ++q) {
+        const float t = clip.duration * float(q) / 4.f;
+        const WorldPose pose = EchoesPose(echoes, clip, t, c);
+        std::string joints;
+        for (const char* name : kJoints) {
+          const int j = FindBone(echoes, name);
+          if (j < 0) {
+            continue;
           }
+          char item[64];
+          const Vec3& v = pose.positions[size_t(j)];
+          std::snprintf(item, sizeof(item), " %s %.2f %.2f %.2f", name, v.x, v.y, v.z);
+          joints += item;
         }
-        if (head >= 0) {
-          headMin = std::min(headMin, pose.positions[size_t(head)].z);
-          headMax = std::max(headMax, pose.positions[size_t(head)].z);
+        Line(out, "  pose #%zu %s t=%.3f:%s", ranking[rank].index, clips[ci].name.c_str(), t,
+             joints.c_str());
+        if (Contains(clips[ci].name, "ready")) {
+          break;
         }
-        if (root >= 0) {
-          (s == 0 ? rootStart : rootEnd) = pose.positions[size_t(root)];
-        }
-        WorldPose primeWorld;
-        RetargetToPrime(echoes, pose, prime, primeWorld);
+      }
+    }
+  }
+
+  // The best one carried onto Prime's skeleton: shared joints should land where they are on
+  // Echoes'.
+  if (!ranking.empty()) {
+    float worst = 0.f;
+    const Convention& c = conventions[ranking.front().index];
+    for (size_t ci = 0; ci < clips.size(); ++ci) {
+      if (!ok[ci]) {
+        continue;
+      }
+      for (int q = 0; q < 8; ++q) {
+        const WorldPose pose =
+            EchoesPose(echoes, decoded[ci], decoded[ci].duration * float(q) / 8.f, c);
+        const PrimePose onPrime = RetargetToPrime(echoes, pose, prime);
         for (size_t i = 0; i < prime.bones.size(); ++i) {
-          for (size_t j = 0; j < echoes.bones.size(); ++j) {
-            if (echoes.bones[j].name == prime.bones[i].name) {
-              retargetError =
-                  std::max(retargetError, Length(Sub(primeWorld.positions[i], pose.positions[j])));
-            }
+          const int j = FindBone(echoes, prime.bones[i].name.c_str());
+          if (j >= 0) {
+            worst = std::max(worst, Length(Sub(onPrime.positions[i], pose.positions[size_t(j)])));
           }
         }
       }
-      if (footMin > footMax) {
-        footMin = footMax = 0.f;
-      }
-      if (headMin > headMax) {
-        headMin = headMax = 0.f;
-      }
-      Line(out,
-           "  %-17s feet z %6.3f..%6.3f  head z %6.3f..%6.3f  root moves (%6.3f %6.3f %6.3f)  on "
-           "Prime off by %.4f",
-           modeNames[m], footMin, footMax, headMin, headMax, rootEnd.x - rootStart.x,
-           rootEnd.y - rootStart.y, rootEnd.z - rootStart.z, retargetError);
     }
+    Line(out, "On Prime's skeleton, with #%zu: shared joints off by %.4f m at most",
+         ranking.front().index, worst);
   }
   return out;
 }

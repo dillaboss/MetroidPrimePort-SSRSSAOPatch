@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 class CPlayer;
 class CStateManager;
 class CTransform4f;
@@ -9,7 +11,8 @@ class CTransform4f;
 // first-person camera's; the third-person camera only looks at the point that camera aims at, so
 // the crosshair stays on what a shot hits. Samus has no walk or aim animations, so her standing
 // pose is moved by hand: she leans into turns and strafes, bobs and sways with her stride, dips on
-// landing, and bends at the spine towards where she aims.
+// landing, and bends at the spine towards where she aims. Or, with the user's own Echoes image,
+// she plays Echoes' Samus animations instead (port_echoes_locomotion.h).
 //
 // It applies only while the game's own first-person camera is current: cutscenes, the morph ball,
 // the interpolations between them and the free camera all keep their own views.
@@ -30,5 +33,9 @@ bool ShowBody();
 // physics moving: `view` with the body's motion for this frame folded in (see
 // CPortActorRenderScope). False (and `out` untouched) while there is no motion to apply.
 bool BodyView(const CPlayer& player, const CTransform4f& view, CTransform4f& out);
+
+// Echoes' animations: loading, playing (with how their keys are read and what is blending), or
+// why not. Empty while they are off.
+std::string EchoesAnimationStatus();
 
 } // namespace PortThirdPerson

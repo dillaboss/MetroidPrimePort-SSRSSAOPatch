@@ -553,7 +553,14 @@ ThirdPersonSettings ThirdPerson() {
   s.shoulder = sThirdPersonShoulder;
   s.bodyMotion = sThirdPersonBodyMotion;
   s.torsoAim = sThirdPersonTorsoAim;
+  s.echoesAnims = sThirdPersonEchoesAnims;
+  s.echoesConvention = sThirdPersonEchoesConvention;
   return s;
+}
+
+std::string EchoesImagePath() {
+  EnsureInitialized();
+  return sEchoesImagePath;
 }
 
 void SetThirdPerson(bool enabled) {

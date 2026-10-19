@@ -2,6 +2,8 @@
 #include "port_third_person.h"
 
 #include "port_debug.h"
+#include "port_echoes_locomotion.h"
+#include "port_echoes_probe.h"
 #include "port_freecam.h"
 #include "port_log.h"
 
@@ -24,7 +26,12 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace PortThirdPerson {
 namespace {
@@ -239,6 +246,213 @@ void ResetMotion() {
   sHavePrevForward = false;
 }
 
+
+// ---- Echoes' animations ------------------------------------------------------------------------
+
+// Read from the user's Echoes image on a thread of its own, once per image.
+struct EchoesLoad {
+  std::mutex mutex;
+  std::string path;
+  bool loading = false;
+  std::string error;
+  std::shared_ptr< const PortEchoesLocomotion::Library > library;
+  std::string status; // for the settings, written each tick
+};
+
+// Never destroyed: the loading thread may still hold it at exit.
+EchoesLoad& Echoes() {
+  static EchoesLoad* load = new EchoesLoad;
+  return *load;
+}
+
+void RequestEchoes(const std::string& path) {
+  EchoesLoad& load = Echoes();
+  std::lock_guard lock(load.mutex);
+  if (load.path == path) {
+    return;
+  }
+  load.path = path;
+  load.loading = true;
+  load.error.clear();
+  load.library.reset();
+  PortLog::Write("third person: reading Echoes' animations from %s\n", path.c_str());
+  std::thread([path] {
+    PortEchoesProbe::Skeleton skeleton;
+    std::vector< std::pair< std::string, std::vector< uint8_t > > > clips;
+    std::string error;
+    std::shared_ptr< PortEchoesLocomotion::Library > library;
+    if (PortEchoesProbe::LoadEchoesSamus(path, PortEchoesLocomotion::ClipNames(), skeleton, clips, error)) {
+      auto built = std::make_shared< PortEchoesLocomotion::Library >();
+      if (PortEchoesLocomotion::BuildLibrary(skeleton, clips, *built, error)) {
+        library = std::move(built);
+      }
+    }
+    EchoesLoad& load = Echoes();
+    std::lock_guard lock(load.mutex);
+    if (load.path != path) {
+      return;
+    }
+    load.loading = false;
+    load.library = library;
+    load.error = library != nullptr ? std::string() : error;
+    if (library != nullptr) {
+      const auto& best = library->ranking.front();
+      PortLog::Write("third person: Echoes' animations ready (%zu clips, %zu missing); keys read as #%zu %s\n",
+                     library->clips.size(), library->missing.size(), best.index,
+                     PortEchoesAnim::ConventionName(PortEchoesAnim::Conventions()[best.index]).c_str());
+    } else {
+      PortLog::Write("third person: Echoes' animations not loaded: %s\n", error.c_str());
+    }
+  }).detach();
+}
+
+PortEchoesLocomotion::Player sEchoesPlayer;
+std::shared_ptr< const PortEchoesLocomotion::Library > sEchoesLibrary;
+const CAnimData* sEchoesFor = nullptr;
+std::vector< CSegId > sEchoesSegs; // by Prime bone, as handed to the player
+std::vector< CQuaternion > sEchoesBaseRotation;
+std::vector< CVector3f > sEchoesBaseOffset;
+bool sEchoesDriving = false;
+
+void SetEchoesStatus(const std::string& status) {
+  EchoesLoad& load = Echoes();
+  std::lock_guard lock(load.mutex);
+  load.status = status;
+}
+
+// Prime's skeleton as the body's layout has it, by name.
+PortEchoesProbe::Skeleton PrimeSkeleton(const CCharLayoutInfo& layout, std::vector< CSegId >& segs) {
+  PortEchoesProbe::Skeleton skeleton;
+  segs.clear();
+  for (auto it = layout.PortNameMap().begin(); it != layout.PortNameMap().end(); ++it) {
+    const CSegId seg = it->second;
+    if (seg == CSegId::Invalid() || seg == CSegId::Null()) {
+      continue;
+    }
+    PortEchoesProbe::Bone bone;
+    bone.id = seg.val();
+    bone.parent = layout.GetOriginalParent(seg).val();
+    const CVector3f p = layout.GetReferenceStanceOffset(seg);
+    bone.position[0] = p.GetX();
+    bone.position[1] = p.GetY();
+    bone.position[2] = p.GetZ();
+    bone.name.assign(it->first.data(), it->first.size());
+    skeleton.bones.push_back(bone);
+    segs.push_back(seg);
+  }
+  return skeleton;
+}
+
+// Puts the body's own pose back.
+void StopEchoes(CAnimData* anim) {
+  if (sEchoesDriving && anim != nullptr && anim == sEchoesFor) {
+    CHierarchyPoseBuilder& pose = anim->PoseBuilder();
+    for (size_t i = 0; i < sEchoesSegs.size() && i < sEchoesBaseRotation.size(); ++i) {
+      pose.Insert(sEchoesSegs[i], sEchoesBaseRotation[i]);
+      pose.Insert(sEchoesSegs[i], sEchoesBaseOffset[i]);
+    }
+    anim->SetPoseBuilderValid(false);
+  }
+  if (sEchoesDriving) {
+    sEchoesPlayer.Reset();
+  }
+  sEchoesDriving = false;
+}
+
+// Poses the body from Echoes' animations; false while they are not loaded.
+bool DriveEchoes(CAnimData& anim, const CPlayer& player, float dt, float forwardSpeed, float sideSpeed,
+                 bool onGround, const PortDebug::ThirdPersonSettings& s) {
+  const std::string path = PortDebug::EchoesImagePath();
+  if (path.empty()) {
+    SetEchoesStatus("Pick your Echoes image with the button above first.");
+    return false;
+  }
+  RequestEchoes(path);
+  std::shared_ptr< const PortEchoesLocomotion::Library > library;
+  {
+    EchoesLoad& load = Echoes();
+    std::lock_guard lock(load.mutex);
+    if (load.library == nullptr) {
+      load.status = load.loading ? "Reading Echoes' animations..." : "Echoes' animations: " + load.error;
+      return false;
+    }
+    library = load.library;
+  }
+  if (library != sEchoesLibrary) {
+    StopEchoes(&anim);
+    sEchoesLibrary = library;
+    sEchoesPlayer.SetLibrary(library);
+  }
+  if (sEchoesFor != &anim) {
+    if (sEchoesFor != nullptr) {
+      sEchoesDriving = false; // the old body is gone; nothing to put back
+    }
+    const CCharLayoutInfo* layout = anim.GetCharLayoutInfo();
+    if (layout == nullptr) {
+      return false;
+    }
+    sEchoesFor = &anim;
+    const PortEchoesProbe::Skeleton prime = PrimeSkeleton(*layout, sEchoesSegs);
+    sEchoesPlayer.SetPrime(prime);
+    int mapped = 0;
+    for (const PortEchoesProbe::Bone& b : prime.bones) {
+      mapped += library->echoes.Find(b.name) != nullptr;
+    }
+    PortLog::Write("third person: Echoes' animations drive %d of the body's %zu bones\n", mapped,
+                   prime.bones.size());
+  }
+  const auto& conventions = PortEchoesAnim::Conventions();
+  const size_t best = library->ranking.empty() ? 0 : library->ranking.front().index;
+  const size_t convention =
+      s.echoesConvention > 0 ? std::min(size_t(s.echoesConvention - 1), conventions.size() - 1) : best;
+  sEchoesPlayer.SetConvention(convention);
+
+  // The pose tree as the body's own animation has it, kept to put back.
+  anim.PreRender();
+  CHierarchyPoseBuilder& pose = anim.PoseBuilder();
+  if (!sEchoesDriving) {
+    sEchoesBaseRotation.clear();
+    sEchoesBaseOffset.clear();
+    for (const CSegId& seg : sEchoesSegs) {
+      sEchoesBaseRotation.push_back(pose.GetSegRotation(seg));
+      sEchoesBaseOffset.push_back(pose.PortGetSegOffset(seg));
+    }
+  }
+
+  PortEchoesLocomotion::Input in;
+  in.dt = dt;
+  in.forwardSpeed = forwardSpeed;
+  in.sideSpeed = sideSpeed;
+  in.onGround = onGround;
+  in.scale = std::max(player.GetModelScale().GetZ(), 0.01f);
+  const PortEchoesAnim::PrimePose& p = sEchoesPlayer.Update(in);
+  for (size_t i = 0; i < sEchoesSegs.size() && i < p.locals.size(); ++i) {
+    const PortEchoesAnim::Quat& q = p.locals[i];
+    pose.Insert(sEchoesSegs[i], CQuaternion(q.w, q.x, q.y, q.z));
+    if (p.hasOffset[i]) {
+      const PortEchoesAnim::Vec3& o = p.offsets[i];
+      pose.Insert(sEchoesSegs[i], CVector3f(o.x, o.y, o.z));
+    }
+  }
+  anim.SetPoseBuilderValid(false);
+  sEchoesDriving = true;
+
+  std::string status = "Playing Echoes' animations. Keys read as #" + std::to_string(convention) + " " +
+                       PortEchoesAnim::ConventionName(conventions[convention]);
+  status += convention == best ? " (best ranked)." : " (chosen; best ranked is #" + std::to_string(best) + ").";
+  if (!library->missing.empty()) {
+    status += " " + std::to_string(library->missing.size()) + " animation(s) not found.";
+  }
+  status += "\nNow:";
+  for (const auto& [name, weight] : sEchoesPlayer.Weights()) {
+    char item[96];
+    std::snprintf(item, sizeof(item), " %s %.0f%%", name.c_str(), weight * 100.f);
+    status += item;
+  }
+  SetEchoesStatus(status);
+  return true;
+}
+
 } // namespace
 
 void UpdateFrame(const CStateManager& mgr) {
@@ -330,6 +544,10 @@ void Tick(float dt, CPlayer& player, CStateManager& mgr) {
     if (anim != nullptr) {
       RestoreSpine(*anim);
     }
+    StopEchoes(anim);
+    if (!s.echoesAnims || !s.enabled) {
+      SetEchoesStatus("");
+    }
     ResetMotion();
     return;
   }
@@ -357,11 +575,23 @@ void Tick(float dt, CPlayer& player, CStateManager& mgr) {
   sPrevForward = forward;
   sHavePrevForward = true;
 
+  // Echoes' animations, when on and loaded, pose the whole body; the hand-made motion stands down.
+  bool echoes = false;
+  if (anim != nullptr && s.echoesAnims) {
+    if (!sEchoesDriving) {
+      RestoreSpine(*anim);
+    }
+    echoes = DriveEchoes(*anim, player, dt, forwardSpeed, sideSpeed, onGround, s);
+  } else {
+    StopEchoes(anim);
+    SetEchoesStatus("");
+  }
+
   // Samus runs at about 16 units a second; the motion is scaled to that.
   const float run = 16.f;
   sPrevMotion = sMotion;
   Motion m;
-  if (s.bodyMotion) {
+  if (s.bodyMotion && !echoes) {
     // Into turns (left turn: tips left) and strafes (moving right: tips right), and forward with
     // speed; in the air back on the way up and forward on the way down.
     const float leanTarget =
@@ -420,6 +650,12 @@ void Tick(float dt, CPlayer& player, CStateManager& mgr) {
 }
 
 bool Active() { return sActive; }
+
+std::string EchoesAnimationStatus() {
+  EchoesLoad& load = Echoes();
+  std::lock_guard lock(load.mutex);
+  return load.status;
+}
 
 CTransform4f View(const CTransform4f& game) { return sActive ? sView : game; }
 

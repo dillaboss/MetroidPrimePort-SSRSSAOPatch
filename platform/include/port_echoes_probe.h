@@ -94,6 +94,11 @@ struct State {
 // the user folder. False when a run is already going.
 bool Start(const std::string& echoesPath);
 State Status();
+// For playing Echoes' animations: the Samus the report picks (the one with the most animations),
+// her skeleton and the named animations' ANIM bytes (empty when not found). Blocking; the progress
+// shows in Status().message only while no report is running.
+bool LoadEchoesSamus(const std::string& path, const std::vector< std::string >& names, Skeleton& skeleton,
+                     std::vector< std::pair< std::string, std::vector< uint8_t > > >& clips, std::string& error);
 // The same, blocking, for `--echoes-report <image>`: the report's path on stdout, 0 on success.
 int RunFromCommandLine(const std::string& echoesPath);
 

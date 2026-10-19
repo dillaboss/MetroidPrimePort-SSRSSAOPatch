@@ -498,10 +498,24 @@
   rotations, which Prime's skeletons lack) and Echoes' Samus animation names.
   Its "Animation decode check" decodes a few of those animations (standing,
   walking, jogging, running, strafing, in the air, an additive aim;
-  `platform/port_echoes_anim.cpp`) and measures them: how the compressed
-  bitstream's length comes out against its keys, foot and head heights and root
-  travel under each way the keys could apply to Echoes' bind pose, and how
-  closely the pose lands on Prime's skeleton after the retarget.
+  `platform/port_echoes_anim.cpp`), says how the skeleton stores its bind
+  rotations (Echoes' are inverted, world-to-bone), compares the standing clip's
+  first keys with the bind pose, and ranks every candidate reading of the keys
+  (14: Prime-style, absolute, bind*key, key*bind; key or its inverse;
+  translations in the parent's unrotated or bound frame) by keeping the feet on
+  the floor, the head at its height standing and the planted foot from sliding,
+  with joint positions of the two best for a look at the figure.
+  "Echoes animations" (once an Echoes image has been picked there) plays Echoes'
+  Samus locomotion on Prime's body in third person
+  (`platform/port_echoes_locomotion.cpp`): standing, walk/jog/run forwards and
+  backwards and strafing, blended by speed and direction with a shared stride
+  phase, the jump loop in the air and a landing after a fall. The clips are read
+  from the saved image (`echoes_image` in the settings) on a background thread,
+  carried onto Prime's skeleton (bone names match; Prime's extra bones keep
+  their rest pose) and written into the body's pose builder each tick; the
+  root keeps its height but not the clips' travel, and the hand-made body
+  motion stands down. "How keys apply" picks a reading by hand ("Best ranked"
+  by default) while the right one is being confirmed.
   Names and numbers only; no game data is copied. It is the first step towards
   playing Echoes' locomotion animations on Prime's body. Echoes' PAKs keep
   Prime's table layout but compress with LZO1X in 0x4000-byte segments

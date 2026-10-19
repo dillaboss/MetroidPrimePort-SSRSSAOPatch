@@ -79,35 +79,78 @@ struct Sample {
 Sample SampleChannel(const Clip& clip, const Channel& channel, float time);
 
 // --- Poses ------------------------------------------------------------------------------------
-
-// How a rotation key is taken: as the bone's whole local rotation (replacing the bind local
-// rotation), or as a turn from the bind pose (bind local * key).
-enum class RotationMode { Replace, FromBind };
-// How a translation key is taken: as the bone's offset from its parent, or added to the bind one.
-enum class TranslationMode { Replace, Add };
-
-struct PoseOptions {
-  RotationMode rotation = RotationMode::Replace;
-  TranslationMode translation = TranslationMode::Replace;
+//
+// Echoes' skeletons carry bind rotations; Prime's bones rest unrotated. A pose is worked out on
+// Echoes' skeleton as each bone's "unbound" orientation Q (its world orientation with the bind
+// rotation taken out, so the bind pose is all identity, as on Prime) and its place; carried onto
+// Prime's skeleton, Q is the orientation a Prime bone of the same name takes.
+//
+// How Echoes' keys apply is what the report measures; a Convention is one candidate:
+//   Prime        the key is the bone's local rotation as on Prime's unrotated bones (no bind);
+//   Absolute     the key is the bone's whole local rotation in the bind frames (replaces the bind
+//                local rotation);
+//   BindThenKey  bind local * key;  KeyThenBind  key * bind local;
+// each with the key conjugated or not, and translation keys read in the parent's unrotated frame
+// or its bound one. Bones without a key keep the bind pose.
+enum class KeyMode { Prime, Absolute, BindThenKey, KeyThenBind };
+enum class TranslationFrame { Unrotated, ParentBind };
+struct Convention {
+  KeyMode mode = KeyMode::Prime;
+  bool conjugate = false;
+  TranslationFrame translation = TranslationFrame::Unrotated;
 };
+// Every candidate, in a fixed order (settings refer to them by index).
+const std::vector< Convention >& Conventions();
+std::string ConventionName(const Convention& c);
 
-// Every bone's skeleton-space place and orientation for `clip` at `time` on Echoes' skeleton,
-// indexed like skeleton.bones.
+// Whether the skeleton's rotations are stored inverted (as world-to-bone): the skeleton's own local
+// rotations say so (local = bind * parent^-1 when inverted, parent^-1 * bind when not).
+bool BindStoredInverse(const PortEchoesProbe::Skeleton& skeleton);
+
+// A pose on Echoes' skeleton, indexed like skeleton.bones (skeleton space).
 struct WorldPose {
   std::vector< Vec3 > positions;
-  std::vector< Quat > orientations;
+  std::vector< Quat > orientations; // unbound: identity in the bind pose
+  std::vector< bool > moved;        // the clip set this bone's offset (a translation key)
 };
 WorldPose EchoesPose(const PortEchoesProbe::Skeleton& skeleton, const Clip& clip, float time,
-                     const PoseOptions& options);
+                     const Convention& convention);
 
-// The same pose carried onto Prime's skeleton (no bind rotations): each Prime bone's local rotation
-// (parent-relative), indexed like prime.bones. Bones Echoes lacks keep the rest orientation of
-// their parent (a local identity). Also fills `world` with Prime's skeleton-space pose.
-std::vector< Quat > RetargetToPrime(const PortEchoesProbe::Skeleton& echoes,
-                                    const WorldPose& echoesPose,
-                                    const PortEchoesProbe::Skeleton& prime, WorldPose& world);
+// The pose carried onto Prime's skeleton, indexed like prime.bones: each bone's local rotation
+// (parent-relative, what the pose builder takes), skeleton-space orientation and place, and, for
+// bones whose Echoes counterpart was moved by a translation key, the offset from the parent in the
+// parent's frame (unrotated layout offsets otherwise). Bones Echoes lacks keep their parent's
+// orientation (a local identity).
+struct PrimePose {
+  std::vector< Quat > locals;
+  std::vector< Quat > orientations;
+  std::vector< Vec3 > positions;
+  std::vector< bool > hasOffset;
+  std::vector< Vec3 > offsets;
+};
+PrimePose RetargetToPrime(const PortEchoesProbe::Skeleton& echoes, const WorldPose& pose,
+                          const PortEchoesProbe::Skeleton& prime);
 
-// The check written into the report: decodes the named clips and measures them.
+// --- Choosing the convention from the clips themselves ------------------------------------------
+
+struct NamedClip {
+  std::string name; // "ready" in it: a standing clip; walk/jog/run/strafe: moving
+  const Clip* clip = nullptr;
+};
+struct ConventionScore {
+  size_t index = 0;   // into Conventions()
+  float score = 0.f;  // lower is better
+  float ground = 0.f; // how far the lowest foot is from the floor, averaged over the clips (m)
+  float head = 0.f;   // standing clips: head height against the bind pose's (m)
+  float skate = 0.f;  // moving clips: the planted foot's slide against the body's travel (ratio)
+  int broken = 0;     // samples with the body folded (head below hips, feet above knees)
+};
+// Best first.
+std::vector< ConventionScore > RankConventions(const PortEchoesProbe::Skeleton& echoes,
+                                               const std::vector< NamedClip >& clips);
+
+// --- The report ---------------------------------------------------------------------------------
+
 struct ClipInput {
   std::string name;
   std::vector< uint8_t > data; // empty when the ANIM was not found

@@ -51,7 +51,9 @@
 #include "port_gpu_driver.h"
 #include "port_disc.h"
 #include "port_pal_languages.h"
+#include "port_echoes_anim.h"
 #include "port_echoes_probe.h"
+#include "port_third_person.h"
 #if defined(__ANDROID__)
 #include "touch_pad.h"
 #endif
@@ -245,6 +247,9 @@ float sThirdPersonHeight = 0.35f;
 float sThirdPersonShoulder = 0.6f;
 bool sThirdPersonBodyMotion = true;
 bool sThirdPersonTorsoAim = true;
+bool sThirdPersonEchoesAnims = false;
+int sThirdPersonEchoesConvention = 0; // 0: the best ranked; n: PortEchoesAnim::Conventions()[n - 1]
+std::string sEchoesImagePath;         // the user's Echoes image, as last picked
 bool sRevealMap = false;
 int sMapPickups = PortDebug::kMapPickups_Off;
 bool sMapLogicColors = true;

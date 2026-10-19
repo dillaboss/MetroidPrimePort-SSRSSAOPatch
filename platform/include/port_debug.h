@@ -270,6 +270,8 @@ struct ThirdPersonSettings {
   float shoulder;  // to the right (negative: left)
   bool bodyMotion; // lean, bob and sway
   bool torsoAim;   // the spine bends towards the aim
+  bool echoesAnims;     // play Echoes' Samus animations on the body (port_echoes_locomotion.h)
+  int echoesConvention; // how their keys apply: 0 the best ranked, n Conventions()[n - 1]
 };
 const float kThirdPersonDistanceMin = 1.f;
 const float kThirdPersonDistanceMax = 6.f;
@@ -277,6 +279,8 @@ const float kThirdPersonHeightMax = 1.5f;
 const float kThirdPersonShoulderMax = 1.5f;
 ThirdPersonSettings ThirdPerson();
 void SetThirdPerson(bool enabled);
+// The user's Metroid Prime 2: Echoes image, as last picked (empty when never).
+std::string EchoesImagePath();
 // Every world's map shows as if its map station had been used; the save is
 // not changed.
 bool RevealMap();

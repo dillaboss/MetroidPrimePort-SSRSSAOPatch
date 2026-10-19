@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <set>
@@ -35,9 +36,12 @@ constexpr uint32_t kANIM = 0x414E494D;
 std::mutex sMutex;
 State sState;
 
+// Progress for the report's status line; a load for playback (LoadEchoesSamus) leaves it alone.
 void SetMessage(const std::string& message) {
   std::lock_guard lock(sMutex);
-  sState.message = message;
+  if (sState.running) {
+    sState.message = message;
+  }
 }
 
 bool EndsWithPak(const std::string& name) {
@@ -154,8 +158,8 @@ const PortMods::PakResource* FindResource(const std::vector< Pak >& paks, uint32
   return nullptr;
 }
 
-// The picked Echoes Samus's animation set, and the ANIMs the check's animations play.
-void GatherClips(const std::vector< Pak >& paks, DiscScan& scan) {
+// The picked Echoes Samus's animation set, and the ANIMs the named animations play.
+void GatherClips(const std::vector< Pak >& paks, DiscScan& scan, const std::vector< std::string >& names) {
   const Found* e = PickSamus(scan, Game::Echoes);
   if (e == nullptr) {
     scan.clipError = "no Echoes Samus with a readable skeleton";
@@ -184,7 +188,7 @@ void GatherClips(const std::vector< Pak >& paks, DiscScan& scan) {
     scan.notes.push_back("Echoes animation set: read " + std::to_string(set.size()) +
                          " animations, then " + error);
   }
-  for (const char* name : kCheckClips) {
+  for (const std::string& name : names) {
     std::vector< uint8_t > anim;
     for (const PortEchoesAnim::AnimationEntry& entry : set) {
       if (entry.name != name || entry.anims.empty()) {
@@ -196,9 +200,9 @@ void GatherClips(const std::vector< Pak >& paks, DiscScan& scan) {
       if (animRes == nullptr) {
         char idText[16];
         std::snprintf(idText, sizeof(idText), "%08X", entry.anims.front());
-        scan.notes.push_back(std::string(name) + ": ANIM " + idText + " is on no PAK");
+        scan.notes.push_back(name + ": ANIM " + idText + " is on no PAK");
       } else if (!ReadResource(*animPak, *animRes, Game::Echoes, anim, error)) {
-        scan.notes.push_back(std::string(name) + ": " + error);
+        scan.notes.push_back(name + ": " + error);
         anim.clear();
       }
       break;
@@ -207,7 +211,8 @@ void GatherClips(const std::vector< Pak >& paks, DiscScan& scan) {
   }
 }
 
-void ScanDisc(const std::string& path, Game game, DiscScan& scan) {
+void ScanDisc(const std::string& path, Game game, DiscScan& scan,
+              const std::vector< std::string >& clipNames = {std::begin(kCheckClips), std::end(kCheckClips)}) {
   const char* gameName = game == Game::Echoes ? "Echoes" : "Prime";
   char id[6] = {};
   u8 discNumber = 0;
@@ -349,7 +354,7 @@ void ScanDisc(const std::string& path, Game game, DiscScan& scan) {
         "no Samus character found in " + std::to_string(scan.characterSets) + " character sets";
   } else if (game == Game::Echoes) {
     SetMessage("Reading a few of Echoes' Samus animations");
-    GatherClips(paks, scan);
+    GatherClips(paks, scan, clipNames);
   }
 }
 
@@ -418,6 +423,24 @@ bool Start(const std::string& echoesPath) {
 State Status() {
   std::lock_guard lock(sMutex);
   return sState;
+}
+
+bool LoadEchoesSamus(const std::string& path, const std::vector< std::string >& names, Skeleton& skeleton,
+                     std::vector< std::pair< std::string, std::vector< uint8_t > > >& clips, std::string& error) {
+  DiscScan scan;
+  ScanDisc(path, Game::Echoes, scan, names);
+  const Found* samus = PickSamus(scan, Game::Echoes);
+  if (scan.id.empty() || samus == nullptr) {
+    error = scan.error.empty() ? "no Samus with a readable skeleton on the Echoes image" : scan.error;
+    return false;
+  }
+  if (!scan.clipError.empty()) {
+    error = scan.clipError;
+    return false;
+  }
+  skeleton = samus->skeleton;
+  clips = std::move(scan.clips);
+  return true;
 }
 
 int RunFromCommandLine(const std::string& echoesPath) {
