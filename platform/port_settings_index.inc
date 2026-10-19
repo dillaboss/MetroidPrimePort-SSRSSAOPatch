@@ -134,6 +134,7 @@
 {"Video", "Display", "Third person (experimental)", "Torso follows aim", "third person torso spine aim bend"},
 {"Video", "Display", "Third person (experimental)", "Compare with Echoes' Samus...", "echoes prime 2 skeleton animations report third person"},
 {"Video", "Display", "Third person (experimental)", "Echoes animations", "echoes prime 2 animations walk run strafe jump third person body"},
+{"Video", "Display", "Third person (experimental)", "How keys apply", "echoes animations convention keys pose reading third person"},
 {"Video", "Quality", "Quality", "Anti-aliasing", "msaa aa smoothing edges jagged"},
 {"Video", "Quality", "Quality", "Show shader compilation", "shader compile progress toast"},
 {"Video", "Quality", "Quality", "Show F1 hint at launch", "f1 hint menu launch tip"},
