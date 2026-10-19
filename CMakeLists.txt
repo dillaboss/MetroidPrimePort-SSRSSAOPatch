@@ -215,6 +215,7 @@ set(MP_PORT_SOURCES
     platform/port_lzo.cpp
     platform/port_echoes_probe.cpp
     platform/port_echoes_probe_import.cpp
+    platform/port_echoes_anim.cpp
     platform/port_actor_collision_bounds.cpp
     platform/port_importers.cpp
     platform/port_importers_lines.cpp
@@ -654,7 +655,7 @@ if(MP_BUILD_TESTS)
     target_include_directories(port_pal_languages_tests PRIVATE platform/include)
     target_link_libraries(port_pal_languages_tests PRIVATE ZLIB::ZLIB)
     add_executable(port_echoes_probe_tests tests/port_echoes_probe.cpp platform/port_echoes_probe.cpp
-        platform/port_lzo.cpp)
+        platform/port_echoes_anim.cpp platform/port_lzo.cpp)
     target_include_directories(port_echoes_probe_tests PRIVATE platform/include)
     add_executable(port_mods_tests tests/port_mods.cpp platform/port_mods_pak.cpp)
     target_include_directories(port_mods_tests PRIVATE platform/include)

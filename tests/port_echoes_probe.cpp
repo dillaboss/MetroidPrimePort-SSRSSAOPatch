@@ -1,8 +1,11 @@
 // Tests for the Echoes skeleton report: LZO segments (vectors made with the reference LZO1X-999
-// compressor), Prime and Echoes skeletons, Prime- and Echoes-version character sets, and the report.
+// compressor), Prime and Echoes skeletons, Prime- and Echoes-version character sets, the report,
+// and Echoes' animations: the animation set, compressed ANIMs, poses and the retarget onto Prime.
+#include "port_echoes_anim.h"
 #include "port_echoes_probe.h"
 #include "port_lzo.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -644,6 +647,281 @@ void TestReport() {
         "a bind rotation is counted");
 }
 
+// --- Echoes animations --------------------------------------------------------------------------
+
+using PortEchoesAnim::Quat;
+using PortEchoesAnim::Vec3;
+
+Quat AxisAngle(float x, float y, float z, float degrees) {
+  const float h = degrees * 3.14159265f / 360.f;
+  const float s = std::sin(h);
+  return Quat{std::cos(h), x * s, y * s, z * s};
+}
+
+bool Near(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) <= eps; }
+bool Near(const Vec3& a, const Vec3& b, float eps = 1e-4f) {
+  return Near(a.x, b.x, eps) && Near(a.y, b.y, eps) && Near(a.z, b.z, eps);
+}
+
+// Bits as the compressed ANIM stores them: big-endian words, each filled from its lowest bit.
+struct BitWriter {
+  std::vector<uint32_t> words;
+  uint32_t used = 0;
+  void Put(int32_t value, uint32_t count) {
+    for (uint32_t i = 0; i < count; ++i) {
+      if (used % 32 == 0) {
+        words.push_back(0);
+      }
+      words.back() |= ((uint32_t(value) >> i) & 1u) << (used % 32);
+      ++used;
+    }
+  }
+};
+
+void WritePlay(Writer& w, uint32_t anim, const char* name) {
+  w.U32(0);
+  w.U32(anim);
+  w.U32(0);
+  w.Str(name);
+  w.F32(0.f);
+  w.U32(0);
+}
+
+void WriteAnimationSet(Writer& w) {
+  w.U16(4);
+  w.U32(3);
+  w.Str("Run");
+  WritePlay(w, 0xA1, "run_prim");
+  w.Str("Blend");
+  w.U32(1);
+  WritePlay(w, 0xB1, "b1");
+  WritePlay(w, 0xB2, "b2");
+  w.F32(0.5f);
+  w.U8(1);
+  w.Str("Rand");
+  w.U32(3);
+  w.U32(2);
+  WritePlay(w, 0xC1, "c1");
+  w.U32(50);
+  w.U32(4); // a sequence inside the random pick
+  w.U32(1);
+  WritePlay(w, 0xC2, "c2");
+  w.U32(50);
+}
+
+void TestAnimationSet() {
+  using namespace PortEchoesAnim;
+  Writer w;
+  w.U16(1);
+  w.U16(1);
+  w.U32(1);
+  WriteCharacter(w, 10, "Samus_Low_Res_HIGH", 0xC1, {"Run", "Blend", "Rand"});
+  const size_t setStart = w.b.size();
+  WriteAnimationSet(w);
+  std::vector<PortEchoesProbe::Character> chars;
+  std::string error;
+  size_t end = 0;
+  Check(PortEchoesProbe::ParseCharacterSet(w.b.data(), w.b.size(), chars, error, &end) && end == setStart,
+        "a character set reports where its animation set starts");
+  std::vector<AnimationEntry> set;
+  Check(ParseAnimationSet(w.b.data(), w.b.size(), end, set, error) && set.size() == 3, "the animation set reads");
+  Check(set.size() == 3 && set[0].name == "Run" && set[0].anims == std::vector<uint32_t>{0xA1} &&
+            set[1].anims == std::vector<uint32_t>{0xB1, 0xB2} && set[2].anims == std::vector<uint32_t>{0xC1, 0xC2},
+        "each animation's ANIMs are found through blends, random picks and sequences");
+  std::vector<AnimationEntry> part;
+  Check(!ParseAnimationSet(w.b.data(), w.b.size(), 3, part, error), "a wrong offset is refused");
+  Check(ParseAnimationSet(w.b.data(), w.b.size() - 10, end, part, error) && part.size() == 2 && !error.empty(),
+        "a cut set keeps the animations before the cut");
+}
+
+// A compressed Echoes ANIM: two channels over six frames, keys at frames 0, 2 and 5.
+std::vector<uint8_t> MakeCompressedClip(bool cut) {
+  Writer w;
+  w.U32(2);
+  w.U32(0x1000);
+  w.U16(0);
+  w.F32(5.f / 30.f);
+  w.F32(1.f / 30.f);
+  w.U32(1);
+  w.U32(1);
+  w.U32(16384);
+  w.F32(0.01f);
+  w.F32(1.f);
+  w.U32(2);
+  w.U32(1);
+  w.U32(6);
+  w.U32((1u << 2) | (1u << 5));
+  w.U32(2);
+  // Bone 1: rotation (5-bit deltas) and translation (6-bit); bone 2: rotation, z only.
+  w.U8(1);
+  w.U16(3);
+  for (int16_t v : {int16_t(0), int16_t(100), int16_t(0)}) {
+    w.U16(uint16_t(v));
+    w.U8(5);
+  }
+  w.U16(3);
+  for (int16_t v : {int16_t(10), int16_t(0), int16_t(0)}) {
+    w.U16(uint16_t(v));
+    w.U8(6);
+  }
+  w.U16(0);
+  w.U8(2);
+  w.U16(3);
+  for (int c = 0; c < 3; ++c) {
+    w.U16(0);
+    w.U8(c == 2 ? 8 : 0);
+  }
+  w.U16(0);
+  w.U16(0);
+  BitWriter b;
+  // Key 1.
+  b.Put(0, 1);
+  b.Put(3, 5);
+  b.Put(-2, 5);
+  b.Put(15, 5);
+  b.Put(5, 6);
+  b.Put(-7, 6);
+  b.Put(31, 6);
+  b.Put(1, 1);
+  b.Put(-100, 8);
+  // Key 2.
+  b.Put(0, 1);
+  b.Put(1, 5);
+  b.Put(1, 5);
+  b.Put(1, 5);
+  b.Put(0, 6);
+  b.Put(0, 6);
+  b.Put(-32, 6);
+  b.Put(0, 1);
+  b.Put(50, 8);
+  for (size_t i = 0; i < b.words.size() - (cut ? 1 : 0); ++i) {
+    w.U32(b.words[i]);
+  }
+  return w.b;
+}
+
+void TestCompressedClip() {
+  using namespace PortEchoesAnim;
+  const auto data = MakeCompressedClip(false);
+  Clip clip;
+  std::string error;
+  Check(ParseClip(data.data(), data.size(), clip, error), "a compressed Echoes ANIM decodes");
+  Check(clip.boneIdBytes == 1 && clip.wordsAfterBitmap == 1 && clip.layoutTies == 0,
+        "the channel table layout is found by the bitstream's length");
+  Check(clip.keyFrames == std::vector<uint32_t>{0, 2, 5} && clip.keyBitmapKeys == 2 && clip.bitmapFrames == 6,
+        "keys sit at frame 0 and the frames the bitmap marks");
+  Check(clip.bitsUsed == 86 && clip.bitsAvailable == 96, "the bitstream is read to its last key");
+  Check(clip.channels.size() == 2 && clip.channels[0].bone == 1 && clip.channels[1].bone == 2 &&
+            clip.channels[0].rotations.size() == 3 && clip.channels[0].translations.size() == 3 &&
+            clip.channels[1].rotations.size() == 3 && clip.channels[1].translations.empty(),
+        "each channel has a value per key for the parts it has");
+  const float rq = 3.14159265f / 2.f / 16384.f;
+  if (clip.channels.size() == 2 && clip.channels[0].rotations.size() == 3 && clip.channels[1].rotations.size() == 3) {
+    const Quat& q1 = clip.channels[0].rotations[1];
+    Check(Near(q1.x, std::sin(rq * 3)) && Near(q1.y, std::sin(rq * 98)) && Near(q1.z, std::sin(rq * 15)) &&
+              q1.w > 0.99f,
+          "rotation deltas add up from the initial values");
+    const Quat& q2 = clip.channels[0].rotations[2];
+    Check(Near(q2.x, std::sin(rq * 4)) && Near(q2.y, std::sin(rq * 99)) && Near(q2.z, std::sin(rq * 16)),
+          "every key adds its deltas");
+    Check(clip.channels[1].rotations[1].w < 0.f && Near(clip.channels[1].rotations[1].z, std::sin(rq * -100)) &&
+              clip.channels[1].rotations[2].w > 0.f && Near(clip.channels[1].rotations[2].z, std::sin(rq * -50)),
+          "the W sign bit and negative deltas are read");
+    Check(Near(clip.channels[0].translations[0], Vec3{0.1f, 0.f, 0.f}) &&
+              Near(clip.channels[0].translations[1], Vec3{0.15f, -0.07f, 0.31f}) &&
+              Near(clip.channels[0].translations[2], Vec3{0.15f, -0.07f, -0.01f}),
+          "translations are scaled by the multiplier");
+    const Sample s = SampleChannel(clip, clip.channels[0], 1.f / 30.f);
+    Check(s.hasTranslation && Near(s.translation.x, 0.125f), "sampling between keys interpolates");
+    const Sample wrapped = SampleChannel(clip, clip.channels[0], 6.f / 30.f);
+    Check(Near(wrapped.translation.x, 0.125f), "a looping clip wraps around");
+  }
+  const auto cut = MakeCompressedClip(true);
+  Clip refused;
+  Check(!ParseClip(cut.data(), cut.size(), refused, error), "a bitstream too short for its keys is refused");
+  const uint8_t junk[] = {0, 0, 0, 7, 1, 2, 3};
+  Check(!ParseClip(junk, sizeof(junk), refused, error), "other ANIM versions are refused");
+}
+
+PortEchoesProbe::Bone MakeBone(uint32_t id, uint32_t parent, const char* name, Vec3 p, Quat bind = {},
+                               Quat local = {}) {
+  PortEchoesProbe::Bone b;
+  b.id = id;
+  b.parent = parent;
+  b.name = name;
+  b.position[0] = p.x;
+  b.position[1] = p.y;
+  b.position[2] = p.z;
+  b.rotation[0] = bind.w;
+  b.rotation[1] = bind.x;
+  b.rotation[2] = bind.y;
+  b.rotation[3] = bind.z;
+  b.localRotation[0] = local.w;
+  b.localRotation[1] = local.x;
+  b.localRotation[2] = local.y;
+  b.localRotation[3] = local.z;
+  return b;
+}
+
+void TestPoses() {
+  using namespace PortEchoesAnim;
+  const Quat r0 = AxisAngle(0, 0, 1, 90);
+  const Quat r1 = Mul(AxisAngle(1, 0, 0, 90), AxisAngle(0, 0, 1, 30));
+  const Quat r2 = AxisAngle(0, 1, 0, -40);
+  PortEchoesProbe::Skeleton echoes;
+  echoes.bones.push_back(MakeBone(1, 0, "root", {0, 0, 0}, r0, r0));
+  echoes.bones.push_back(MakeBone(2, 1, "Spine", {0, 0.1f, 1}, r1, Mul(Conj(r0), r1)));
+  echoes.bones.push_back(MakeBone(3, 2, "Head", {0, 0.2f, 2}, r2, Mul(Conj(r1), r2)));
+  echoes.bones.push_back(MakeBone(4, 3, "Echoes_only", {0.3f, 0.2f, 2}, r2, Quat{}));
+  PortEchoesProbe::Skeleton prime;
+  prime.bones.push_back(MakeBone(10, 10, "root", {0, 0, 0}));
+  prime.bones.push_back(MakeBone(11, 10, "Pelvis", {0, 0, 0.5f}));
+  prime.bones.push_back(MakeBone(12, 11, "Spine", {0, 0.1f, 1}));
+  prime.bones.push_back(MakeBone(13, 12, "Head", {0, 0.2f, 2}));
+
+  Clip still;
+  still.interval = 1.f / 30.f;
+  still.duration = 1.f;
+  still.keyFrames = {0};
+  const WorldPose rest = EchoesPose(echoes, still, 0.f, {});
+  Check(Near(rest.positions[2], Vec3{0, 0.2f, 2}) && AngleBetween(rest.orientations[2], r2) < 0.01f,
+        "with no keys the pose is the bind pose");
+
+  Clip turn = still;
+  Channel ch;
+  ch.bone = 2;
+  ch.rotations = {AxisAngle(0, 1, 0, 90)};
+  turn.channels.push_back(ch);
+  const WorldPose fromBind = EchoesPose(echoes, turn, 0.f, {RotationMode::FromBind, TranslationMode::Replace});
+  const Quat spineWorld = Mul(r1, AxisAngle(0, 1, 0, 90));
+  const Vec3 head = Rotate(spineWorld, Rotate(Conj(r1), Vec3{0, 0.1f, 1}));
+  Check(AngleBetween(fromBind.orientations[1], spineWorld) < 0.01f &&
+            Near(fromBind.positions[2], Vec3{head.x, 0.1f + head.y, 1 + head.z}),
+        "a key taken from the bind pose turns the bone and moves its children");
+  const WorldPose replace = EchoesPose(echoes, turn, 0.f, {RotationMode::Replace, TranslationMode::Replace});
+  Check(AngleBetween(replace.orientations[1], Mul(r0, AxisAngle(0, 1, 0, 90))) < 0.01f,
+        "a key taken as the whole local rotation replaces it");
+
+  WorldPose onPrime;
+  const std::vector<Quat> locals = RetargetToPrime(echoes, fromBind, prime, onPrime);
+  Check(locals.size() == 4 && AngleBetween(locals[1], Quat{}) < 0.01f, "Prime's extra bones stay at rest");
+  Check(Near(onPrime.positions[0], fromBind.positions[0]) && Near(onPrime.positions[2], fromBind.positions[1]) &&
+            Near(onPrime.positions[3], fromBind.positions[2]),
+        "on Prime's skeleton every shared joint lands where it is in Echoes' pose");
+  WorldPose restOnPrime;
+  RetargetToPrime(echoes, rest, prime, restOnPrime);
+  Check(Near(restOnPrime.positions[3], Vec3{0, 0.2f, 2}) && AngleBetween(restOnPrime.orientations[3], Quat{}) < 0.01f,
+        "Echoes' bind pose is Prime's rest pose");
+
+  const std::string report = BuildAnimationCheck(echoes, prime, {{"B_run_samus", MakeCompressedClip(false)},
+                                                                 {"B_missing", {}}});
+  Check(report.find("local = parent^-1 * bind off by 0.00") != std::string::npos,
+        "the check measures the skeleton's own rotations");
+  Check(report.find("B_run_samus: version 2") != std::string::npos && report.find("86 of 96 bits") != std::string::npos,
+        "the check decodes the clips");
+  Check(report.find("B_missing: not found") != std::string::npos, "a missing clip is reported");
+}
+
 } // namespace
 
 int main() {
@@ -651,6 +929,9 @@ int main() {
   TestSkeletons();
   TestCharacterSets();
   TestReport();
+  TestAnimationSet();
+  TestCompressedClip();
+  TestPoses();
   if (sFailures == 0) {
     std::printf("port_echoes_probe: all checks passed\n");
   }

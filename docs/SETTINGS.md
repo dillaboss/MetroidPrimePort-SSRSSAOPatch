@@ -496,6 +496,12 @@
   the user folder: the Samus characters each game has, their skeletons side by
   side (shared bone names and parents, rest positions, and Echoes' bind
   rotations, which Prime's skeletons lack) and Echoes' Samus animation names.
+  Its "Animation decode check" decodes a few of those animations (standing,
+  walking, jogging, running, strafing, in the air, an additive aim;
+  `platform/port_echoes_anim.cpp`) and measures them: how the compressed
+  bitstream's length comes out against its keys, foot and head heights and root
+  travel under each way the keys could apply to Echoes' bind pose, and how
+  closely the pose lands on Prime's skeleton after the retarget.
   Names and numbers only; no game data is copied. It is the first step towards
   playing Echoes' locomotion animations on Prime's body. Echoes' PAKs keep
   Prime's table layout but compress with LZO1X in 0x4000-byte segments

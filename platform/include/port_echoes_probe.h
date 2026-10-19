@@ -46,8 +46,10 @@ struct Character {
 // An ANCS's characters. Their animation names come early in each; reaching the next character
 // needs the whole entry read, so a set that can't be read to the end still returns the characters
 // before the failure (true with `error` set when at least one was read).
+// `end`, when given, is set to where the characters end (the animation set starts there) after a
+// whole read, and to 0 otherwise.
 bool ParseCharacterSet(const uint8_t* data, size_t size, std::vector< Character >& out,
-                       std::string& error);
+                       std::string& error, size_t* end = nullptr);
 
 // A Samus character found on a disc, with its skeleton when that could be read.
 struct Found {
@@ -67,7 +69,14 @@ struct DiscScan {
   std::vector< Found > samus;
   int characterSets = 0;
   std::vector< std::string > notes; // characters that could not be read in full, ...
+  // Echoes: a few of the picked Samus's animations (name, ANIM bytes; empty when not found) for
+  // the decode check, or why they could not be gathered.
+  std::vector< std::pair< std::string, std::vector< uint8_t > > > clips;
+  std::string clipError;
 };
+
+// The Samus the comparison uses: Prime's body ("Samus"), Echoes' with the most animations.
+const Found* PickSamus(const DiscScan& scan, Game game);
 
 std::string BuildReport(const DiscScan& prime, const DiscScan& echoes);
 

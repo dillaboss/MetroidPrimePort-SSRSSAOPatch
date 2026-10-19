@@ -13,6 +13,8 @@
 //        ids); (10+: u32 spatial primitives, u8, indexed AABBs).
 #include "port_echoes_probe.h"
 
+#include "port_echoes_anim.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -329,6 +331,8 @@ void ListBones(std::string& out, const Skeleton& s, bool rotations) {
 
 } // namespace
 
+const Found* PickSamus(const DiscScan& scan, Game game) { return Pick(scan, game == Game::Echoes); }
+
 const Bone* Skeleton::Find(uint32_t id) const {
   for (const Bone& b : bones) {
     if (b.id == id) {
@@ -395,8 +399,11 @@ bool ParseSkeleton(const uint8_t* data, size_t size, Game game, Skeleton& out, s
 }
 
 bool ParseCharacterSet(const uint8_t* data, size_t size, std::vector< Character >& out,
-                       std::string& error) {
+                       std::string& error, size_t* end) {
   out.clear();
+  if (end != nullptr) {
+    *end = 0;
+  }
   Reader in(data, size);
   const uint16_t fileVersion = in.U16();
   const uint16_t setVersion = in.U16();
@@ -417,6 +424,9 @@ bool ParseCharacterSet(const uint8_t* data, size_t size, std::vector< Character 
       error = why + " (character " + std::to_string(i + 1) + " of " + std::to_string(count) + ")";
       return !out.empty();
     }
+  }
+  if (end != nullptr) {
+    *end = in.pos();
   }
   return true;
 }
@@ -515,6 +525,20 @@ std::string BuildReport(const DiscScan& prime, const DiscScan& echoes) {
                                                                                    : "DIFFERS ",
            Distance(q->position, b.position), RotationAngle(b.rotation),
            RotationAngle(b.localRotation));
+    }
+  }
+
+  if (p != nullptr && e != nullptr && (!echoes.clips.empty() || !echoes.clipError.empty())) {
+    Line(out, "");
+    if (!echoes.clipError.empty()) {
+      Line(out, "== Animation decode check ==");
+      Line(out, "Not possible: %s", echoes.clipError.c_str());
+    } else {
+      std::vector< PortEchoesAnim::ClipInput > clips;
+      for (const auto& [name, data] : echoes.clips) {
+        clips.push_back({name, data});
+      }
+      out += PortEchoesAnim::BuildAnimationCheck(e->skeleton, p->skeleton, clips);
     }
   }
 

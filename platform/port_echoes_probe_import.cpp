@@ -1,6 +1,8 @@
 // The Echoes skeleton report's disc reading and background run (see port_echoes_probe.h).
 #include "port_echoes_probe.h"
 
+#include "port_echoes_anim.h"
+
 #include "port_debug.h"
 #include "port_gci.h"
 #include "port_lzo.h"
@@ -28,6 +30,7 @@ namespace {
 
 constexpr uint32_t kANCS = 0x414E4353;
 constexpr uint32_t kCINF = 0x43494E46;
+constexpr uint32_t kANIM = 0x414E494D;
 
 std::mutex sMutex;
 State sState;
@@ -117,6 +120,91 @@ bool ReadResource(const Pak& pak, const PortMods::PakResource& res, Game game,
     return false;
   }
   return true;
+}
+
+// The animations the decode check measures: standing, walking, jogging, running, strafing, in the
+// air, and an additive aim.
+const char* const kCheckClips[] = {"B_ready_samus",       "B_walk_samus",     "B_jog_samus",
+                                   "B_run_samus",         "B_strafe_Left_samus", "B_jumploop_samus",
+                                   "Aim_U_additive_samus"};
+
+std::string HexBytes(const std::vector< uint8_t >& data, size_t offset, size_t count) {
+  std::string s;
+  char buf[4];
+  for (size_t i = offset; i < data.size() && i < offset + count; ++i) {
+    std::snprintf(buf, sizeof(buf), "%02X", data[i]);
+    s += buf;
+    if ((i - offset) % 4 == 3) {
+      s += ' ';
+    }
+  }
+  return s;
+}
+
+const PortMods::PakResource* FindResource(const std::vector< Pak >& paks, uint32_t type,
+                                          uint32_t id, const Pak** where) {
+  for (const Pak& pak : paks) {
+    for (const PortMods::PakResource& res : pak.table.resources) {
+      if (res.type == type && res.id == id) {
+        *where = &pak;
+        return &res;
+      }
+    }
+  }
+  return nullptr;
+}
+
+// The picked Echoes Samus's animation set, and the ANIMs the check's animations play.
+void GatherClips(const std::vector< Pak >& paks, DiscScan& scan) {
+  const Found* e = PickSamus(scan, Game::Echoes);
+  if (e == nullptr) {
+    scan.clipError = "no Echoes Samus with a readable skeleton";
+    return;
+  }
+  const Pak* pak = nullptr;
+  const PortMods::PakResource* res = FindResource(paks, kANCS, e->ancs, &pak);
+  std::vector< uint8_t > data;
+  std::string error;
+  if (res == nullptr || !ReadResource(*pak, *res, Game::Echoes, data, error)) {
+    scan.clipError = res == nullptr ? "the character set is gone" : error;
+    return;
+  }
+  std::vector< Character > characters;
+  size_t end = 0;
+  if (!ParseCharacterSet(data.data(), data.size(), characters, error, &end) || end == 0) {
+    scan.clipError = "the character set could not be read to its animation set (" + error + ")";
+    return;
+  }
+  std::vector< PortEchoesAnim::AnimationEntry > set;
+  if (!PortEchoesAnim::ParseAnimationSet(data.data(), data.size(), end, set, error)) {
+    scan.clipError = error + "; bytes there: " + HexBytes(data, end, 24);
+    return;
+  }
+  if (!error.empty()) {
+    scan.notes.push_back("Echoes animation set: read " + std::to_string(set.size()) +
+                         " animations, then " + error);
+  }
+  for (const char* name : kCheckClips) {
+    std::vector< uint8_t > anim;
+    for (const PortEchoesAnim::AnimationEntry& entry : set) {
+      if (entry.name != name || entry.anims.empty()) {
+        continue;
+      }
+      const Pak* animPak = nullptr;
+      const PortMods::PakResource* animRes =
+          FindResource(paks, kANIM, entry.anims.front(), &animPak);
+      if (animRes == nullptr) {
+        char idText[16];
+        std::snprintf(idText, sizeof(idText), "%08X", entry.anims.front());
+        scan.notes.push_back(std::string(name) + ": ANIM " + idText + " is on no PAK");
+      } else if (!ReadResource(*animPak, *animRes, Game::Echoes, anim, error)) {
+        scan.notes.push_back(std::string(name) + ": " + error);
+        anim.clear();
+      }
+      break;
+    }
+    scan.clips.emplace_back(name, std::move(anim));
+  }
 }
 
 void ScanDisc(const std::string& path, Game game, DiscScan& scan) {
@@ -259,6 +347,9 @@ void ScanDisc(const std::string& path, Game game, DiscScan& scan) {
   if (scan.samus.empty()) {
     scan.error =
         "no Samus character found in " + std::to_string(scan.characterSets) + " character sets";
+  } else if (game == Game::Echoes) {
+    SetMessage("Reading a few of Echoes' Samus animations");
+    GatherClips(paks, scan);
   }
 }
 
