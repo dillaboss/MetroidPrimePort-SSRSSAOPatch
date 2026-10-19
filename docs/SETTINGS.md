@@ -490,6 +490,16 @@
   follows aim bends up to two spine bones, found by name ("spine", "chest",
   "torso") and logged at the first use with every bone of the skeleton, by half
   the view's pitch.
+  "Compare with Echoes' Samus..." (desktop; or `--echoes-report <image>` on the
+  command line) reads the user's own Metroid Prime 2: Echoes image (GameCube,
+  G2M...) and the port's Prime disc and writes `echoes_skeleton_report.txt` in
+  the user folder: the Samus characters each game has, their skeletons side by
+  side (shared bone names and parents, rest positions, and Echoes' bind
+  rotations, which Prime's skeletons lack) and Echoes' Samus animation names.
+  Names and numbers only; no game data is copied. It is the first step towards
+  playing Echoes' locomotion animations on Prime's body. Echoes' PAKs keep
+  Prime's table layout but compress with LZO1X in 0x4000-byte segments
+  (`platform/port_lzo.cpp`).
 - Hide helmet and hide visor effects (Video > Display and pause Options > Visor,
   persisted as `hide_helmet` and `hide_visor_effects`, off by default): the
   first drops the helmet frame (the dome and the lights at the bottom); the

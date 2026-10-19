@@ -31,6 +31,7 @@
 #include "port_memory_log.h"
 #include "port_mods.h"
 #include "port_pal_languages.h"
+#include "port_echoes_probe.h"
 #include "port_room_geo.h"
 #include "port_importers.h"
 #include "port_remastered_import.h"
@@ -869,6 +870,15 @@ int main(int argc, char** argv) {
             return 2;
         }
         return PortPalLanguages::RunFromCommandLine(argv[2]);
+    }
+    // --echoes-report <image>: compare Samus's skeleton with Echoes' (port_echoes_probe.h), without
+    // starting the game.
+    if (argc >= 2 && std::strcmp(argv[1], "--echoes-report") == 0) {
+        if (argc != 3) {
+            std::fprintf(stderr, "usage: %s %s <Metroid Prime 2: Echoes disc image>\n", argv[0], argv[1]);
+            return 2;
+        }
+        return PortEchoesProbe::RunFromCommandLine(argv[2]);
     }
 #endif
     // The file log starts first so it holds everything after it, build id included.

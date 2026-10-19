@@ -168,6 +168,42 @@ void DrawVideoDisplay() {
       }
       ImGui::SetItemTooltip("Bends Samus at the spine towards where you aim up or down. The most\n"
                             "experimental part: turn it off if the pose looks wrong.");
+#if !defined(__ANDROID__)
+      {
+        std::string picked;
+        {
+          std::lock_guard lock(sRemasteredPickMutex);
+          picked.swap(sEchoesPick);
+        }
+        static std::string sEchoesStartError;
+        if (!picked.empty()) {
+          sEchoesStartError = PortEchoesProbe::Start(picked) ? "" : "A report is already being written.";
+        }
+        const PortEchoesProbe::State echoes = PortEchoesProbe::Status();
+        ImGui::BeginDisabled(echoes.running);
+        if (ImGui::Button("Compare with Echoes' Samus...")) {
+          OpenRemasteredDialog(kEchoesPick);
+        }
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Pick your own Metroid Prime 2: Echoes image (GameCube, any format the port\n"
+                              "reads). Writes a report comparing Samus's skeleton in the two games and listing\n"
+                              "Echoes' Samus animations: names and numbers only, no game data.");
+        if (echoes.running) {
+          ImGui::TextDisabled("%s...", echoes.message.c_str());
+        } else if (echoes.finished) {
+          if (echoes.ok) {
+            ImGui::TextWrapped("%s", echoes.message.c_str());
+            if (ImGui::Button("Copy report path##echoes")) {
+              ImGui::SetClipboardText(echoes.reportPath.c_str());
+            }
+          } else {
+            ImGui::TextColored(ThemeWarnColor(), "%s", echoes.message.c_str());
+          }
+        } else if (!sEchoesStartError.empty()) {
+          ImGui::TextColored(ThemeWarnColor(), "%s", sEchoesStartError.c_str());
+        }
+      }
+#endif
       if (ImGui::Button("Defaults##thirdperson")) {
         sThirdPersonDistance = 2.6f;
         sThirdPersonHeight = 0.35f;

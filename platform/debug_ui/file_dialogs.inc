@@ -667,6 +667,9 @@ std::vector<std::pair<int, std::string>> sRemasteredPicks;
 // Which 2 of the same picker: a PAL image for its languages (DrawLanguageSection).
 constexpr int kPalLanguagesPick = 2;
 std::string sPalLanguagesPick;
+// And an Echoes image for the third-person skeleton report (DrawVideoDisplay); desktop only.
+constexpr int kEchoesPick = 3;
+std::string sEchoesPick;
 
 #if defined(__ANDROID__)
 // Not SDL_ShowOpenFileDialog: Android often kills the game behind the picker
@@ -718,6 +721,8 @@ void OpenRemasteredDialog(int which) {
       const int which = int(reinterpret_cast< intptr_t >(userdata));
       if (which == kPalLanguagesPick) {
         sPalLanguagesPick = files[0];
+      } else if (which == kEchoesPick) {
+        sEchoesPick = files[0];
       } else {
         sRemasteredPicks.emplace_back(which, files[0]);
       }

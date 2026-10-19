@@ -51,6 +51,7 @@
 #include "port_gpu_driver.h"
 #include "port_disc.h"
 #include "port_pal_languages.h"
+#include "port_echoes_probe.h"
 #if defined(__ANDROID__)
 #include "touch_pad.h"
 #endif
