@@ -296,10 +296,12 @@ void RequestEchoes(const std::string& path) {
     load.library = library;
     load.error = library != nullptr ? std::string() : error;
     if (library != nullptr) {
-      const auto& best = library->ranking.front();
-      PortLog::Write("third person: Echoes' animations ready (%zu clips, %zu missing); keys read as #%zu %s\n",
-                     library->clips.size(), library->missing.size(), best.index,
-                     PortEchoesAnim::ConventionName(PortEchoesAnim::Conventions()[best.index]).c_str());
+      std::string missing;
+      for (const std::string& name : library->missing) {
+        missing += " " + name;
+      }
+      PortLog::Write("third person: Echoes' animations ready (%zu clips; not found:%s)\n", library->clips.size(),
+                     missing.empty() ? " none" : missing.c_str());
     } else {
       PortLog::Write("third person: Echoes' animations not loaded: %s\n", error.c_str());
     }
@@ -313,6 +315,7 @@ std::vector< CSegId > sEchoesSegs; // by Prime bone, as handed to the player
 std::vector< CQuaternion > sEchoesBaseRotation;
 std::vector< CVector3f > sEchoesBaseOffset;
 bool sEchoesDriving = false;
+int sPendingShot = -1; // the strongest shot since the last tick, for the recoil
 
 void SetEchoesStatus(const std::string& status) {
   EchoesLoad& load = Echoes();
@@ -361,7 +364,7 @@ void StopEchoes(CAnimData* anim) {
 
 // Poses the body from Echoes' animations; false while they are not loaded.
 bool DriveEchoes(CAnimData& anim, const CPlayer& player, float dt, float forwardSpeed, float sideSpeed,
-                 bool onGround, const PortDebug::ThirdPersonSettings& s) {
+                 bool onGround, float aimPitch, float aimYaw, const PortDebug::ThirdPersonSettings& s) {
   const std::string path = PortDebug::EchoesImagePath();
   if (path.empty()) {
     SetEchoesStatus("Pick your Echoes image with the button above first.");
@@ -398,14 +401,11 @@ bool DriveEchoes(CAnimData& anim, const CPlayer& player, float dt, float forward
     for (const PortEchoesProbe::Bone& b : prime.bones) {
       mapped += library->echoes.Find(b.name) != nullptr;
     }
-    PortLog::Write("third person: Echoes' animations drive %d of the body's %zu bones\n", mapped,
-                   prime.bones.size());
+    PortLog::Write("third person: Echoes' animations drive %d of the body's %zu bones; aim turns the cannon "
+                   "up %.0f, down %.0f, left %.0f, right %.0f degrees at full weight\n",
+                   mapped, prime.bones.size(), sEchoesPlayer.AimRange(0), sEchoesPlayer.AimRange(1),
+                   sEchoesPlayer.AimRange(2), sEchoesPlayer.AimRange(3));
   }
-  const auto& conventions = PortEchoesAnim::Conventions();
-  const size_t best = library->ranking.empty() ? 0 : library->ranking.front().index;
-  const size_t convention =
-      s.echoesConvention > 0 ? std::min(size_t(s.echoesConvention - 1), conventions.size() - 1) : best;
-  sEchoesPlayer.SetConvention(convention);
 
   // The pose tree as the body's own animation has it, kept to put back.
   anim.PreRender();
@@ -425,6 +425,13 @@ bool DriveEchoes(CAnimData& anim, const CPlayer& player, float dt, float forward
   in.sideSpeed = sideSpeed;
   in.onGround = onGround;
   in.scale = std::max(player.GetModelScale().GetZ(), 0.01f);
+  in.aim = s.torsoAim;
+  in.aimPitch = aimPitch;
+  in.aimYaw = aimYaw;
+  if (sPendingShot >= 0) {
+    sEchoesPlayer.Shoot(sPendingShot);
+    sPendingShot = -1;
+  }
   const PortEchoesAnim::PrimePose& p = sEchoesPlayer.Update(in);
   for (size_t i = 0; i < sEchoesSegs.size() && i < p.locals.size(); ++i) {
     const PortEchoesAnim::Quat& q = p.locals[i];
@@ -437,17 +444,12 @@ bool DriveEchoes(CAnimData& anim, const CPlayer& player, float dt, float forward
   anim.SetPoseBuilderValid(false);
   sEchoesDriving = true;
 
-  std::string status = "Playing Echoes' animations. Keys read as #" + std::to_string(convention) + " " +
-                       PortEchoesAnim::ConventionName(conventions[convention]);
-  status += convention == best ? " (best ranked)." : " (chosen; best ranked is #" + std::to_string(best) + ").";
+  std::string status = "Playing Echoes' animations.";
   if (!library->missing.empty()) {
-    status += " " + std::to_string(library->missing.size()) + " animation(s) not found.";
-  }
-  status += "\nNow:";
-  for (const auto& [name, weight] : sEchoesPlayer.Weights()) {
-    char item[96];
-    std::snprintf(item, sizeof(item), " %s %.0f%%", name.c_str(), weight * 100.f);
-    status += item;
+    status += " Not found:";
+    for (const std::string& name : library->missing) {
+      status += " " + name;
+    }
   }
   SetEchoesStatus(status);
   return true;
@@ -545,6 +547,7 @@ void Tick(float dt, CPlayer& player, CStateManager& mgr) {
       RestoreSpine(*anim);
     }
     StopEchoes(anim);
+    sPendingShot = -1;
     if (!s.echoesAnims || !s.enabled) {
       SetEchoesStatus("");
     }
@@ -581,11 +584,22 @@ void Tick(float dt, CPlayer& player, CStateManager& mgr) {
     if (!sEchoesDriving) {
       RestoreSpine(*anim);
     }
-    echoes = DriveEchoes(*anim, player, dt, forwardSpeed, sideSpeed, onGround, s);
+    // Where the cannon points: the first-person camera's pitch, and its heading against the body's
+    // (they part with free aim and lock-on).
+    float aimPitch = 0.f;
+    float aimYaw = 0.f;
+    CVector3f view = mgr.GetCameraManager()->GetCurrentCameraTransform(mgr).GetForward();
+    if (view.CanBeNormalized()) {
+      view = view.AsNormalized();
+      aimPitch = std::asin(Clamp(view.GetZ(), -1.f, 1.f));
+      aimYaw = std::atan2(CVector3f::Dot(view, right), CVector3f::Dot(view, forward));
+    }
+    echoes = DriveEchoes(*anim, player, dt, forwardSpeed, sideSpeed, onGround, aimPitch, aimYaw, s);
   } else {
     StopEchoes(anim);
     SetEchoesStatus("");
   }
+  sPendingShot = -1;
 
   // Samus runs at about 16 units a second; the motion is scaled to that.
   const float run = 16.f;
@@ -635,7 +649,9 @@ void Tick(float dt, CPlayer& player, CStateManager& mgr) {
 
   // The torso bends towards the aim: up to half the view's pitch, eased.
   if (anim != nullptr) {
-    if (s.torsoAim && sActive) {
+    if (echoes) {
+      sBend = 0.f; // Echoes' aim animations do it
+    } else if (s.torsoAim && sActive) {
       const CVector3f view = mgr.GetCameraManager()->GetCurrentCameraTransform(mgr).GetForward();
       const float aimPitch =
           std::asin(Clamp(view.CanBeNormalized() ? view.AsNormalized().GetZ() : 0.f, -1.f, 1.f));
@@ -650,6 +666,8 @@ void Tick(float dt, CPlayer& player, CStateManager& mgr) {
 }
 
 bool Active() { return sActive; }
+
+void NoteShot(int strength) { sPendingShot = std::max(sPendingShot, strength); }
 
 std::string EchoesAnimationStatus() {
   EchoesLoad& load = Echoes();

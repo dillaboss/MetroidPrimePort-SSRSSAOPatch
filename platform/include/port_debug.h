@@ -270,8 +270,7 @@ struct ThirdPersonSettings {
   float shoulder;  // to the right (negative: left)
   bool bodyMotion; // lean, bob and sway
   bool torsoAim;   // the spine bends towards the aim
-  bool echoesAnims;     // play Echoes' Samus animations on the body (port_echoes_locomotion.h)
-  int echoesConvention; // how their keys apply: 0 the best ranked, n Conventions()[n - 1]
+  bool echoesAnims; // play Echoes' Samus animations on the body (port_echoes_locomotion.h)
 };
 const float kThirdPersonDistanceMin = 1.f;
 const float kThirdPersonDistanceMax = 6.f;

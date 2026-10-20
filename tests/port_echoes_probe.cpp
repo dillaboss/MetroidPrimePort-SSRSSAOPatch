@@ -892,6 +892,9 @@ Rig MakeRig() {
       {9, 7, "R_ball", {0.1f, 0.1f, 0}, AxisAngle(1, 0, 0, 90)},
       {10, 1, "Spine_1", {0, 0.04f, 1.18f}, AxisAngle(0, 1, 1, 170)},
       {11, 10, "Head_1", {0, 0.06f, 1.62f}, AxisAngle(1, 0, 1, 180)},
+      {12, 10, "R_shoulder", {0.3f, 0.04f, 1.5f}, AxisAngle(0, 0, 1, 170)},
+      {13, 12, "R_elbow", {0.53f, 0.04f, 1.5f}, AxisAngle(0, 1, 0, 90)},
+      {14, 13, "Charge_LCTR", {0.83f, 0.04f, 1.5f}, AxisAngle(1, 0, 0, 30)},
   };
   Rig rig;
   for (const B& b : bones) {
@@ -1055,7 +1058,6 @@ void TestLocomotion() {
   Player player;
   player.SetLibrary(lib);
   player.SetPrime(rig.prime);
-  player.SetConvention(0);
   Check(player.Ready(), "the player is ready with a library and Prime's skeleton");
 
   PortEchoesLocomotion::Input in;
@@ -1102,6 +1104,63 @@ void TestLocomotion() {
         "in the air the jump loop plays");
 }
 
+
+// A two-key clip that turns one bone from nothing to `delta` (as Echoes' additive clips do).
+PortEchoesAnim::Clip Additive(uint32_t bone, Quat first, Quat last, float duration) {
+  PortEchoesAnim::Clip clip;
+  clip.version = 2;
+  clip.duration = duration;
+  clip.interval = duration;
+  clip.keyFrames = {0, 1};
+  PortEchoesAnim::Channel ch;
+  ch.bone = bone;
+  ch.rotations = {first, last};
+  clip.channels.push_back(ch);
+  return clip;
+}
+
+void TestAimAndShots() {
+  using namespace PortEchoesAnim;
+  using namespace PortEchoesLocomotion;
+  const Rig rig = MakeRig();
+  auto lib = std::make_shared<Library>();
+  lib->echoes = rig.echoes;
+  const std::vector<Quat> stand(rig.echoes.bones.size(), Quat{});
+  lib->clips["B_ready_samus"] = Hold(rig, stand, 0.f, 1.f);
+  lib->clips["B_walk_samus"] = Hold(rig, stand, 2.f, 1.f);
+  // Turning Spine_1 -30 degrees about y raises the arm, which points along x, by 30 degrees.
+  lib->clips["Aim_U_additive_samus"] = Additive(10, Quat{}, AxisAngle(0, 1, 0, -30), 1.f / 30.f);
+  lib->clips["A_shoot_additive_samus"] = Additive(13, AxisAngle(0, 0, 1, 20), Quat{}, 0.2f);
+  Player player;
+  player.SetLibrary(lib);
+  player.SetPrime(rig.prime);
+  Check(std::fabs(player.AimRange(0) - 30.f) < 0.5f, "the aim-up animation is measured on the arm cannon");
+  Check(player.AimRange(1) == 0.f, "a missing aim animation has no range");
+
+  PortEchoesLocomotion::Input in;
+  in.dt = 1.f / 60.f;
+  in.aimPitch = 15.f * 3.14159265f / 180.f;
+  const PrimePose* pose = &player.Update(in);
+  Check(AngleBetween(pose->locals[10], AxisAngle(0, 1, 0, -15)) < 0.5f,
+        "aiming halfway up plays half the aim animation, from its full key");
+  in.aimPitch = 1.2f;
+  for (int i = 0; i < 30; ++i) {
+    pose = &player.Update(in);
+  }
+  Check(AngleBetween(pose->locals[10], AxisAngle(0, 1, 0, -30)) < 0.5f, "aiming past its range holds the full aim");
+  in.aim = false;
+  pose = &player.Update(in);
+  Check(AngleBetween(pose->locals[10], Quat{}) < 0.5f, "with the aim off the torso stays as the clip has it");
+
+  player.Shoot(2); // no heavy recoil: the light one plays
+  pose = &player.Update(in);
+  Check(AngleBetween(pose->locals[13], Quat{}) > 15.f, "a shot plays its recoil");
+  for (int i = 0; i < 20; ++i) {
+    pose = &player.Update(in);
+  }
+  Check(AngleBetween(pose->locals[13], Quat{}) < 0.5f, "the recoil ends");
+}
+
 } // namespace
 
 int main() {
@@ -1113,6 +1172,7 @@ int main() {
   TestCompressedClip();
   TestPoses();
   TestLocomotion();
+  TestAimAndShots();
   if (sFailures == 0) {
     std::printf("port_echoes_probe: all checks passed\n");
   }

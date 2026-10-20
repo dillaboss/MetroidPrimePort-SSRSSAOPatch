@@ -248,7 +248,6 @@ float sThirdPersonShoulder = 0.6f;
 bool sThirdPersonBodyMotion = true;
 bool sThirdPersonTorsoAim = true;
 bool sThirdPersonEchoesAnims = false;
-int sThirdPersonEchoesConvention = 0; // 0: the best ranked; n: PortEchoesAnim::Conventions()[n - 1]
 std::string sEchoesImagePath;         // the user's Echoes image, as last picked
 bool sRevealMap = false;
 int sMapPickups = PortDebug::kMapPickups_Off;

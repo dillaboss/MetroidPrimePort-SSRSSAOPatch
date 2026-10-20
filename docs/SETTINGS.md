@@ -514,8 +514,15 @@
   carried onto Prime's skeleton (bone names match; Prime's extra bones keep
   their rest pose) and written into the body's pose builder each tick; the
   root keeps its height but not the clips' travel, and the hand-made body
-  motion stands down. "How keys apply" picks a reading by hand ("Best ranked"
-  by default) while the right one is being confirmed.
+  motion stands down. Echoes' keys read as Prime reads its own (the report's
+  "prime" convention, confirmed on real data and in game): the bind rotations
+  are for skinning only. On top, as Echoes layers them, additive animations:
+  aim up, down, left and right (with "Torso follows aim"; each weighted by the
+  first-person camera's pitch, and its heading against the body's, over how far
+  that animation turns the arm cannon, measured once on the standing pose), and
+  a recoil for each shot (light for a beam shot, medium for a missile or combo,
+  heavy for a charged shot; CPlayerGun reports them through
+  PortThirdPerson::NoteShot).
   Names and numbers only; no game data is copied. It is the first step towards
   playing Echoes' locomotion animations on Prime's body. Echoes' PAKs keep
   Prime's table layout but compress with LZO1X in 0x4000-byte segments

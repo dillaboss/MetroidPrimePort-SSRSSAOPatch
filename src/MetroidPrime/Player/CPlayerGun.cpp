@@ -2,6 +2,7 @@
 #include "port_debug.h"
 #include "port_room_env.h"
 #include "port_synthetic_effect.h"
+#include "port_third_person.h"
 #ifdef MP_ENABLE_SMOKE_DRIVER
 #include "port_smoke.h"
 #endif
@@ -1371,6 +1372,9 @@ void CPlayerGun::UpdateNormalShotCycle(float dt, CStateManager& mgr) {
 
   xf.AddTranslation(mgr.GetCameraManager()->GetGlobalCameraTranslation(mgr));
   x38c_muzzleEffectVisTimer = 0.0625f;
+#ifdef TARGET_PC
+  PortThirdPerson::NoteShot(x330_chargeState == kCS_Charged ? 2 : 0);
+#endif
 
 #ifdef MP_ENABLE_SMOKE_DRIVER
   PortSmokeMouseShot(x330_chargeState == kCS_Charged, false);
@@ -1442,6 +1446,9 @@ void CPlayerGun::FireSecondary(float dt, CStateManager& mgr) {
 #endif
 
     xf.AddTranslation(mgr.GetCameraManager()->GetGlobalCameraTranslation(mgr));
+#ifdef TARGET_PC
+    PortThirdPerson::NoteShot(1);
+#endif
 #ifdef MP_ENABLE_SMOKE_DRIVER
     PortSmokeMouseShot(x330_chargeState == kCS_Charged, true);
 #endif

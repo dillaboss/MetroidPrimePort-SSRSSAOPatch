@@ -554,7 +554,6 @@ ThirdPersonSettings ThirdPerson() {
   s.bodyMotion = sThirdPersonBodyMotion;
   s.torsoAim = sThirdPersonTorsoAim;
   s.echoesAnims = sThirdPersonEchoesAnims;
-  s.echoesConvention = sThirdPersonEchoesConvention;
   return s;
 }
 

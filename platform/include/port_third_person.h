@@ -34,6 +34,10 @@ bool ShowBody();
 // CPortActorRenderScope). False (and `out` untouched) while there is no motion to apply.
 bool BodyView(const CPlayer& player, const CTransform4f& view, CTransform4f& out);
 
+// A shot left the arm cannon (CPlayerGun): 0 a normal shot, 1 a missile or combo, 2 a charged
+// shot. Echoes' animations play a recoil for it.
+void NoteShot(int strength);
+
 // Echoes' animations: loading, playing (with how their keys are read and what is blending), or
 // why not. Empty while they are off.
 std::string EchoesAnimationStatus();

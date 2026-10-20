@@ -139,8 +139,9 @@ void DrawVideoDisplay() {
     }
     const std::string keys = PortInputRemap::BindingsText(PortInput::Action::ThirdPerson, " / ");
     ImGui::SetItemTooltip("Plays from behind Samus's shoulder. Aiming, lock-on and scanning work as in\n"
-                          "first person, and the crosshair stays on what a shot hits. Samus has no walk\n"
-                          "animations, so she keeps one pose, moved by the body motion below.\n"
+                          "first person, and the crosshair stays on what a shot hits. Prime has no walk\n"
+                          "animations for Samus: with your own Echoes image she plays Echoes' (below);\n"
+                          "without, she keeps one pose, moved by the body motion.\n"
                           "Toggle in game: %s.",
                           keys.empty() ? "unbound" : keys.c_str());
     if (sThirdPerson) {
@@ -157,17 +158,21 @@ void DrawVideoDisplay() {
         MarkDirty();
       }
       ImGui::SetItemTooltip("To the right of Samus; negative for over the left shoulder.");
+      const bool echoesPlaying = sThirdPersonEchoesAnims && !sEchoesImagePath.empty();
+      ImGui::BeginDisabled(echoesPlaying);
       if (ImGui::Checkbox("Body motion", &sThirdPersonBodyMotion)) {
         MarkDirty();
       }
+      ImGui::EndDisabled();
       ImGui::SetItemTooltip("Leans into turns and strafes, bobs and sways with each stride, and dips on\n"
-                            "landing.");
+                            "landing. Not used while Echoes' animations play.");
       ImGui::SameLine();
       if (ImGui::Checkbox("Torso follows aim", &sThirdPersonTorsoAim)) {
         MarkDirty();
       }
-      ImGui::SetItemTooltip("Bends Samus at the spine towards where you aim up or down. The most\n"
-                            "experimental part: turn it off if the pose looks wrong.");
+      ImGui::SetItemTooltip("Samus points her arm cannon where you aim. With Echoes' animations she\n"
+                            "plays their aim animations (up, down, left and right); without them, she\n"
+                            "bends at the spine towards where you aim up or down.");
 #if !defined(__ANDROID__)
       {
         std::string picked;
@@ -212,35 +217,14 @@ void DrawVideoDisplay() {
         ImGui::EndDisabled();
         ImGui::SetItemTooltip("Plays Metroid Prime 2: Echoes' Samus animations on Prime's Samus: standing,\n"
                               "walking, jogging and running forwards and backwards, strafing, jumping and\n"
-                              "landing, blended by how she moves. Read from your own Echoes image (pick it\n"
-                              "with the button above once). Very experimental.");
+                              "landing, blended by how she moves, with Echoes' aiming (see Torso follows aim)\n"
+                              "and the arm cannon's recoil when she fires. Read from your own Echoes image\n"
+                              "(pick it with the button above once). Experimental.");
         if (sEchoesImagePath.empty()) {
           ImGui::SameLine();
           ImGui::TextDisabled("(pick your Echoes image above first)");
         }
         if (sThirdPersonEchoesAnims && !sEchoesImagePath.empty()) {
-          const auto& conventions = PortEchoesAnim::Conventions();
-          const std::string current =
-              sThirdPersonEchoesConvention <= 0 || size_t(sThirdPersonEchoesConvention) > conventions.size()
-                  ? std::string("Best ranked")
-                  : PortEchoesAnim::ConventionName(conventions[size_t(sThirdPersonEchoesConvention - 1)]);
-          if (ImGui::BeginCombo("How keys apply", current.c_str())) {
-            if (ImGui::Selectable("Best ranked", sThirdPersonEchoesConvention == 0)) {
-              sThirdPersonEchoesConvention = 0;
-              MarkDirty();
-            }
-            for (size_t i = 0; i < conventions.size(); ++i) {
-              const std::string name = std::to_string(i) + ": " + PortEchoesAnim::ConventionName(conventions[i]);
-              if (ImGui::Selectable(name.c_str(), sThirdPersonEchoesConvention == int(i) + 1)) {
-                sThirdPersonEchoesConvention = int(i) + 1;
-                MarkDirty();
-              }
-            }
-            ImGui::EndCombo();
-          }
-          ImGui::SetItemTooltip("How Echoes' animation data turns into a pose is still being worked out. The\n"
-                                "port ranks every candidate by how well Samus keeps her feet on the floor; if\n"
-                                "she looks broken, try the others here.");
           const std::string status = PortThirdPerson::EchoesAnimationStatus();
           if (!status.empty()) {
             ImGui::TextWrapped("%s", status.c_str());
