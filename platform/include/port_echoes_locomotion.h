@@ -9,8 +9,10 @@
 #include <vector>
 
 // Echoes' Samus locomotion played on Prime's Samus in the third-person view: standing, walking,
-// jogging and running forwards and backwards, strafing, in the air and landing, blended by the
-// player's speed and direction and carried onto Prime's skeleton (port_echoes_anim.h). On top, as
+// jogging and running forwards and backwards, strafing, turning on the spot, jumping (take-off,
+// the air, double jumps, side dashes) and landing, and the morph ball's way in and out, blended by
+// the player's motion and carried onto Prime's skeleton (port_echoes_anim.h). Faster than Echoes'
+// clips move, the stride lengthens before the playback speeds up. On top, as
 // Echoes layers them, additive animations: aiming up, down, left and right, and the recoil of a
 // shot. Echoes' keys are read as Prime reads its own (the "prime" convention, which the report
 // ranks first on real data): its bind rotations are for skinning only. Pure: no
@@ -37,10 +39,15 @@ struct Input {
   float forwardSpeed = 0.f; // world units a second, in the body's frame
   float sideSpeed = 0.f;    // to the right
   bool onGround = true;
-  float scale = 1.f;    // world units per skeleton unit (the body model's scale)
-  bool aim = true;      // layer the aim
-  float aimPitch = 0.f; // radians, up positive
-  float aimYaw = 0.f;   // radians from the body's forward, right positive
+  float scale = 1.f;         // world units per skeleton unit (the body model's scale)
+  bool aim = true;           // layer the aim
+  float aimPitch = 0.f;      // radians, up positive
+  float aimYaw = 0.f;        // radians from the body's forward, right positive
+  float turnRate = 0.f;      // radians a second, left positive
+  bool jumped = false;       // left the ground with a jump this tick
+  bool doubleJumped = false; // jumped again in the air this tick
+  bool dashing = false;      // a side dash (left or right by sideSpeed)
+  int morph = 0;             // 1 curling into the morph ball, 2 standing up out of it
 };
 
 class Player {
@@ -60,6 +67,8 @@ public:
 
   // What the blend is made of, for display: clip name and weight, heaviest first.
   std::vector< std::pair< std::string, float > > Weights() const;
+  // How much longer than the clip's the last update's stride was (1: as animated).
+  float LastStride() const { return mLastStride; }
 
 private:
   struct Moving {
@@ -72,10 +81,14 @@ private:
     std::string name;
     float time;
     float weight;
+    float stride = 1.f; // leg swing scaled about its mean
   };
 
   void Classify();
   void Calibrate();
+  // Swings the legs further (stride > 1) about the clip's average leg pose.
+  void Stretch(const PortEchoesAnim::Clip& clip, float stride,
+               PortEchoesAnim::PrimePose& pose) const;
   PortEchoesAnim::PrimePose PoseOf(const PortEchoesAnim::Clip& clip, float time) const;
   // Turns each bone by the additive clip's rotation at `time`, scaled by `weight`.
   void ApplyAdditive(const PortEchoesAnim::Clip& clip, float time, float weight,
@@ -98,6 +111,29 @@ private:
   int mShotStrength = 0;
   float mAimPitch = 0.f; // smoothed
   float mAimYaw = 0.f;
+
+  std::vector< int > mLegBones; // in mPrime
+  std::map< const PortEchoesAnim::Clip*, std::vector< PortEchoesAnim::Quat > > mMeanLegs;
+  float mLastStride = 1.f;
+
+  const PortEchoesAnim::Clip* mTurn[2] = {}; // left, right
+  float mTurnSpeed[2] = {};                  // radians a second as animated
+  float mTurnRate = 0.f;                     // smoothed input
+  float mTurnTime = 0.f;
+  const PortEchoesAnim::Clip* mTakeoff[2] = {}; // from standing, from running
+  const PortEchoesAnim::Clip* mDoubleJump = nullptr;
+  const PortEchoesAnim::Clip* mDashInto[2] = {}; // left, right
+  const PortEchoesAnim::Clip* mDashLoop[2] = {};
+  const PortEchoesAnim::Clip* mDashLand[2] = {};
+  const PortEchoesAnim::Clip* mMorph[2] = {}; // into the ball, out of it
+  const PortEchoesAnim::Clip* mTakeoffClip = nullptr;
+  float mTakeoffTime = -1.f;
+  float mDoubleTime = -1.f;
+  bool mDashAir = false;
+  int mDashSide = 0;
+  const PortEchoesAnim::Clip* mLandClip = nullptr;
+  int mMorphState = 0;
+  float mMorphTime = 0.f;
 
   float mForward = 0.f; // smoothed input, skeleton units a second
   float mSide = 0.f;

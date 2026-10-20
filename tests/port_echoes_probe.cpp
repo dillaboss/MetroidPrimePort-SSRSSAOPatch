@@ -1161,6 +1161,116 @@ void TestAimAndShots() {
   Check(AngleBetween(pose->locals[13], Quat{}) < 0.5f, "the recoil ends");
 }
 
+
+void TestMoreMovement() {
+  using namespace PortEchoesAnim;
+  using namespace PortEchoesLocomotion;
+  const Rig rig = MakeRig();
+  auto lib = std::make_shared<Library>();
+  lib->echoes = rig.echoes;
+  const std::vector<Quat> stand(rig.echoes.bones.size(), Quat{});
+  for (const char* name : {"B_ready_samus", "B_45turnL_samus", "B_45turnR_samus", "B_jumploop_samus",
+                           "B_intojump_fromready_samus", "B_intojump_fromrun_samus", "B_doublejump_samus",
+                           "B_sidedashloop_Right_Samus", "B_intosidedash_Right_Samus", "B_sidedashland_Right_Samus",
+                           "B_readytoball_MultiPlayer_samus", "B_jumpland_toready_samus"}) {
+    lib->clips[name] = Hold(rig, stand, 0.f, 0.5f);
+  }
+  lib->clips["B_walk_samus"] = Hold(rig, stand, 2.f, 1.f);
+  // A run whose left knee swings 0 to 40 degrees over the cycle.
+  Clip run = Hold(rig, stand, 6.f, 0.5f);
+  for (Channel& ch : run.channels) {
+    if (ch.bone == 4) {
+      ch.rotations = {Quat{}, AxisAngle(1, 0, 0, 40)};
+    }
+  }
+  lib->clips["B_run_samus"] = run;
+  Player player;
+  player.SetLibrary(lib);
+  player.SetPrime(rig.prime);
+  const auto has = [&](const char* name) {
+    for (const auto& [n, w] : player.Weights()) {
+      if (n == name && w > 0.05f) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  PortEchoesLocomotion::Input in;
+  in.dt = 1.f / 60.f;
+  in.turnRate = 2.f;
+  for (int i = 0; i < 30; ++i) {
+    player.Update(in);
+  }
+  Check(has("B_45turnL_samus") && !has("B_45turnR_samus"), "turning left on the spot steps round to the left");
+  in.turnRate = 0.f;
+
+  // Faster than the run: the stride lengthens before the playback speeds up.
+  in.forwardSpeed = 6.f * 1.69f;
+  for (int i = 0; i < 60; ++i) {
+    player.Update(in);
+  }
+  Check(std::fabs(player.LastStride() - 1.3f) < 0.02f, "past the run's speed the stride lengthens first");
+  in.forwardSpeed = 6.f * 4.f;
+  for (int i = 0; i < 60; ++i) {
+    player.Update(in);
+  }
+  Check(std::fabs(player.LastStride() - 1.35f) < 0.01f, "the stride lengthens only so far");
+  in.forwardSpeed = 0.f;
+  for (int i = 0; i < 60; ++i) {
+    player.Update(in);
+  }
+
+  in.onGround = false;
+  in.jumped = true;
+  player.Update(in);
+  in.jumped = false;
+  Check(has("take-off"), "a jump starts with the take-off");
+  for (int i = 0; i < 40; ++i) {
+    player.Update(in);
+  }
+  Check(has("B_jumploop_samus") && !has("take-off"), "the take-off gives way to the jump loop");
+  in.doubleJumped = true;
+  player.Update(in);
+  in.doubleJumped = false;
+  player.Update(in);
+  player.Update(in);
+  player.Update(in);
+  player.Update(in);
+  Check(has("B_doublejump_samus"), "a double jump plays its own animation");
+  in.onGround = true;
+  player.Update(in);
+  Check(has("B_jumpland_toready_samus"), "a jump ends with a landing");
+
+  for (int i = 0; i < 60; ++i) {
+    player.Update(in);
+  }
+  in.sideSpeed = 8.f;
+  in.dashing = true;
+  in.onGround = false;
+  in.jumped = true;
+  player.Update(in);
+  in.jumped = false;
+  Check(has("take-off"), "a side dash starts with its own take-off");
+  for (int i = 0; i < 40; ++i) {
+    player.Update(in);
+  }
+  Check(has("side dash"), "a side dash loops its own animation in the air");
+  in.onGround = true;
+  in.dashing = false;
+  in.sideSpeed = 0.f;
+  player.Update(in);
+  Check(has("dash landing"), "a side dash lands with its own landing");
+
+  in.morph = 1;
+  for (int i = 0; i < 10; ++i) {
+    player.Update(in);
+  }
+  Check(!player.Weights().empty() && player.Weights().front().first == "B_readytoball_MultiPlayer_samus" &&
+            player.Weights().front().second > 0.99f,
+        "curling into the morph ball plays over everything");
+}
+
 } // namespace
 
 int main() {
@@ -1173,6 +1283,7 @@ int main() {
   TestPoses();
   TestLocomotion();
   TestAimAndShots();
+  TestMoreMovement();
   if (sFailures == 0) {
     std::printf("port_echoes_probe: all checks passed\n");
   }

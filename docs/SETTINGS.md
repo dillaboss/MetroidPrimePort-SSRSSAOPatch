@@ -523,6 +523,16 @@
   a recoil for each shot (light for a beam shot, medium for a missile or combo,
   heavy for a charged shot; CPlayerGun reports them through
   PortThirdPerson::NoteShot).
+  Also: turning on the spot (Echoes' 45-degree turn steps, played at the
+  view's turn rate while standing), the take-off from standing or running, the
+  jump loop, a double jump (the climb kicked back up in the air), side dashes
+  (their own take-off, loop and landing), landings, and the morph ball's way in
+  and out while the body is shown. Faster than Echoes' clips move (Prime's
+  Samus runs faster than Echoes' run), the legs first swing further about their
+  average pose over the cycle (up to 1.35 times, the square root of the speed
+  ratio) and only then does the playback speed up (up to twice), so the feet
+  keep closer to the ground's speed. The root's turn is left to the player, as
+  Prime's own animations leave it.
   Names and numbers only; no game data is copied. It is the first step towards
   playing Echoes' locomotion animations on Prime's body. Echoes' PAKs keep
   Prime's table layout but compress with LZO1X in 0x4000-byte segments

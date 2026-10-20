@@ -20,6 +20,21 @@ const char* const kAims[4] = {"Aim_U_additive_samus", "Aim_D_additive_samus",
                               "Aim_L_additive_samus", "Aim_R_additive_samus"};
 const char* const kShots[3] = {"A_shoot_additive_samus", "A_mediumshoot_additive_samus",
                                "A_heavyshoot_additive_samus"};
+const char* const kTurns[2] = {"B_45turnL_samus", "B_45turnR_samus"};
+const char* const kTakeoffs[2] = {"B_intojump_fromready_samus", "B_intojump_fromrun_samus"};
+const char* const kDoubleJump = "B_doublejump_samus";
+const char* const kDashInto[2] = {"B_intosidedash_Left_samus", "B_intosidedash_Right_Samus"};
+const char* const kDashLoop[2] = {"B_sidedashloop_Left_samus", "B_sidedashloop_Right_Samus"};
+const char* const kDashLand[2] = {"B_sidedashland_Left_samus", "B_sidedashland_Right_Samus"};
+const char* const kMorphs[2] = {"B_readytoball_MultiPlayer_samus",
+                                "B_ballstationarytoready_MultiPlayer_samus"};
+// The bones a longer stride swings further.
+const char* const kLegs[] = {"L_hip",   "R_hip",   "L_knee", "R_knee",
+                             "L_ankle", "R_ankle", "L_ball", "R_ball"};
+// Past the fastest clip: the stride lengthens up to this much, then the playback speeds up, to
+// this.
+constexpr float kMaxStride = 1.35f;
+constexpr float kMaxRate = 2.f;
 constexpr float kPi = 3.14159265f;
 // Forward, backward, left, right; each slowest first.
 const char* const kSets[4][3] = {
@@ -151,6 +166,11 @@ const std::vector< std::string >& ClipNames() {
     for (const char* name : kShots) {
       v.push_back(name);
     }
+    for (const auto* list : {kTurns, kTakeoffs, kDashInto, kDashLoop, kDashLand, kMorphs}) {
+      v.push_back(list[0]);
+      v.push_back(list[1]);
+    }
+    v.push_back(kDoubleJump);
     for (const auto& set : kSets) {
       for (const char* name : set) {
         v.push_back(name);
@@ -206,6 +226,14 @@ void Player::Reset() {
   mLandTime = -1.f;
   mShotTime = -1.f;
   mAimPitch = mAimYaw = 0.f;
+  mTurnRate = mTurnTime = 0.f;
+  mTakeoffClip = nullptr;
+  mTakeoffTime = mDoubleTime = -1.f;
+  mDashAir = false;
+  mLandClip = nullptr;
+  mMorphState = 0;
+  mMorphTime = 0.f;
+  mLastStride = 1.f;
   mFresh = true;
   mLast.clear();
 }
@@ -231,6 +259,15 @@ void Player::Classify() {
   for (int k = 0; k < 3; ++k) {
     mShots[k] = find(kShots[k]);
   }
+  for (int k = 0; k < 2; ++k) {
+    mTurn[k] = find(kTurns[k]);
+    mTakeoff[k] = find(kTakeoffs[k]);
+    mDashInto[k] = find(kDashInto[k]);
+    mDashLoop[k] = find(kDashLoop[k]);
+    mDashLand[k] = find(kDashLand[k]);
+    mMorph[k] = find(kMorphs[k]);
+  }
+  mDoubleJump = find(kDoubleJump);
   for (int k = 0; k < 4; ++k) {
     for (const char* name : kSets[k]) {
       const Clip* clip = find(name);
@@ -262,6 +299,61 @@ void Player::Calibrate() {
       }
     }
   }
+  // The legs' average pose over each moving clip's cycle, about which a longer stride swings.
+  mLegBones.clear();
+  mMeanLegs.clear();
+  for (const char* name : kLegs) {
+    for (size_t i = 0; i < mPrime.bones.size(); ++i) {
+      if (mPrime.bones[i].name == name) {
+        mLegBones.push_back(int(i));
+      }
+    }
+  }
+  for (const auto& set : mSets) {
+    for (const Moving& m : set) {
+      std::vector< Quat > sum(mLegBones.size(), Quat{0.f, 0.f, 0.f, 0.f});
+      std::vector< Quat > first(mLegBones.size());
+      constexpr int kSamples = 16;
+      for (int k = 0; k < kSamples; ++k) {
+        const PrimePose pose = PoseOf(*m.clip, m.clip->duration * float(k) / float(kSamples));
+        for (size_t j = 0; j < mLegBones.size(); ++j) {
+          Quat q = pose.locals[size_t(mLegBones[j])];
+          if (k == 0) {
+            first[j] = q;
+          } else if (q.w * first[j].w + q.x * first[j].x + q.y * first[j].y + q.z * first[j].z <
+                     0.f) {
+            q = Quat{-q.w, -q.x, -q.y, -q.z};
+          }
+          sum[j] = Quat{sum[j].w + q.w, sum[j].x + q.x, sum[j].y + q.y, sum[j].z + q.z};
+        }
+      }
+      for (Quat& q : sum) {
+        q = PortEchoesAnim::Normalized(q);
+      }
+      mMeanLegs[m.clip] = std::move(sum);
+    }
+  }
+  // How fast each turn-on-the-spot clip turns: its root's heading over the clip.
+  for (int k = 0; k < 2; ++k) {
+    mTurnSpeed[k] = 0.f;
+    if (mTurn[k] == nullptr) {
+      continue;
+    }
+    const PortEchoesProbe::Bone* root = mLibrary->echoes.Find("root");
+    for (const PortEchoesAnim::Channel& ch : mTurn[k]->channels) {
+      if (root != nullptr && ch.bone == root->id && ch.rotations.size() >= 2) {
+        const Quat& a = ch.rotations.front();
+        const Quat& b = ch.rotations.back();
+        const float yaw =
+            std::remainder(2.f * std::atan2(b.z, b.w) - 2.f * std::atan2(a.z, a.w), 2.f * kPi);
+        mTurnSpeed[k] = std::fabs(yaw) / std::max(mTurn[k]->duration, 0.05f);
+      }
+    }
+    if (mTurnSpeed[k] < 0.1f) {
+      mTurnSpeed[k] = (kPi / 4.f) / std::max(mTurn[k]->duration, 0.05f);
+    }
+  }
+
   int from = -1;
   int to = -1;
   for (size_t i = 0; i < mPrime.bones.size(); ++i) {
@@ -312,6 +404,17 @@ void Player::Calibrate() {
     if (mAimRange[k] < 3.f * kPi / 180.f) {
       mAimRange[k] = 45.f * kPi / 180.f;
     }
+  }
+}
+
+void Player::Stretch(const Clip& clip, float stride, PrimePose& pose) const {
+  const auto mean = mMeanLegs.find(&clip);
+  if (mean == mMeanLegs.end() || std::fabs(stride - 1.f) < 1e-3f) {
+    return;
+  }
+  for (size_t j = 0; j < mLegBones.size() && j < mean->second.size(); ++j) {
+    Quat& local = pose.locals[size_t(mLegBones[j])];
+    local = PortEchoesAnim::Normalized(PortEchoesAnim::Slerp(mean->second[j], local, stride));
   }
 }
 
@@ -368,14 +471,18 @@ const PrimePose& Player::Update(const Input& in) {
   const float scale = std::max(in.scale, 0.01f);
   const float targetForward = in.forwardSpeed / scale;
   const float targetSide = in.sideSpeed / scale;
-  if (mFresh) {
+  if (fresh) {
     mForward = targetForward;
     mSide = targetSide;
+    mTurnRate = in.turnRate;
   } else {
     mForward += (targetForward - mForward) * Approach(dt, 10.f);
     mSide += (targetSide - mSide) * Approach(dt, 10.f);
+    mTurnRate += (in.turnRate - mTurnRate) * Approach(dt, 8.f);
   }
   const float speed = std::sqrt(mForward * mForward + mSide * mSide);
+
+  // ---- On the ground: standing, turning on the spot, or moving ----
 
   // Direction: forward and backward against the sides, squared cosines so they sum to one.
   float dir[4] = {1.f, 0.f, 0.f, 0.f};
@@ -395,46 +502,54 @@ const PrimePose& Player::Update(const Input& in) {
     }
   }
   const float walkSpeed = mSets[0].empty() ? 1.f : mSets[0].front().speed;
+  const float runSpeed = mSets[0].empty() ? 1.f : mSets[0].back().speed;
   const float idleWeight =
       mIdle != nullptr ? std::clamp(1.f - speed / (0.6f * walkSpeed), 0.f, 1.f) : 0.f;
 
   std::vector< Contribution > base;
   float freq = 0.f;
   float freqWeight = 0.f;
+  float strideSum = 0.f;
   for (int k = 0; k < 4; ++k) {
     const float w = dir[k] * (1.f - idleWeight);
     if (w <= 1e-4f || mSets[k].empty()) {
       continue;
     }
     const std::vector< Moving >& set = mSets[k];
-    // The two clips around this speed, or the nearest one played faster or slower.
+    // The two clips around this speed; slower than the slowest, it plays slower; faster than the
+    // fastest, its stride lengthens, then it plays faster.
     size_t a = 0;
     while (a + 1 < set.size() && set[a + 1].speed < speed) {
       ++a;
     }
     float t = 0.f;
     float rate = 1.f;
+    float stride = 1.f;
     if (speed <= set.front().speed) {
       a = 0;
       rate = std::max(speed / set.front().speed, 0.5f);
     } else if (a + 1 < set.size()) {
       t = (speed - set[a].speed) / (set[a + 1].speed - set[a].speed);
     } else {
-      rate = std::min(speed / set.back().speed, 2.5f);
+      const float ratio = speed / set.back().speed;
+      stride = std::min(std::sqrt(ratio), kMaxStride);
+      rate = std::min(ratio / stride, kMaxRate);
     }
     const auto add = [&](const Moving& m, float weight) {
       if (weight <= 1e-4f) {
         return;
       }
-      base.push_back({m.clip, m.name, 0.f, weight});
+      base.push_back({m.clip, m.name, 0.f, weight, stride});
       freq += weight * rate / std::max(m.clip->duration, 0.05f);
       freqWeight += weight;
+      strideSum += weight * stride;
     };
     add(set[a], w * (1.f - t));
     if (t > 0.f) {
       add(set[a + 1], w * t);
     }
   }
+  mLastStride = freqWeight > 0.f ? strideSum / freqWeight : 1.f;
   if (freqWeight > 0.f) {
     mPhase = Wrap(mPhase + dt * freq / freqWeight, 1.f);
   }
@@ -443,48 +558,152 @@ const PrimePose& Player::Update(const Input& in) {
   }
   mIdleTime += dt;
   if (idleWeight > 0.f) {
-    base.push_back({mIdle, kIdle, Wrap(mIdleTime, mIdle->duration), idleWeight});
+    // Turning on the spot steps round, at the speed the view turns.
+    const int side = mTurnRate > 0.f ? 0 : 1;
+    const float turn = std::fabs(mTurnRate);
+    const float turnWeight =
+        mTurn[side] != nullptr ? std::clamp((turn - 0.3f) / 0.9f, 0.f, 1.f) : 0.f;
+    if (turnWeight > 0.f) {
+      mTurnTime += dt * std::clamp(turn / mTurnSpeed[side], 0.5f, 2.f);
+      base.push_back({mTurn[side], kTurns[side], Wrap(mTurnTime, mTurn[side]->duration),
+                      idleWeight * turnWeight});
+    } else {
+      mTurnTime = 0.f;
+    }
+    if (turnWeight < 1.f) {
+      base.push_back(
+          {mIdle, kIdle, Wrap(mIdleTime, mIdle->duration), idleWeight * (1.f - turnWeight)});
+    }
   }
 
-  // In the air after a moment off the ground; a landing after a real fall.
-  if (!in.onGround) {
+  // ---- In the air: a take-off, the loop (a side dash's or a jump's), a double jump ----
+  const bool airborne = !in.onGround;
+  if (in.jumped) {
+    mDashAir = in.dashing;
+    mDashSide = mSide > 0.f ? 1 : 0;
+    const Clip* takeoff =
+        mDashAir ? mDashInto[mDashSide] : mTakeoff[speed > 0.5f * (walkSpeed + runSpeed) ? 1 : 0];
+    if (takeoff == nullptr) {
+      takeoff = mTakeoff[0] != nullptr ? mTakeoff[0] : mTakeoff[1];
+    }
+    mTakeoffClip = takeoff;
+    mTakeoffTime = takeoff != nullptr ? 0.f : -1.f;
+  }
+  if (airborne && in.dashing && !mDashAir) {
+    mDashAir = true;
+    mDashSide = mSide > 0.f ? 1 : 0;
+  }
+  if (in.doubleJumped && mDoubleJump != nullptr) {
+    mDoubleTime = 0.f;
+  }
+  if (airborne) {
     mAirTime += dt;
   } else {
-    if (mAirTime > 0.3f && mLand != nullptr) {
-      mLandTime = 0.f;
+    // A landing after a real fall (or any jump), from a dash its own.
+    if ((mAirTime > 0.3f || (mAirTime > 0.f && mTakeoffTime >= 0.f)) && !in.jumped) {
+      mLandClip = mDashAir && mDashLand[mDashSide] != nullptr ? mDashLand[mDashSide] : mLand;
+      mLandTime = mLandClip != nullptr ? 0.f : -1.f;
+    }
+    if (!in.jumped) {
+      mDashAir = false;
+      mTakeoffTime = -1.f;
+      mDoubleTime = -1.f;
     }
     mAirTime = 0.f;
   }
-  const float airTarget = (!in.onGround && mAirTime > 0.08f && mAir != nullptr) ? 1.f : 0.f;
-  mAirWeight = mFresh ? airTarget : mAirWeight + (airTarget - mAirWeight) * Approach(dt, 12.f);
+  const Clip* loop = mDashAir && mDashLoop[mDashSide] != nullptr ? mDashLoop[mDashSide] : mAir;
+  const bool inAir = airborne && (mAirTime > 0.08f || mTakeoffTime >= 0.f);
+  const float airTarget = inAir && (loop != nullptr || mTakeoffTime >= 0.f) ? 1.f : 0.f;
+  mAirWeight = fresh ? airTarget
+                     : mAirWeight + (airTarget - mAirWeight) *
+                                        Approach(dt, mTakeoffTime >= 0.f ? 25.f : 12.f);
   mAirClipTime = mAirWeight > 0.f ? mAirClipTime + dt : 0.f;
+  std::vector< Contribution > air;
+  float takeoffWeight = 0.f;
+  if (mTakeoffTime >= 0.f && mTakeoffClip != nullptr) {
+    const float duration = std::max(mTakeoffClip->duration, 0.05f);
+    if (mTakeoffTime >= duration) {
+      mTakeoffTime = -1.f;
+    } else {
+      takeoffWeight =
+          loop != nullptr ? 1.f - SmoothStep((mTakeoffTime / duration - 0.7f) / 0.3f) : 1.f;
+      air.push_back({mTakeoffClip, "take-off", mTakeoffTime, takeoffWeight});
+      mTakeoffTime += dt;
+    }
+  }
+  if (loop != nullptr && takeoffWeight < 1.f) {
+    air.push_back({loop, loop == mAir ? kAir : "side dash", Wrap(mAirClipTime, loop->duration),
+                   1.f - takeoffWeight});
+  }
+  float doubleWeight = 0.f;
+  if (mDoubleTime >= 0.f) {
+    const float duration = std::max(mDoubleJump->duration, 0.05f);
+    if (mDoubleTime >= duration) {
+      mDoubleTime = -1.f;
+    } else {
+      doubleWeight = SmoothStep(mDoubleTime / 0.06f) *
+                     (1.f - SmoothStep((mDoubleTime / duration - 0.7f) / 0.3f)) * mAirWeight;
+      mDoubleTime += dt;
+    }
+  }
+
+  // ---- Landing ----
   float landWeight = 0.f;
-  if (mLandTime >= 0.f && mLand != nullptr) {
+  if (mLandTime >= 0.f && mLandClip != nullptr) {
     mLandTime += dt;
-    const float progress = mLandTime / std::max(mLand->duration, 0.05f);
+    const float progress = mLandTime / std::max(mLandClip->duration, 0.05f);
     if (progress >= 1.f) {
       mLandTime = -1.f;
     } else {
-      const float moving = std::clamp(speed / walkSpeed, 0.f, 1.f);
+      // A landing to stand gives way to the stride when moving on; a dash's lands either way.
+      const float moving = mLandClip == mLand ? std::clamp(speed / walkSpeed, 0.f, 1.f) : 0.f;
       landWeight = (1.f - progress) * (1.f - progress) * (1.f - moving);
     }
   }
+
+  // ---- The morph ball's way in and out, over everything ----
+  if (in.morph != mMorphState) {
+    mMorphState = in.morph;
+    mMorphTime = 0.f;
+  } else {
+    mMorphTime += dt;
+  }
+  const Clip* morph = mMorphState >= 1 && mMorphState <= 2 ? mMorph[mMorphState - 1] : nullptr;
+  const float morphWeight = morph != nullptr ? SmoothStep(mMorphTime / 0.06f + 0.5f) : 0.f;
   mFresh = false;
 
+  // Layered: ground, then landing over it, the air over both, a double jump over that, the morph
+  // over all.
   mLast.clear();
-  const float baseShare = (1.f - mAirWeight) * (1.f - landWeight);
-  for (Contribution& c : base) {
-    c.weight *= baseShare;
+  const auto layer = [](std::vector< Contribution >& under, float weight) {
+    for (Contribution& c : under) {
+      c.weight *= weight;
+    }
+  };
+  std::vector< Contribution > all = base;
+  if (landWeight > 0.f) {
+    layer(all, 1.f - landWeight);
+    all.push_back({mLandClip, mLandClip == mLand ? kLand : "dash landing",
+                   std::min(mLandTime, mLandClip->duration), landWeight});
+  }
+  if (mAirWeight > 1e-4f && !air.empty()) {
+    layer(all, 1.f - mAirWeight);
+    layer(air, mAirWeight);
+    all.insert(all.end(), air.begin(), air.end());
+  }
+  if (doubleWeight > 0.f) {
+    layer(all, 1.f - doubleWeight);
+    all.push_back({mDoubleJump, kDoubleJump, mDoubleTime, doubleWeight});
+  }
+  if (morphWeight > 0.f) {
+    layer(all, 1.f - morphWeight);
+    all.push_back(
+        {morph, kMorphs[mMorphState - 1], std::min(mMorphTime, morph->duration), morphWeight});
+  }
+  for (const Contribution& c : all) {
     if (c.weight > 1e-4f) {
       mLast.push_back(c);
     }
-  }
-  if (landWeight > 0.f) {
-    mLast.push_back(
-        {mLand, kLand, std::min(mLandTime, mLand->duration), (1.f - mAirWeight) * landWeight});
-  }
-  if (mAirWeight > 1e-4f) {
-    mLast.push_back({mAir, kAir, Wrap(mAirClipTime, mAir->duration), mAirWeight});
   }
   if (mLast.empty() && mIdle != nullptr) {
     mLast.push_back({mIdle, kIdle, Wrap(mIdleTime, mIdle->duration), 1.f});
@@ -492,7 +711,9 @@ const PrimePose& Player::Update(const Input& in) {
 
   std::vector< std::pair< PrimePose, float > > poses;
   for (const Contribution& c : mLast) {
-    poses.emplace_back(PoseOf(*c.clip, c.time), c.weight);
+    PrimePose pose = PoseOf(*c.clip, c.time);
+    Stretch(*c.clip, c.stride, pose);
+    poses.emplace_back(std::move(pose), c.weight);
   }
   Blend(poses, mPose);
   // Aim, as Echoes layers it: up or down and left or right, each by how far the cannon points
@@ -504,11 +725,13 @@ const PrimePose& Player::Update(const Input& in) {
   } else {
     mAimPitch = mAimYaw = 0.f;
   }
+  const float aimShare = 1.f - morphWeight; // curling into the ball, she stops aiming
   const float aimAmount[4] = {std::max(mAimPitch, 0.f), std::max(-mAimPitch, 0.f),
                               std::max(-mAimYaw, 0.f), std::max(mAimYaw, 0.f)};
   for (int k = 0; k < 4; ++k) {
     if (mAim[k] != nullptr && mAimRange[k] > 0.f && aimAmount[k] > 0.f) {
-      ApplyAdditive(*mAim[k], mAimTime[k], std::min(aimAmount[k] / mAimRange[k], 1.f), mPose);
+      ApplyAdditive(*mAim[k], mAimTime[k], std::min(aimAmount[k] / mAimRange[k], 1.f) * aimShare,
+                    mPose);
     }
   }
   // A shot's recoil, fading out over its last part.
@@ -524,11 +747,13 @@ const PrimePose& Player::Update(const Input& in) {
     }
   }
 
-  // The player moves the body: the root keeps its height, not the clips' travel.
+  // The player moves and turns the body: the root keeps its height, not the clips' travel or
+  // turn (as Prime's own animations leave the root to the actor).
   if (mRootBone >= 0 && size_t(mRootBone) < mPose.offsets.size()) {
     mPose.offsets[size_t(mRootBone)].x = 0.f;
     mPose.offsets[size_t(mRootBone)].y = 0.f;
     mPose.hasOffset[size_t(mRootBone)] = true;
+    mPose.locals[size_t(mRootBone)] = Quat{};
   }
   return mPose;
 }

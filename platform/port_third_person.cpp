@@ -363,8 +363,20 @@ void StopEchoes(CAnimData* anim) {
 }
 
 // Poses the body from Echoes' animations; false while they are not loaded.
+// What the player did this tick, beyond moving, for Echoes' animations.
+struct EchoesEvents {
+  float turnRate = 0.f; // radians a second, left positive
+  bool jumped = false;
+  bool doubleJumped = false;
+  bool dashing = false;
+  int morph = 0; // 1 curling into the ball, 2 standing up out of it
+};
+bool sEchoesWasOnGround = true;
+float sEchoesPrevUpSpeed = 0.f;
+
 bool DriveEchoes(CAnimData& anim, const CPlayer& player, float dt, float forwardSpeed, float sideSpeed,
-                 bool onGround, float aimPitch, float aimYaw, const PortDebug::ThirdPersonSettings& s) {
+                 bool onGround, float aimPitch, float aimYaw, const EchoesEvents& events,
+                 const PortDebug::ThirdPersonSettings& s) {
   const std::string path = PortDebug::EchoesImagePath();
   if (path.empty()) {
     SetEchoesStatus("Pick your Echoes image with the button above first.");
@@ -428,6 +440,11 @@ bool DriveEchoes(CAnimData& anim, const CPlayer& player, float dt, float forward
   in.aim = s.torsoAim;
   in.aimPitch = aimPitch;
   in.aimYaw = aimYaw;
+  in.turnRate = events.turnRate;
+  in.jumped = events.jumped;
+  in.doubleJumped = events.doubleJumped;
+  in.dashing = events.dashing;
+  in.morph = events.morph;
   if (sPendingShot >= 0) {
     sEchoesPlayer.Shoot(sPendingShot);
     sPendingShot = -1;
@@ -541,8 +558,12 @@ void UpdateFrame(const CStateManager& mgr) {
 void Tick(float dt, CPlayer& player, CStateManager& mgr) {
   const PortDebug::ThirdPersonSettings s = PortDebug::ThirdPerson();
   CAnimData* anim = player.HasAnimation() ? player.AnimationData() : nullptr;
-  const bool upright = player.GetMorphballTransitionState() == CPlayer::kMS_Unmorphed;
-  if (!s.enabled || !upright || dt <= 0.f) {
+  const CPlayer::EPlayerMorphBallState morphState = player.GetMorphballTransitionState();
+  const bool upright = morphState == CPlayer::kMS_Unmorphed;
+  // Echoes' animations, already playing, see the morph ball's way in and out through.
+  const bool morphing = (morphState == CPlayer::kMS_Morphing || morphState == CPlayer::kMS_Unmorphing) &&
+                        s.echoesAnims && sEchoesDriving;
+  if (!s.enabled || !(upright || morphing) || dt <= 0.f) {
     if (anim != nullptr) {
       RestoreSpine(*anim);
     }
@@ -594,7 +615,17 @@ void Tick(float dt, CPlayer& player, CStateManager& mgr) {
       aimPitch = std::asin(Clamp(view.GetZ(), -1.f, 1.f));
       aimYaw = std::atan2(CVector3f::Dot(view, right), CVector3f::Dot(view, forward));
     }
-    echoes = DriveEchoes(*anim, player, dt, forwardSpeed, sideSpeed, onGround, aimPitch, aimYaw, s);
+    EchoesEvents events;
+    events.turnRate = turnRate;
+    // A jump leaves the ground going up; a double jump kicks the climb back up in the air.
+    const float upSpeed = v.GetZ();
+    events.jumped = sEchoesWasOnGround && !onGround && upSpeed > 1.f;
+    events.doubleJumped = !sEchoesWasOnGround && !onGround && upSpeed - sEchoesPrevUpSpeed > 3.f;
+    sEchoesWasOnGround = onGround;
+    sEchoesPrevUpSpeed = upSpeed;
+    events.dashing = player.IsSidewaysDashing();
+    events.morph = morphState == CPlayer::kMS_Morphing ? 1 : morphState == CPlayer::kMS_Unmorphing ? 2 : 0;
+    echoes = DriveEchoes(*anim, player, dt, forwardSpeed, sideSpeed, onGround, aimPitch, aimYaw, events, s);
   } else {
     StopEchoes(anim);
     SetEchoesStatus("");
