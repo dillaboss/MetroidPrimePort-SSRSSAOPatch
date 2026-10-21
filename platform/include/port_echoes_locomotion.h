@@ -39,15 +39,16 @@ struct Input {
   float forwardSpeed = 0.f; // world units a second, in the body's frame
   float sideSpeed = 0.f;    // to the right
   bool onGround = true;
-  float scale = 1.f;         // world units per skeleton unit (the body model's scale)
-  bool aim = true;           // layer the aim
-  float aimPitch = 0.f;      // radians, up positive
-  float aimYaw = 0.f;        // radians from the body's forward, right positive
-  float turnRate = 0.f;      // radians a second, left positive
-  bool jumped = false;       // left the ground with a jump this tick
-  bool doubleJumped = false; // jumped again in the air this tick
-  bool dashing = false;      // a side dash (left or right by sideSpeed)
-  int morph = 0;             // 1 curling into the morph ball, 2 standing up out of it
+  float scale = 1.f;          // world units per skeleton unit (the body model's scale)
+  bool aim = true;            // layer the aim
+  float aimPitch = 0.f;       // radians, up positive
+  float aimYaw = 0.f;         // radians from the body's forward, right positive
+  float turnRate = 0.f;       // radians a second, left positive
+  bool jumped = false;        // left the ground with a jump this tick
+  bool doubleJumped = false;  // jumped again in the air this tick
+  bool dashing = false;       // a side dash (left or right by sideSpeed)
+  int morph = 0;              // 1 curling into the morph ball, 2 standing up out of it
+  float morphProgress = -1.f; // the morph transition's progress, 0..1 (< 0: by time)
 };
 
 class Player {

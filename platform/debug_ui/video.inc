@@ -174,60 +174,104 @@ void DrawVideoDisplay() {
                             "plays their aim animations (up, down, left and right); without them, she\n"
                             "bends at the spine towards where you aim up or down.");
 #if !defined(__ANDROID__)
+      ImGui::Spacing();
+      ImGui::SeparatorText("Animations from Metroid Prime 2: Echoes");
       {
+        // An image from the picker: kept, and the animations switched on with it.
         std::string picked;
         {
           std::lock_guard lock(sRemasteredPickMutex);
           picked.swap(sEchoesPick);
         }
-        static std::string sEchoesStartError;
         if (!picked.empty()) {
-          sEchoesStartError = PortEchoesProbe::Start(picked) ? "" : "A report is already being written.";
           sEchoesImagePath = picked;
+          sThirdPersonEchoesAnims = true;
           MarkDirty();
         }
-        const PortEchoesProbe::State echoes = PortEchoesProbe::Status();
-        ImGui::BeginDisabled(echoes.running);
-        if (ImGui::Button("Compare with Echoes' Samus...")) {
-          OpenRemasteredDialog(kEchoesPick);
-        }
-        ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Pick your own Metroid Prime 2: Echoes image (GameCube, any format the port\n"
-                              "reads). Writes a report comparing Samus's skeleton in the two games and listing\n"
-                              "Echoes' Samus animations: names and numbers only, no game data.");
-        if (echoes.running) {
-          ImGui::TextDisabled("%s...", echoes.message.c_str());
-        } else if (echoes.finished) {
-          if (echoes.ok) {
-            ImGui::TextWrapped("%s", echoes.message.c_str());
-            if (ImGui::Button("Copy report path##echoes")) {
-              ImGui::SetClipboardText(echoes.reportPath.c_str());
-            }
-          } else {
-            ImGui::TextColored(ThemeWarnColor(), "%s", echoes.message.c_str());
-          }
-        } else if (!sEchoesStartError.empty()) {
-          ImGui::TextColored(ThemeWarnColor(), "%s", sEchoesStartError.c_str());
-        }
-
-        ImGui::BeginDisabled(sEchoesImagePath.empty());
-        if (ImGui::Checkbox("Echoes animations", &sThirdPersonEchoesAnims)) {
-          MarkDirty();
-        }
-        ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Plays Metroid Prime 2: Echoes' Samus animations on Prime's Samus: standing,\n"
-                              "walking, jogging and running forwards and backwards, strafing, jumping and\n"
-                              "landing, blended by how she moves, with Echoes' aiming (see Torso follows aim)\n"
-                              "and the arm cannon's recoil when she fires. Read from your own Echoes image\n"
-                              "(pick it with the button above once). Experimental.");
         if (sEchoesImagePath.empty()) {
+          ImGui::TextWrapped("Samus can walk, run, strafe, jump, aim and recoil with Echoes' animations, read "
+                             "from your own Metroid Prime 2: Echoes disc image. Nothing is downloaded.");
+          if (ImGui::Button("Choose Echoes image...")) {
+            OpenRemasteredDialog(kEchoesPick);
+          }
+          ImGui::SetItemTooltip("The GameCube release, in any image format the port reads (.iso, .rvz, ...).\n"
+                                "Metroid Prime Trilogy's Echoes (Wii) is not supported.");
+        } else {
+          if (ImGui::Checkbox("Echoes animations", &sThirdPersonEchoesAnims)) {
+            MarkDirty();
+          }
+          ImGui::SetItemTooltip("Samus moves with Echoes' animations instead of one pose: standing, walking and\n"
+                                "running in every direction, turning, jumping, double jumps, side dashes and\n"
+                                "landings, the morph ball's way in and out, aiming (with Torso follows aim) and\n"
+                                "the arm cannon's recoil. Experimental.");
+          // Which image, with a way to pick another.
+          const size_t slash = sEchoesImagePath.find_last_of("/\\");
+          const std::string imageName =
+              slash == std::string::npos ? sEchoesImagePath : sEchoesImagePath.substr(slash + 1);
+          ImGui::TextDisabled("Image: %s", imageName.c_str());
+          ImGui::SetItemTooltip("%s", sEchoesImagePath.c_str());
           ImGui::SameLine();
-          ImGui::TextDisabled("(pick your Echoes image above first)");
-        }
-        if (sThirdPersonEchoesAnims && !sEchoesImagePath.empty()) {
-          const std::string status = PortThirdPerson::EchoesAnimationStatus();
-          if (!status.empty()) {
-            ImGui::TextWrapped("%s", status.c_str());
+          if (ImGui::SmallButton("Change...##echoesimage")) {
+            OpenRemasteredDialog(kEchoesPick);
+          }
+          if (sThirdPersonEchoesAnims) {
+            // Read now, so they are ready when play starts.
+            PortThirdPerson::LoadEchoesAnimations(sEchoesImagePath);
+            const PortThirdPerson::EchoesAnimationState state = PortThirdPerson::EchoesAnimations();
+            switch (state.phase) {
+            case PortThirdPerson::EchoesAnimationState::Phase::None:
+            case PortThirdPerson::EchoesAnimationState::Phase::Loading:
+              ImGui::TextDisabled("Reading the animations from the image...");
+              break;
+            case PortThirdPerson::EchoesAnimationState::Phase::Ready:
+              ImGui::TextColored(ThemeGoodColor(), state.playing ? "Playing (%zu animations)" : "Ready (%zu animations)",
+                                 state.clips);
+              if (!state.playing) {
+                ImGui::SetItemTooltip("They play in game while the camera is behind Samus.");
+              }
+              if (!state.missing.empty()) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(%zu not on this image)", state.missing.size());
+                std::string list;
+                for (const std::string& name : state.missing) {
+                  list += (list.empty() ? "" : "\n") + name;
+                }
+                ImGui::SetItemTooltip("%s", list.c_str());
+              }
+              break;
+            case PortThirdPerson::EchoesAnimationState::Phase::Failed:
+              ImGui::TextColored(ThemeBadColor(), "Couldn't read the animations: %s.", state.message.c_str());
+              ImGui::TextDisabled("Choose a GameCube Metroid Prime 2: Echoes image with Change.");
+              break;
+            }
+          }
+          if (ImGui::TreeNode("Diagnostics##echoes")) {
+            static std::string sEchoesStartError;
+            const PortEchoesProbe::State report = PortEchoesProbe::Status();
+            ImGui::BeginDisabled(report.running);
+            if (ImGui::Button("Write animation report")) {
+              sEchoesStartError =
+                  PortEchoesProbe::Start(sEchoesImagePath) ? "" : "A report is already being written.";
+            }
+            ImGui::EndDisabled();
+            ImGui::SetItemTooltip("Compares Samus's skeleton in the two games and checks how Echoes' animations\n"
+                                  "decode, into a text file in the user folder: names and numbers only, no game\n"
+                                  "data. Useful when reporting a problem with the animations.");
+            if (report.running) {
+              ImGui::TextDisabled("%s...", report.message.c_str());
+            } else if (report.finished) {
+              if (report.ok) {
+                ImGui::TextWrapped("%s", report.message.c_str());
+                if (ImGui::Button("Copy report path##echoes")) {
+                  ImGui::SetClipboardText(report.reportPath.c_str());
+                }
+              } else {
+                ImGui::TextColored(ThemeWarnColor(), "%s", report.message.c_str());
+              }
+            } else if (!sEchoesStartError.empty()) {
+              ImGui::TextColored(ThemeWarnColor(), "%s", sEchoesStartError.c_str());
+            }
+            ImGui::TreePop();
           }
         }
       }

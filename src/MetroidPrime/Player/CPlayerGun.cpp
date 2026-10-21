@@ -1367,6 +1367,9 @@ void CPlayerGun::UpdateNormalShotCycle(float dt, CStateManager& mgr) {
 #ifdef TARGET_PC
   if (!x833_29_pointBlankWorldSurface) {
     PortShotFromDrawnMuzzle(mgr, xf);
+    if (!mPortPointerAimValid) {
+      PortThirdPerson::AimShot(mgr, xf);
+    }
   }
 #endif
 
@@ -1442,6 +1445,9 @@ void CPlayerGun::FireSecondary(float dt, CStateManager& mgr) {
 #ifdef TARGET_PC
     if (!x833_29_pointBlankWorldSurface) {
       PortShotFromDrawnMuzzle(mgr, xf);
+      if (!mPortPointerAimValid) {
+        PortThirdPerson::AimShot(mgr, xf);
+      }
     }
 #endif
 

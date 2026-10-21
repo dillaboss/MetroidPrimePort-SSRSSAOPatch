@@ -697,8 +697,12 @@ const PrimePose& Player::Update(const Input& in) {
   }
   if (morphWeight > 0.f) {
     layer(all, 1.f - morphWeight);
+    // Paced by the game's transition when it says how far along it is.
+    const float morphClipTime = in.morphProgress >= 0.f
+                                    ? std::clamp(in.morphProgress, 0.f, 1.f) * morph->duration
+                                    : mMorphTime;
     all.push_back(
-        {morph, kMorphs[mMorphState - 1], std::min(mMorphTime, morph->duration), morphWeight});
+        {morph, kMorphs[mMorphState - 1], std::min(morphClipTime, morph->duration), morphWeight});
   }
   for (const Contribution& c : all) {
     if (c.weight > 1e-4f) {

@@ -490,7 +490,13 @@
   follows aim bends up to two spine bones, found by name ("spine", "chest",
   "torso") and logged at the first use with every bone of the skeleton, by half
   the view's pitch.
-  "Compare with Echoes' Samus..." (desktop; or `--echoes-report <image>` on the
+  "Animations from Metroid Prime 2: Echoes" (desktop): "Choose Echoes image..."
+  keeps the user's own GameCube Echoes image (`echoes_image`) and switches
+  "Echoes animations" on; the image's name shows with a "Change..." button, and
+  a status line says whether the animations are being read, ready or playing
+  (with any not on the image), or why they could not be read. They are read as
+  soon as the option is on, before play. Under "Diagnostics", "Write animation
+  report" (or `--echoes-report <image>` on the
   command line) reads the user's own Metroid Prime 2: Echoes image (GameCube,
   G2M...) and the port's Prime disc and writes `echoes_skeleton_report.txt` in
   the user folder: the Samus characters each game has, their skeletons side by
@@ -505,7 +511,7 @@
   translations in the parent's unrotated or bound frame) by keeping the feet on
   the floor, the head at its height standing and the planted foot from sliding,
   with joint positions of the two best for a look at the figure.
-  "Echoes animations" (once an Echoes image has been picked there) plays Echoes'
+  "Echoes animations" plays Echoes'
   Samus locomotion on Prime's body in third person
   (`platform/port_echoes_locomotion.cpp`): standing, walk/jog/run forwards and
   backwards and strafing, blended by speed and direction with a shared stride
@@ -533,6 +539,14 @@
   ratio) and only then does the playback speed up (up to twice), so the feet
   keep closer to the ground's speed. The root's turn is left to the player, as
   Prime's own animations leave it.
+  Behind her, each shot leaves the muzzle for the point under the crosshair
+  (what the eyes' ray meets, which the camera looks at;
+  PortThirdPerson::AimShot) rather than parallel to the eyes' ray, which from
+  the shoulder misses it; a lock and pointer aim aim as before. Into and out of
+  the morph ball the view moves between the shoulder and the ball camera with
+  the transition's progress (holding behind her until first person resumes)
+  instead of cutting to Samus's eyes, where the game's own camera starts and
+  ends; Echoes' curl and stand-up clips are paced by the same progress.
   Names and numbers only; no game data is copied. It is the first step towards
   playing Echoes' locomotion animations on Prime's body. Echoes' PAKs keep
   Prime's table layout but compress with LZO1X in 0x4000-byte segments

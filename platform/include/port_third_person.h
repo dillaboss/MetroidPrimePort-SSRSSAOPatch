@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 class CPlayer;
 class CStateManager;
@@ -34,12 +35,27 @@ bool ShowBody();
 // CPortActorRenderScope). False (and `out` untouched) while there is no motion to apply.
 bool BodyView(const CPlayer& player, const CTransform4f& view, CTransform4f& out);
 
+// A shot's start (camera-relative, as CPlayerGun builds it) turned to head for the point under the
+// crosshair while the view is behind her: from the shoulder the first-person gun's own direction,
+// parallel to the eyes' ray, misses it. Left alone without the view, under a lock (the shot homes
+// as usual) or when that point is not ahead of the muzzle.
+void AimShot(const CStateManager& mgr, CTransform4f& xf);
+
 // A shot left the arm cannon (CPlayerGun): 0 a normal shot, 1 a missile or combo, 2 a charged
 // shot. Echoes' animations play a recoil for it.
 void NoteShot(int strength);
 
-// Echoes' animations: loading, playing (with how their keys are read and what is blending), or
-// why not. Empty while they are off.
-std::string EchoesAnimationStatus();
+// Echoes' animations, read from the user's Echoes image on a thread of their own, once per image.
+// The settings start the read while the option is on, so they are ready before play.
+void LoadEchoesAnimations(const std::string& path);
+struct EchoesAnimationState {
+  enum class Phase { None, Loading, Ready, Failed };
+  Phase phase = Phase::None; // None: never asked for
+  std::string message;       // Failed: why
+  size_t clips = 0;          // Ready: how many animations were read
+  std::vector< std::string > missing; // Ready: the ones the image did not have
+  bool playing = false;               // Ready and posing Samus now
+};
+EchoesAnimationState EchoesAnimations();
 
 } // namespace PortThirdPerson

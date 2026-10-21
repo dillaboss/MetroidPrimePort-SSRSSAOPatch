@@ -667,7 +667,7 @@ std::vector<std::pair<int, std::string>> sRemasteredPicks;
 // Which 2 of the same picker: a PAL image for its languages (DrawLanguageSection).
 constexpr int kPalLanguagesPick = 2;
 std::string sPalLanguagesPick;
-// And an Echoes image for the third-person skeleton report (DrawVideoDisplay); desktop only.
+// And an Echoes image for the third-person animations (DrawVideoDisplay); desktop only.
 constexpr int kEchoesPick = 3;
 std::string sEchoesPick;
 

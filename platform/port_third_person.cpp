@@ -73,6 +73,14 @@ float sWeight = 0.f;    // 0 first person, 1 fully behind; eases in when the cam
 float sBoom = 0.f;      // how far back the camera sits along its arm, after walls
 float sConverge = 20.f; // distance ahead at which the crosshair ray and the camera's centre meet
 bool sFresh = true;     // the next active frame starts the smoothing over
+// The morph ball's way in and out: the view moves between the shoulder and the ball camera with
+// the transition, instead of cutting to Samus's eyes (where the game's own camera starts and ends).
+enum class Handoff { None, IntoBall, OutOfBall };
+Handoff sHandoff = Handoff::None;
+CTransform4f sHandoffView = CTransform4f::Identity(); // the shoulder end of the blend
+float sHandoffT = 0.f;                                // 0 at the shoulder end
+bool sResumeBehind = false; // out of the ball: start behind her, not eased out of the helmet
+float sResumeWait = 0.f;    // how long the view has held behind her for first person to return
 std::chrono::steady_clock::time_point sLastFrame;
 
 float FrameDt() {
@@ -223,6 +231,36 @@ void BendSpine(CAnimData& anim, float bend) {
   sSpineBent = true;
 }
 
+// Between two views: places and headings blended, kept upright.
+CTransform4f BlendView(const CTransform4f& a, const CTransform4f& b, float t) {
+  const CVector3f pos = a.GetTranslation() * (1.f - t) + b.GetTranslation() * t;
+  CVector3f forward = a.GetForward() * (1.f - t) + b.GetForward() * t;
+  if (!forward.CanBeNormalized()) {
+    forward = b.GetForward();
+  }
+  return CTransform4f::LookAt(pos, pos + forward.AsNormalized(), CVector3f(0.f, 0.f, 1.f));
+}
+
+float SmoothStep01(float x) {
+  x = Clamp(x, 0.f, 1.f);
+  return x * x * (3.f - 2.f * x);
+}
+
+// The shoulder view from `eye` looking along `forward` (no easing): the arm stopped short of walls,
+// looking at what the eye's ray meets.
+CTransform4f ShoulderView(const CStateManager& mgr, const PortDebug::ThirdPersonSettings& s, const CVector3f& eye,
+                          const CVector3f& forward, const CVector3f& right) {
+  const CVector3f arm = forward * -s.distance + right * s.shoulder + CVector3f(0.f, 0.f, s.height);
+  const float armLength = arm.Magnitude();
+  CVector3f camPos = eye;
+  if (armLength > 0.01f) {
+    const CVector3f armDir = arm * (1.f / armLength);
+    camPos = eye + armDir * std::max(RayDistance(mgr, eye, armDir, armLength + 0.35f) - 0.35f, 0.f);
+  }
+  const float converge = std::max(RayDistance(mgr, eye, forward, 80.f), 3.f);
+  return CTransform4f::LookAt(camPos, eye + forward * converge, CVector3f(0.f, 0.f, 1.f));
+}
+
 // Interpolated between the last two ticks, as everything else on screen is.
 Motion PresentedMotion() {
   const float t = CCameraManager::GetPresentationInterpolation();
@@ -256,7 +294,7 @@ struct EchoesLoad {
   bool loading = false;
   std::string error;
   std::shared_ptr< const PortEchoesLocomotion::Library > library;
-  std::string status; // for the settings, written each tick
+  bool playing = false; // posing the body now
 };
 
 // Never destroyed: the loading thread may still hold it at exit.
@@ -317,10 +355,10 @@ std::vector< CVector3f > sEchoesBaseOffset;
 bool sEchoesDriving = false;
 int sPendingShot = -1; // the strongest shot since the last tick, for the recoil
 
-void SetEchoesStatus(const std::string& status) {
+void SetEchoesPlaying(bool playing) {
   EchoesLoad& load = Echoes();
   std::lock_guard lock(load.mutex);
-  load.status = status;
+  load.playing = playing;
 }
 
 // Prime's skeleton as the body's layout has it, by name.
@@ -358,6 +396,7 @@ void StopEchoes(CAnimData* anim) {
   }
   if (sEchoesDriving) {
     sEchoesPlayer.Reset();
+    SetEchoesPlaying(false);
   }
   sEchoesDriving = false;
 }
@@ -369,7 +408,8 @@ struct EchoesEvents {
   bool jumped = false;
   bool doubleJumped = false;
   bool dashing = false;
-  int morph = 0; // 1 curling into the ball, 2 standing up out of it
+  int morph = 0;             // 1 curling into the ball, 2 standing up out of it
+  float morphProgress = 0.f; // the transition's, 0..1
 };
 bool sEchoesWasOnGround = true;
 float sEchoesPrevUpSpeed = 0.f;
@@ -379,7 +419,6 @@ bool DriveEchoes(CAnimData& anim, const CPlayer& player, float dt, float forward
                  const PortDebug::ThirdPersonSettings& s) {
   const std::string path = PortDebug::EchoesImagePath();
   if (path.empty()) {
-    SetEchoesStatus("Pick your Echoes image with the button above first.");
     return false;
   }
   RequestEchoes(path);
@@ -388,7 +427,6 @@ bool DriveEchoes(CAnimData& anim, const CPlayer& player, float dt, float forward
     EchoesLoad& load = Echoes();
     std::lock_guard lock(load.mutex);
     if (load.library == nullptr) {
-      load.status = load.loading ? "Reading Echoes' animations..." : "Echoes' animations: " + load.error;
       return false;
     }
     library = load.library;
@@ -445,6 +483,7 @@ bool DriveEchoes(CAnimData& anim, const CPlayer& player, float dt, float forward
   in.doubleJumped = events.doubleJumped;
   in.dashing = events.dashing;
   in.morph = events.morph;
+  in.morphProgress = events.morphProgress;
   if (sPendingShot >= 0) {
     sEchoesPlayer.Shoot(sPendingShot);
     sPendingShot = -1;
@@ -461,14 +500,7 @@ bool DriveEchoes(CAnimData& anim, const CPlayer& player, float dt, float forward
   anim.SetPoseBuilderValid(false);
   sEchoesDriving = true;
 
-  std::string status = "Playing Echoes' animations.";
-  if (!library->missing.empty()) {
-    status += " Not found:";
-    for (const std::string& name : library->missing) {
-      status += " " + name;
-    }
-  }
-  SetEchoesStatus(status);
+  SetEchoesPlaying(true);
   return true;
 }
 
@@ -485,14 +517,53 @@ void UpdateFrame(const CStateManager& mgr) {
   const bool fpCamera = player != nullptr && cameras != nullptr && !PortFreeCam::Active() &&
                         cameras->IsInFPCamera() && !cameras->IsInCinematicCamera() &&
                         player->GetCameraState() == CPlayer::kCS_FirstPerson &&
-                        player->GetMorphballTransitionState() != CPlayer::kMS_Morphed;
+                        player->GetMorphballTransitionState() == CPlayer::kMS_Unmorphed;
   if (!fpCamera) {
+    // Curling into the ball from behind her, the view goes from the shoulder to the ball camera
+    // as the transition runs; standing up out of it, from the ball camera to the shoulder.
+    const CPlayer::EPlayerMorphBallState morph =
+        player != nullptr ? player->GetMorphballTransitionState() : CPlayer::kMS_Unmorphed;
+    const bool handoffAllowed = s.enabled && player != nullptr && cameras != nullptr && !PortFreeCam::Active() &&
+                                !cameras->IsInCinematicCamera();
+    if (handoffAllowed && morph == CPlayer::kMS_Morphing && (sActive || sHandoff == Handoff::IntoBall)) {
+      if (sHandoff != Handoff::IntoBall) {
+        sHandoff = Handoff::IntoBall;
+        sHandoffView = sView;
+      }
+      sHandoffT = SmoothStep01(player->GetMorphBallTransitionFactor());
+    } else if (handoffAllowed && (morph == CPlayer::kMS_Unmorphing ||
+                                  (morph == CPlayer::kMS_Unmorphed && sResumeBehind && sResumeWait < 1.f))) {
+      // (Stood up, the game's camera can take a frame or two to be first person again: the view
+      // holds behind her meanwhile.)
+      sHandoff = Handoff::OutOfBall;
+      CVector3f forward = player->GetTransform().GetForward();
+      forward = CVector3f(forward.GetX(), forward.GetY(), 0.f);
+      if (forward.CanBeNormalized()) {
+        forward = forward.AsNormalized();
+        const CVector3f right(forward.GetY(), -forward.GetX(), 0.f);
+        sHandoffView = ShoulderView(mgr, s, player->GetEyePosition(), forward, right);
+      }
+      sHandoffT = morph == CPlayer::kMS_Unmorphing ? 1.f - SmoothStep01(player->GetMorphBallTransitionFactor())
+                                                   : 0.f;
+      sResumeWait = morph == CPlayer::kMS_Unmorphing ? 0.f : sResumeWait + dt;
+      sResumeBehind = true;
+    } else {
+      sHandoff = Handoff::None;
+      sResumeBehind = false;
+    }
     sWeight = 0.f;
     sActive = false;
     sShowBody = false;
     sFresh = true;
     return;
   }
+  sHandoff = Handoff::None;
+  // Out of the ball, the view is already behind her: no easing out of the helmet.
+  if (sResumeBehind && s.enabled) {
+    sWeight = 1.f;
+    sFresh = true;
+  }
+  sResumeBehind = false;
   // Switched on: eases back over about a third of a second. Switched off: eases in to the eyes.
   sWeight = Clamp(sWeight + (s.enabled ? dt : -dt) / 0.3f, 0.f, 1.f);
   if (sWeight <= 0.f) {
@@ -560,18 +631,15 @@ void Tick(float dt, CPlayer& player, CStateManager& mgr) {
   CAnimData* anim = player.HasAnimation() ? player.AnimationData() : nullptr;
   const CPlayer::EPlayerMorphBallState morphState = player.GetMorphballTransitionState();
   const bool upright = morphState == CPlayer::kMS_Unmorphed;
-  // Echoes' animations, already playing, see the morph ball's way in and out through.
-  const bool morphing = (morphState == CPlayer::kMS_Morphing || morphState == CPlayer::kMS_Unmorphing) &&
-                        s.echoesAnims && sEchoesDriving;
+  // Echoes' animations play the morph ball's way in and out too.
+  const bool morphing =
+      (morphState == CPlayer::kMS_Morphing || morphState == CPlayer::kMS_Unmorphing) && s.echoesAnims;
   if (!s.enabled || !(upright || morphing) || dt <= 0.f) {
     if (anim != nullptr) {
       RestoreSpine(*anim);
     }
     StopEchoes(anim);
     sPendingShot = -1;
-    if (!s.echoesAnims || !s.enabled) {
-      SetEchoesStatus("");
-    }
     ResetMotion();
     return;
   }
@@ -625,10 +693,10 @@ void Tick(float dt, CPlayer& player, CStateManager& mgr) {
     sEchoesPrevUpSpeed = upSpeed;
     events.dashing = player.IsSidewaysDashing();
     events.morph = morphState == CPlayer::kMS_Morphing ? 1 : morphState == CPlayer::kMS_Unmorphing ? 2 : 0;
+    events.morphProgress = player.GetMorphBallTransitionFactor();
     echoes = DriveEchoes(*anim, player, dt, forwardSpeed, sideSpeed, onGround, aimPitch, aimYaw, events, s);
   } else {
     StopEchoes(anim);
-    SetEchoesStatus("");
   }
   sPendingShot = -1;
 
@@ -698,15 +766,72 @@ void Tick(float dt, CPlayer& player, CStateManager& mgr) {
 
 bool Active() { return sActive; }
 
-void NoteShot(int strength) { sPendingShot = std::max(sPendingShot, strength); }
-
-std::string EchoesAnimationStatus() {
-  EchoesLoad& load = Echoes();
-  std::lock_guard lock(load.mutex);
-  return load.status;
+void AimShot(const CStateManager& mgr, CTransform4f& xf) {
+  const CPlayer* player = mgr.GetPlayer();
+  const CCameraManager* cameras = mgr.GetCameraManager();
+  if (!sActive || player == nullptr || cameras == nullptr || player->GetOrbitTargetId() != kInvalidUniqueId) {
+    return;
+  }
+  const CTransform4f eyeXf = cameras->GetCurrentCameraTransform(mgr);
+  CVector3f forward = eyeXf.GetForward();
+  if (!forward.CanBeNormalized()) {
+    return;
+  }
+  forward = forward.AsNormalized();
+  const CVector3f eye = eyeXf.GetTranslation();
+  // The crosshair sits on what the eyes' ray meets (UpdateFrame looks the camera at it).
+  const CVector3f target = eye + forward * std::max(RayDistance(mgr, eye, forward, 80.f), 3.f);
+  const CVector3f toTarget = target - (xf.GetTranslation() + cameras->GetGlobalCameraTranslation(mgr));
+  if (!toTarget.CanBeNormalized() || CVector3f::Dot(toTarget, forward) < 0.5f * toTarget.Magnitude()) {
+    return;
+  }
+  const CVector3f start = xf.GetTranslation();
+  xf = CTransform4f::LookAt(CVector3f::Zero(), toTarget);
+  xf.SetTranslation(start);
 }
 
-CTransform4f View(const CTransform4f& game) { return sActive ? sView : game; }
+void NoteShot(int strength) { sPendingShot = std::max(sPendingShot, strength); }
+
+void LoadEchoesAnimations(const std::string& path) {
+  if (!path.empty()) {
+    RequestEchoes(path);
+  }
+}
+
+EchoesAnimationState EchoesAnimations() {
+  EchoesLoad& load = Echoes();
+  std::lock_guard lock(load.mutex);
+  EchoesAnimationState state;
+  if (load.path.empty()) {
+    return state;
+  }
+  if (load.loading) {
+    state.phase = EchoesAnimationState::Phase::Loading;
+  } else if (load.library != nullptr) {
+    state.phase = EchoesAnimationState::Phase::Ready;
+    state.clips = load.library->clips.size();
+    state.missing = load.library->missing;
+    state.playing = load.playing;
+  } else {
+    state.phase = EchoesAnimationState::Phase::Failed;
+    state.message = load.error;
+  }
+  return state;
+}
+
+CTransform4f View(const CTransform4f& game) {
+  if (sActive) {
+    return sView;
+  }
+  switch (sHandoff) {
+  case Handoff::IntoBall:
+  case Handoff::OutOfBall:
+    // sHandoffT: 0 at the shoulder, 1 at the game's (ball) camera.
+    return BlendView(sHandoffView, game, sHandoffT);
+  default:
+    return game;
+  }
+}
 
 bool ShowBody() { return sActive && sShowBody; }
 
