@@ -65,14 +65,64 @@ SystemMemory ReadSystem() {
 
 long long Mib(int64_t kb) { return kb < 0 ? -1 : static_cast< long long >(kb / 1024); }
 
+// Pipeline retention under memory pressure (SetPipelinePressure). The check reuses Tick's
+// once-a-second /proc/meminfo sample, so it reads nothing of its own; a trim only raises Aurora's
+// request flag, and the eviction runs at the next frame start, as onTrimMemory's does.
+constexpr uint64_t kPressurePollNs = 5 * kSampleNs;
+// A level that holds trims again this often, so a moderate trim catches what went idle since.
+constexpr uint64_t kPressureRepeatNs = 30 * kSampleNs;
+constexpr uint32_t kModerateIdleFrames = 3600; // a minute at 60 fps: areas left a while ago
+constexpr uint32_t kSevereIdleFrames = 16;     // everything this frame and the last few don't draw
+int64_t sPressureModerateKb = 0;
+int64_t sPressureSevereKb = 0;
+
+void CheckPipelinePressure(uint64_t nowNs, int64_t availableKb) {
+  static uint64_t sLastPollNs = 0;
+  static uint64_t sLastTrimNs = 0;
+  static int sLastLevel = 0;
+  if ((sPressureModerateKb <= 0 && sPressureSevereKb <= 0) || availableKb < 0 ||
+      (sLastPollNs != 0 && nowNs - sLastPollNs < kPressurePollNs)) {
+    return;
+  }
+  sLastPollNs = nowNs;
+  const int level = sPressureSevereKb > 0 && availableKb < sPressureSevereKb       ? 2
+                    : sPressureModerateKb > 0 && availableKb < sPressureModerateKb ? 1
+                                                                                   : 0;
+  if (level == 0) {
+    sLastLevel = 0;
+    return;
+  }
+  if (level <= sLastLevel && nowNs - sLastTrimNs < kPressureRepeatNs) {
+    return;
+  }
+  sLastLevel = level;
+  sLastTrimNs = nowNs;
+  const uint32_t idle = level == 2 ? kSevereIdleFrames : kModerateIdleFrames;
+  // Aurora's "pipeline cache: evicted N" line at the next frame start gives the count.
+  PortLog::Write("port: memory pressure: %s, system %lld MiB available (under %lld): trimming pipelines unused "
+                 "for %u frames\n",
+                 level == 2 ? "severe" : "moderate", Mib(availableKb),
+                 Mib(level == 2 ? sPressureSevereKb : sPressureModerateKb), idle);
+  aurora_trim_pipelines(idle);
+}
+
 void WriteLine(int64_t processKb, const SystemMemory& system, bool textures) {
-  char gpu[128] = "";
+  char gpu[320] = "";
   if (textures) {
     AuroraTextureStats stats{};
     aurora_get_texture_stats(&stats);
-    std::snprintf(gpu, sizeof(gpu), ", textures %u (%llu MiB), targets %u (%llu MiB)", stats.count[0],
-                  static_cast< unsigned long long >(stats.bytes[0] >> 20), stats.count[1],
-                  static_cast< unsigned long long >(stats.bytes[1] >> 20));
+    int n = std::snprintf(gpu, sizeof(gpu), ", textures %u (%llu MiB), targets %u (%llu MiB), lighting %u (%llu MiB)",
+                          stats.count[0], static_cast< unsigned long long >(stats.bytes[0] >> 20), stats.count[1],
+                          static_cast< unsigned long long >(stats.bytes[1] >> 20), stats.count[2],
+                          static_cast< unsigned long long >(stats.bytes[2] >> 20));
+    AuroraDawnMemory dawn{};
+    if (n > 0 && static_cast< size_t >(n) < sizeof(gpu) && aurora_get_dawn_memory(&dawn)) {
+      std::snprintf(gpu + n, sizeof(gpu) - n, ", dawn %llu MiB (textures %llu, buffers %llu, allocated %llu)",
+                    static_cast< unsigned long long >(dawn.total >> 20),
+                    static_cast< unsigned long long >(dawn.textures >> 20),
+                    static_cast< unsigned long long >(dawn.buffers >> 20),
+                    static_cast< unsigned long long >(dawn.allocatorAllocated >> 20));
+    }
   }
   PortLog::Write("port: memory: process %lld MiB, system %lld of %lld MiB available%s\n", Mib(processKb),
                  Mib(system.availableKb), Mib(system.totalKb), gpu);
@@ -115,9 +165,61 @@ void LogPreviousExit() {
     PortLog::Write("%s\n", report.c_str());
   }
 }
+
+// MetroidPrimeActivity.lowRamDevice(), set in onCreate.
+bool ActivityLowRam() {
+  JNIEnv* env = static_cast< JNIEnv* >(SDL_GetAndroidJNIEnv());
+  jobject activity = static_cast< jobject >(SDL_GetAndroidActivity());
+  if (env == nullptr || activity == nullptr) {
+    return false;
+  }
+  bool low = false;
+  jclass cls = env->GetObjectClass(activity);
+  jmethodID method = cls != nullptr ? env->GetStaticMethodID(cls, "lowRamDevice", "()Z") : nullptr;
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    method = nullptr;
+  }
+  if (method != nullptr) {
+    low = env->CallStaticBooleanMethod(cls, method) == JNI_TRUE;
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+      low = false;
+    }
+  }
+  if (cls != nullptr) {
+    env->DeleteLocalRef(cls);
+  }
+  env->DeleteLocalRef(activity);
+  return low;
+}
 #endif
 
 } // namespace
+
+#if defined(__ANDROID__)
+bool LowRamDevice(char* why, size_t whySize) {
+  constexpr int64_t kLowRamKb = 4096ll * 1024;
+  const int64_t totalKb = ReadSystem().totalKb;
+  if (ActivityLowRam()) {
+    std::snprintf(why, whySize, "ActivityManager.isLowRamDevice()");
+    return true;
+  }
+  if (totalKb > 0 && totalKb < kLowRamKb) {
+    std::snprintf(why, whySize, "%lld MiB of RAM, under 4096", Mib(totalKb));
+    return true;
+  }
+  std::snprintf(why, whySize, "%lld MiB of RAM", Mib(totalKb));
+  return false;
+}
+#else
+bool LowRamDevice(char* why, size_t whySize) {
+  if (whySize != 0) {
+    why[0] = '\0';
+  }
+  return false;
+}
+#endif
 
 void LogStartup() {
 #if defined(__ANDROID__)
@@ -137,6 +239,7 @@ void Tick(uint64_t nowNs) {
   sLastSampleNs = nowNs;
   const int64_t processKb = ProcessKb();
   const SystemMemory system = ReadSystem();
+  CheckPipelinePressure(nowNs, system.availableKb);
   const bool due = sLastLineNs == 0 || nowNs - sLastLineNs >= kPeriodNs ||
                    std::llabs(processKb - sLineProcessKb) >= kProcessJumpKb ||
                    std::llabs(system.availableKb - sLineAvailableKb) >= kSystemJumpKb;
@@ -149,9 +252,25 @@ void Tick(uint64_t nowNs) {
   WriteLine(processKb, system, true);
 }
 #else
+bool LowRamDevice(char* why, size_t whySize) {
+  if (whySize != 0) {
+    why[0] = '\0';
+  }
+  return false;
+}
 void LogStartup() {}
 void Tick(uint64_t) {}
 #endif
+
+void SetPipelinePressure(int64_t moderateMib, int64_t severeMib) {
+#if defined(__linux__)
+  sPressureModerateKb = moderateMib > 0 ? moderateMib * 1024 : 0;
+  sPressureSevereKb = severeMib > 0 ? severeMib * 1024 : 0;
+#else
+  (void)moderateMib;
+  (void)severeMib;
+#endif
+}
 } // namespace PortMemoryLog
 
 #if defined(__ANDROID__)
@@ -176,5 +295,11 @@ extern "C" JNIEXPORT void JNICALL Java_org_metroidprime_port_MetroidPrimeActivit
                  name, static_cast< int >(level), PortMemoryLog::Mib(PortMemoryLog::ProcessKb()),
                  static_cast< long long >(availableKb / 1024), static_cast< long long >(thresholdKb / 1024),
                  low ? " (system is low on memory)" : "");
+  // Running low or critical, or the app is in the background: release built pipelines no recent frame
+  // drew with (issue #162). The frame loop does it at the next frame start; they rebuild on demand.
+  if (level == -1 || level >= 10) {
+    aurora_trim_pipelines(16);
+    aurora_reduce_gpu_memory();
+  }
 }
 #endif

@@ -10,6 +10,7 @@
 #include "../gx/gx_fmt.hpp"
 
 #include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
 
 #include "texture_convert.hpp"
 #include "hdr_tone.hpp"
@@ -32,6 +33,7 @@ static constexpr std::string_view ShaderPreamble = R"(
 struct UVTransform {
     offset: vec2f,
     scale: vec2f,
+    opaque_alpha: u32,
 };
 @group(0) @binding(2) var<uniform> uv_xf: UVTransform;
 
@@ -56,6 +58,11 @@ var<private> uvs: array<vec2f, 3> = array(
     out.pos = vec4f(positions[vi], 0.0, 1.0);
     out.uv = uvs[vi] * uv_xf.scale + uv_xf.offset;
     return out;
+}
+
+fn sample_efb(uv: vec2f) -> vec4f {
+    let c = textureSample(src, src_samp, uv);
+    return vec4f(c.rgb, select(c.a, 1.0, uv_xf.opaque_alpha != 0u));
 }
 
 fn intensity(rgb: vec3f) -> f32 {
@@ -119,14 +126,36 @@ fn gx_z24(uv: vec2f) -> u32 {
 // Passthrough blit (for scaling)
 static constexpr std::string_view FragPassthrough = R"(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    return textureSample(src, src_samp, in.uv);
+    return sample_efb(in.uv);
+}
+)"sv;
+
+// DisplayLinear: the four texels a bilinear tap mixes, each sRGB-decoded first, as a sampler
+// reading an sRGB texture does.
+static constexpr std::string_view FragDisplayLinear = R"(
+fn srgb_decode(c: vec4f) -> vec4f {
+    let rgb = select(pow((c.rgb + 0.055) / 1.055, vec3f(2.4)), c.rgb / 12.92, c.rgb <= vec3f(0.04045));
+    return vec4f(rgb, select(c.a, 1.0, uv_xf.opaque_alpha != 0u));
+}
+
+@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
+    let size = vec2i(textureDimensions(src));
+    let p = in.uv * vec2f(size) - 0.5;
+    let base = vec2i(floor(p));
+    let f = fract(p);
+    let hi = size - vec2i(1);
+    let t00 = srgb_decode(textureLoad(src, clamp(base, vec2i(0), hi), 0));
+    let t10 = srgb_decode(textureLoad(src, clamp(base + vec2i(1, 0), vec2i(0), hi), 0));
+    let t01 = srgb_decode(textureLoad(src, clamp(base + vec2i(0, 1), vec2i(0), hi), 0));
+    let t11 = srgb_decode(textureLoad(src, clamp(base + vec2i(1, 1), vec2i(0), hi), 0));
+    return mix(mix(t00, t10, f.x), mix(t01, t11, f.x), f.y);
 }
 )"sv;
 
 // GX_TF_I4: 4-bit intensity -> R8Unorm (quantized)
 static constexpr std::string_view FragI4 = R"(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let rgb = textureSample(src, src_samp, in.uv).rgb;
+    let rgb = sample_efb(in.uv).rgb;
     let i = quantize4(intensity(rgb));
     return vec4f(i, i, i, i);
 }
@@ -135,7 +164,7 @@ static constexpr std::string_view FragI4 = R"(
 // GX_TF_I8: 8-bit intensity -> R8Unorm
 static constexpr std::string_view FragI8 = R"(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let rgb = textureSample(src, src_samp, in.uv).rgb;
+    let rgb = sample_efb(in.uv).rgb;
     let i = intensity(rgb);
     return vec4f(i, i, i, i);
 }
@@ -144,7 +173,7 @@ static constexpr std::string_view FragI8 = R"(
 // GX_TF_IA4: 4-bit intensity + 4-bit alpha -> RG8Unorm
 static constexpr std::string_view FragIA4 = R"(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let c = textureSample(src, src_samp, in.uv);
+    let c = sample_efb(in.uv);
     let i = quantize4(intensity(c.rgb));
     let a = quantize4(c.a);
     return vec4f(i, i, i, a);
@@ -154,7 +183,7 @@ static constexpr std::string_view FragIA4 = R"(
 // GX_TF_IA8: 8-bit intensity + 8-bit alpha -> RG8Unorm
 static constexpr std::string_view FragIA8 = R"(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let c = textureSample(src, src_samp, in.uv);
+    let c = sample_efb(in.uv);
     let i = intensity(c.rgb);
     return vec4f(i, i, i, c.a);
 }
@@ -163,7 +192,7 @@ static constexpr std::string_view FragIA8 = R"(
 // GX_TF_RGB565: Blit alpha to 1.0
 static constexpr std::string_view FragRGB565 = R"(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let c = textureSample(src, src_samp, in.uv);
+    let c = sample_efb(in.uv);
     return vec4f(c.rgb, 1.0);
 }
 )"sv;
@@ -171,7 +200,7 @@ static constexpr std::string_view FragRGB565 = R"(
 // GX_CTF_R4: 4-bit red -> R8Unorm
 static constexpr std::string_view FragR4 = R"(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let r = quantize4(textureSample(src, src_samp, in.uv).r);
+    let r = quantize4(sample_efb(in.uv).r);
     return vec4f(r, r, r, r);
 }
 )"sv;
@@ -179,7 +208,7 @@ static constexpr std::string_view FragR4 = R"(
 // GX_CTF_RA4: 4-bit red + 4-bit alpha -> RG8Unorm
 static constexpr std::string_view FragRA4 = R"(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let c = textureSample(src, src_samp, in.uv);
+    let c = sample_efb(in.uv);
     let r = quantize4(c.r);
     return vec4f(r, r, r, quantize4(c.a));
 }
@@ -188,7 +217,7 @@ static constexpr std::string_view FragRA4 = R"(
 // GX_CTF_RA8: 8-bit red + 8-bit alpha -> RG8Unorm
 static constexpr std::string_view FragRA8 = R"(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let c = textureSample(src, src_samp, in.uv);
+    let c = sample_efb(in.uv);
     return vec4f(c.r, c.r, c.r, c.a);
 }
 )"sv;
@@ -196,7 +225,7 @@ static constexpr std::string_view FragRA8 = R"(
 // GX_CTF_A8: 8-bit alpha -> R8Unorm
 static constexpr std::string_view FragA8 = R"(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let a = textureSample(src, src_samp, in.uv).a;
+    let a = sample_efb(in.uv).a;
     return vec4f(a, a, a, a);
 }
 )"sv;
@@ -204,7 +233,7 @@ static constexpr std::string_view FragA8 = R"(
 // GX_CTF_R8: 8-bit red -> R8Unorm
 static constexpr std::string_view FragR8 = R"(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let r = textureSample(src, src_samp, in.uv).r;
+    let r = sample_efb(in.uv).r;
     return vec4f(r, r, r, r);
 }
 )"sv;
@@ -212,7 +241,7 @@ static constexpr std::string_view FragR8 = R"(
 // GX_CTF_G8: 8-bit green -> R8Unorm
 static constexpr std::string_view FragG8 = R"(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let g = textureSample(src, src_samp, in.uv).g;
+    let g = sample_efb(in.uv).g;
     return vec4f(g, g, g, g);
 }
 )"sv;
@@ -220,7 +249,7 @@ static constexpr std::string_view FragG8 = R"(
 // GX_CTF_B8: 8-bit blue -> R8Unorm
 static constexpr std::string_view FragB8 = R"(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let b = textureSample(src, src_samp, in.uv).b;
+    let b = sample_efb(in.uv).b;
     return vec4f(b, b, b, b);
 }
 )"sv;
@@ -228,7 +257,7 @@ static constexpr std::string_view FragB8 = R"(
 // GX_CTF_RG8: 8-bit red + 8-bit green -> RG8Unorm
 static constexpr std::string_view FragRG8 = R"(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let c = textureSample(src, src_samp, in.uv);
+    let c = sample_efb(in.uv);
     return vec4f(c.r, c.r, c.r, c.g);
 }
 )"sv;
@@ -236,7 +265,7 @@ static constexpr std::string_view FragRG8 = R"(
 // GX_CTF_GB8: 8-bit green + 8-bit blue -> RG8Unorm
 static constexpr std::string_view FragGB8 = R"(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let c = textureSample(src, src_samp, in.uv);
+    let c = sample_efb(in.uv);
     return vec4f(c.g, c.g, c.g, c.b);
 }
 )"sv;
@@ -298,6 +327,59 @@ var<private> positions: array<vec2f, 3> = array(
 }
 )"sv;
 
+// Compatibility devices forbid textureLoad on depth textures and non-comparison samplers on them.
+// mp_depth_load (CompatDepthLoad) reads the exact stored depth through a comparison sampler.
+static constexpr std::string_view CompatDepthLoad = R"(
+// Compatibility: textureLoad on a depth texture is rejected, and a depth texture takes only comparison samplers.
+// The stored depth is recovered exactly instead: the largest float ref in [0,1] with ref <= depth, by a binary
+// search over the float bit pattern (non-negative floats order like their bits) with a LessEqual comparison.
+fn mp_depth_load(t: texture_depth_2d, s: sampler_comparison, px: vec2i) -> f32 {
+  let uv = (vec2f(px) + 0.5) / vec2f(textureDimensions(t));
+  var lo = 0u;
+  var hi = 0x3F800001u;
+  loop {
+    if (hi - lo <= 1u) { break; }
+    let mid = lo + (hi - lo) / 2u;
+    if (textureSampleCompareLevel(t, s, uv, bitcast<f32>(mid)) > 0.5) { lo = mid; } else { hi = mid; }
+  }
+  return bitcast<f32>(lo);
+}
+)"sv;
+
+static constexpr std::string_view DepthSnapshotShaderCompatHead = R"(
+@group(0) @binding(0) var src: texture_depth_2d;
+@group(0) @binding(1) var depth_samp: sampler_comparison;
+
+var<private> positions: array<vec2f, 3> = array(
+    vec2f(-1.0, 1.0),
+    vec2f(-1.0, -3.0),
+    vec2f(3.0, 1.0),
+);
+
+@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+    return vec4f(positions[vi], 0.0, 1.0);
+}
+
+@fragment fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+    let depth = mp_depth_load(src, depth_samp, vec2i(floor(pos.xy)));
+    return vec4f(depth, 0.0, 0.0, 1.0);
+}
+)"sv;
+
+std::string_view compat_depth_load_wgsl() noexcept { return CompatDepthLoad; }
+
+static std::string make_compat_depth_preamble() {
+  std::string out = DepthShaderPreamble;
+  const std::string load = "textureLoad(src, coord, 0)";
+  const std::string sample = "mp_depth_load(src, depth_samp, coord)";
+  for (size_t at = out.find(load); at != std::string::npos; at = out.find(load, at + sample.size())) {
+    out.replace(at, load.size(), sample);
+  }
+  out += "\n@group(0) @binding(2) var depth_samp: sampler_comparison;\n";
+  out += CompatDepthLoad;
+  return out;
+}
+
 struct ConvPipeline {
   GXTexFmt fmt;
   std::string_view fragShader;
@@ -329,7 +411,10 @@ static constexpr std::array DepthConvPipelines{
 
 static wgpu::BindGroupLayout g_bindGroupLayout;
 static wgpu::BindGroupLayout g_depthBindGroupLayout;
+static wgpu::BindGroupLayout g_depthBindGroupLayoutMS;
+static absl::flat_hash_map<GXTexFmt, wgpu::RenderPipeline> g_depthPipelinesMS; // Core devices only
 static wgpu::Sampler g_nearestSampler;
+static wgpu::Sampler g_depthCompareSampler; // Compatibility: LessEqual, for mp_depth_load
 static wgpu::Sampler g_linearSampler;
 static absl::flat_hash_map<GXTexFmt, wgpu::RenderPipeline> g_pipelines;
 static wgpu::RenderPipeline g_blitPipeline;
@@ -356,10 +441,16 @@ static wgpu::BindGroupLayout create_depth_snapshot_layout(bool multisampled, con
                   .multisampled = multisampled,
               },
       },
+      // Compatibility only: depth is read through a comparison sampler (see CompatDepthLoad)
+      wgpu::BindGroupLayoutEntry{
+          .binding = 1,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .sampler = wgpu::SamplerBindingLayout{.type = wgpu::SamplerBindingType::Comparison},
+      },
   };
   const wgpu::BindGroupLayoutDescriptor descriptor{
       .label = label,
-      .entryCount = entries.size(),
+      .entryCount = webgpu::g_hasCoreFeatures ? 1u : 2u,
       .entries = entries.data(),
   };
   return g_device.CreateBindGroupLayout(&descriptor);
@@ -487,7 +578,7 @@ static wgpu::BindGroupLayout hdr_bind_group_layout() {
         },
         wgpu::BindGroupLayoutEntry{
             .binding = 2,
-            .visibility = wgpu::ShaderStage::Vertex,
+            .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
             .buffer = wgpu::BufferBindingLayout{.type = wgpu::BufferBindingType::Uniform},
         },
         wgpu::BindGroupLayoutEntry{
@@ -511,18 +602,32 @@ static wgpu::BindGroupLayout hdr_bind_group_layout() {
 // A scaled HdrDisplay copy filters the light and post-tones the filtered sample, where an LDR copy
 // filters display values: the two are not filter-for-filter equal, by design (no exact copy-filter
 // parity is claimed; the curve is not linear, so they differ only where the filter mixes texels).
+// Once per kind and format: a copy with no pipeline is skipped (see run).
+static void warn_missing_pipeline(std::string_view kind, GXTexFmt fmt) {
+  static std::mutex mutex;
+  static absl::flat_hash_set<std::pair<std::string_view, GXTexFmt>> warned;
+  std::lock_guard lock{mutex};
+  if (warned.emplace(kind, fmt).second) {
+    Log.warn("No {} pipeline for format {}; copy not supported; skipped", kind, static_cast<int>(fmt));
+  }
+}
+
 static wgpu::RenderPipeline domain_pipeline(GXTexFmt fmt, CopyDomain domain, wgpu::TextureFormat outputFormat) {
   std::lock_guard lock{g_domainMutex};
   const auto key = std::make_tuple(fmt, domain, outputFormat);
   if (const auto it = g_domainPipelines.find(key); it != g_domainPipelines.end()) {
     return it->second;
   }
-  std::string_view frag = FragPassthrough;
+  std::string_view frag = domain == CopyDomain::DisplayLinear ? FragDisplayLinear : FragPassthrough;
+  if (domain == CopyDomain::DisplayLinear && fmt != GX_TF_RGBA8) {
+    warn_missing_pipeline("display linear copy", fmt);
+    return {};
+  }
   if (fmt != GX_TF_RGBA8) {
     const auto it = std::ranges::find(ConvPipelines, fmt, &ConvPipeline::fmt);
     if (it == ConvPipelines.end() || (domain == CopyDomain::Linear && fmt != GX_TF_RGB565)) {
-      Log.fatal("No {} copy pipeline for format {}", domain == CopyDomain::Linear ? "linear" : "HDR",
-                static_cast<int>(fmt));
+      warn_missing_pipeline(domain == CopyDomain::Linear ? "linear copy" : "HDR copy", fmt);
+      return {};
     }
     frag = it->fragShader;
   }
@@ -530,7 +635,7 @@ static wgpu::RenderPipeline domain_pipeline(GXTexFmt fmt, CopyDomain domain, wgp
   std::string preamble{ShaderPreamble};
   wgpu::BindGroupLayout layout = g_bindGroupLayout;
   if (domain == CopyDomain::HdrDisplay) {
-    static constexpr std::string_view Sample = "textureSample(src, src_samp, in.uv)";
+    static constexpr std::string_view Sample = "sample_efb(in.uv)";
     std::string wrapped;
     size_t pos = 0;
     for (size_t at; (at = fragShader.find(Sample, pos)) != std::string::npos; pos = at + Sample.size()) {
@@ -549,7 +654,9 @@ static wgpu::RenderPipeline domain_pipeline(GXTexFmt fmt, CopyDomain domain, wgp
     preamble += HdrCopyPreamble;
     layout = hdr_bind_group_layout();
   }
-  const char* label = domain == CopyDomain::Linear ? "TexCopyConv Linear" : "TexCopyConv HDR";
+  const char* label = domain == CopyDomain::Linear          ? "TexCopyConv Linear"
+                      : domain == CopyDomain::DisplayLinear ? "TexCopyConv Display Linear"
+                                                            : "TexCopyConv HDR";
   auto pipeline = create_pipeline({fmt, fragShader, outputFormat, label}, preamble, layout);
   g_domainPipelines.emplace(key, pipeline);
   return pipeline;
@@ -576,7 +683,7 @@ void initialize() {
       },
       wgpu::BindGroupLayoutEntry{
           .binding = 2,
-          .visibility = wgpu::ShaderStage::Vertex,
+          .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
           .buffer =
               wgpu::BufferBindingLayout{
                   .type = wgpu::BufferBindingType::Uniform,
@@ -590,7 +697,7 @@ void initialize() {
   };
   g_bindGroupLayout = g_device.CreateBindGroupLayout(&bindGroupLayoutDescriptor);
 
-  static constexpr std::array depthBindGroupLayoutEntries{
+  const std::array depthBindGroupLayoutEntries{
       wgpu::BindGroupLayoutEntry{
           .binding = 0,
           .visibility = wgpu::ShaderStage::Fragment,
@@ -608,13 +715,29 @@ void initialize() {
                   .type = wgpu::BufferBindingType::Uniform,
               },
       },
+      // Compatibility only: depth is read through a comparison sampler (see CompatDepthLoad)
+      wgpu::BindGroupLayoutEntry{
+          .binding = 2,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .sampler = wgpu::SamplerBindingLayout{.type = wgpu::SamplerBindingType::Comparison},
+      },
   };
-  static constexpr wgpu::BindGroupLayoutDescriptor depthBindGroupLayoutDescriptor{
+  const wgpu::BindGroupLayoutDescriptor depthBindGroupLayoutDescriptor{
       .label = "TexCopyConv Depth Bind Group Layout",
-      .entryCount = depthBindGroupLayoutEntries.size(),
+      .entryCount = webgpu::g_hasCoreFeatures ? 2u : 3u,
       .entries = depthBindGroupLayoutEntries.data(),
   };
   g_depthBindGroupLayout = g_device.CreateBindGroupLayout(&depthBindGroupLayoutDescriptor);
+  if (webgpu::g_hasCoreFeatures) {
+    auto msEntries = depthBindGroupLayoutEntries;
+    msEntries[0].texture.multisampled = true;
+    const wgpu::BindGroupLayoutDescriptor msDescriptor{
+        .label = "TexCopyConv Depth MS Bind Group Layout",
+        .entryCount = 2,
+        .entries = msEntries.data(),
+    };
+    g_depthBindGroupLayoutMS = g_device.CreateBindGroupLayout(&msDescriptor);
+  }
 
   g_blitPipeline = create_pipeline(
       {GX_TF_RGBA8, FragPassthrough, webgpu::g_graphicsConfig.surfaceConfiguration.format, "TexCopyConv Blit"},
@@ -625,20 +748,36 @@ void initialize() {
       Log.fatal("Output format mismatch for {}", conv.fmt);
     }
   }
-  // Skip depth copies in compatibility mode
-  if (webgpu::g_hasCoreFeatures) {
+  {
+    const std::string compatPreamble = webgpu::g_hasCoreFeatures ? std::string{} : make_compat_depth_preamble();
+    const std::string_view depthPreamble = webgpu::g_hasCoreFeatures ? std::string_view{DepthShaderPreamble}
+                                                                      : std::string_view{compatPreamble};
     for (const auto& conv : DepthConvPipelines) {
-      g_pipelines[conv.fmt] = create_pipeline(conv, DepthShaderPreamble, g_depthBindGroupLayout);
+      g_pipelines[conv.fmt] = create_pipeline(conv, depthPreamble, g_depthBindGroupLayout);
       if (conv.outputFormat != to_wgpu(conv.fmt)) {
         Log.fatal("Output format mismatch for {}", conv.fmt);
       }
     }
+    if (webgpu::g_hasCoreFeatures) {
+      // The same shaders on a multisampled source: textureLoad's last argument becomes the sample index.
+      std::string msPreamble = DepthShaderPreamble;
+      const std::string_view single = "texture_depth_2d";
+      msPreamble.replace(msPreamble.find(single), single.size(), "texture_depth_multisampled_2d");
+      for (const auto& conv : DepthConvPipelines) {
+        g_depthPipelinesMS[conv.fmt] = create_pipeline(conv, msPreamble, g_depthBindGroupLayoutMS);
+      }
+    }
+    const std::string compatSnapshot = std::string(DepthSnapshotShaderCompatHead) + std::string(CompatDepthLoad);
     g_depthSnapshotBindGroupLayout = create_depth_snapshot_layout(false, "Depth Snapshot Bind Group Layout");
-    g_depthSnapshotBindGroupLayoutMS = create_depth_snapshot_layout(true, "Depth Snapshot MS Bind Group Layout");
     g_depthSnapshotPipeline =
-        create_depth_snapshot_pipeline(DepthSnapshotShader, g_depthSnapshotBindGroupLayout, "Depth Snapshot");
-    g_depthSnapshotPipelineMS =
-        create_depth_snapshot_pipeline(DepthSnapshotShaderMS, g_depthSnapshotBindGroupLayoutMS, "Depth Snapshot MS");
+        create_depth_snapshot_pipeline(webgpu::g_hasCoreFeatures ? std::string_view{DepthSnapshotShader} : std::string_view{compatSnapshot},
+                                       g_depthSnapshotBindGroupLayout, "Depth Snapshot");
+    // Compatibility devices cannot bind multisampled depth textures; callers check snapshot_depth_supported(samples)
+    if (webgpu::g_hasCoreFeatures) {
+      g_depthSnapshotBindGroupLayoutMS = create_depth_snapshot_layout(true, "Depth Snapshot MS Bind Group Layout");
+      g_depthSnapshotPipelineMS =
+          create_depth_snapshot_pipeline(DepthSnapshotShaderMS, g_depthSnapshotBindGroupLayoutMS, "Depth Snapshot MS");
+    }
   }
 
   static constexpr wgpu::SamplerDescriptor nearestSamplerDescriptor{
@@ -647,6 +786,15 @@ void initialize() {
       .minFilter = wgpu::FilterMode::Nearest,
   };
   g_nearestSampler = g_device.CreateSampler(&nearestSamplerDescriptor);
+  static constexpr wgpu::SamplerDescriptor depthCompareDescriptor{
+      .label = "TexCopyConv Depth Compare Sampler",
+      .magFilter = wgpu::FilterMode::Nearest,
+      .minFilter = wgpu::FilterMode::Nearest,
+      .compare = wgpu::CompareFunction::LessEqual,
+  };
+  if (!webgpu::g_hasCoreFeatures) {
+    g_depthCompareSampler = g_device.CreateSampler(&depthCompareDescriptor);
+  }
 
   static constexpr wgpu::SamplerDescriptor linearSamplerDescriptor{
       .label = "TexCopyConv Linear Sampler",
@@ -666,7 +814,10 @@ void shutdown() {
   g_blitPipeline = {};
   g_bindGroupLayout = {};
   g_depthBindGroupLayout = {};
+  g_depthBindGroupLayoutMS = {};
+  g_depthPipelinesMS.clear();
   g_nearestSampler = {};
+  g_depthCompareSampler = {};
   g_linearSampler = {};
   g_depthSnapshotBindGroupLayout = {};
   g_depthSnapshotBindGroupLayoutMS = {};
@@ -680,10 +831,6 @@ static void execute(const wgpu::CommandEncoder& cmd, const ConvRequest& req, con
   }
   wgpu::BindGroup bindGroup;
   if (gx::is_depth_format(req.fmt)) {
-    // Skip depth copies in compatibility mode
-    if (!webgpu::g_hasCoreFeatures) {
-      return;
-    }
     const std::array bindGroupEntries{
         wgpu::BindGroupEntry{
             .binding = 0,
@@ -695,10 +842,14 @@ static void execute(const wgpu::CommandEncoder& cmd, const ConvRequest& req, con
             .offset = req.uniformRange.offset,
             .size = req.uniformRange.size,
         },
+        wgpu::BindGroupEntry{
+            .binding = 2,
+            .sampler = g_depthCompareSampler,
+        },
     };
     const wgpu::BindGroupDescriptor bindGroupDescriptor{
-        .layout = g_depthBindGroupLayout,
-        .entryCount = bindGroupEntries.size(),
+        .layout = req.srcSamples > 1 ? g_depthBindGroupLayoutMS : g_depthBindGroupLayout,
+        .entryCount = webgpu::g_hasCoreFeatures ? 2u : 3u,
         .entries = bindGroupEntries.data(),
     };
     bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
@@ -781,14 +932,23 @@ static void execute(const wgpu::CommandEncoder& cmd, const ConvRequest& req, con
 
 void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req) {
   if (req.domain != CopyDomain::Display) {
-    execute(cmd, req, domain_pipeline(req.fmt, req.domain, req.dst->format));
+    if (const auto pipeline = domain_pipeline(req.fmt, req.domain, req.dst->format)) {
+      execute(cmd, req, pipeline);
+    }
     return;
   }
-  const auto it = g_pipelines.find(req.fmt);
-  if (it == g_pipelines.end()) {
-    Log.fatal("No copy conversion pipeline for format {}", static_cast<int>(req.fmt));
+  // A format with no pipeline leaves the destination as it was, rather than ending the game.
+  const auto& pipelines = req.srcSamples > 1 ? g_depthPipelinesMS : g_pipelines;
+  const auto it = pipelines.find(req.fmt);
+  if (it == pipelines.end()) {
+    warn_missing_pipeline(req.srcSamples > 1 ? "multisampled conversion" : "conversion", req.fmt);
+    return;
   }
   execute(cmd, req, it->second);
+}
+
+bool depth_conversion_supported(GXTexFmt fmt, uint32_t msaaSamples) noexcept {
+  return msaaSamples > 1 ? g_depthPipelinesMS.contains(fmt) : g_pipelines.contains(fmt);
 }
 
 void blit(const wgpu::CommandEncoder& cmd, const ConvRequest& req) {
@@ -799,7 +959,9 @@ void blit(const wgpu::CommandEncoder& cmd, const ConvRequest& req) {
   execute(cmd, req, g_blitPipeline);
 }
 
-bool snapshot_depth_supported() noexcept { return static_cast<bool>(g_depthSnapshotPipeline); }
+bool snapshot_depth_supported(uint32_t msaaSamples) noexcept {
+  return static_cast<bool>(msaaSamples > 1 ? g_depthSnapshotPipelineMS : g_depthSnapshotPipeline);
+}
 
 void snapshot_depth(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& srcDepth, uint32_t msaaSamples,
                     const wgpu::TextureView& dst) {
@@ -813,10 +975,14 @@ void snapshot_depth(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& sr
           .binding = 0,
           .textureView = srcDepth,
       },
+      wgpu::BindGroupEntry{
+          .binding = 1,
+          .sampler = g_depthCompareSampler,
+      },
   };
   const wgpu::BindGroupDescriptor bindGroupDescriptor{
       .layout = multisampled ? g_depthSnapshotBindGroupLayoutMS : g_depthSnapshotBindGroupLayout,
-      .entryCount = bindGroupEntries.size(),
+      .entryCount = webgpu::g_hasCoreFeatures ? 1u : 2u,
       .entries = bindGroupEntries.data(),
   };
   const auto bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);

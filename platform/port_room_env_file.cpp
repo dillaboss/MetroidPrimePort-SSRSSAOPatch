@@ -1,5 +1,7 @@
 // The .roomenv file: parsing, and picking the probe for a point. See port_room_env.h.
 #include "port_room_env.h"
+#include "port_room_geo.h"
+#include "port_hash.h"
 #include "port_strings.h"
 #include "port_bytes.h"
 
@@ -13,7 +15,7 @@ namespace PortRoomEnv {
 namespace {
 
 constexpr uint32_t kMagic = 0x5645504D; // 'MPEV'
-constexpr uint32_t kVersion = 21;
+constexpr uint32_t kVersion = 34;
 constexpr uint32_t kMaxGrades = 64;
 // A fog record up to its link count (inclusive).
 constexpr size_t kFogBytes = 368;
@@ -34,6 +36,9 @@ constexpr size_t kGridHeaderSize = 60;
 constexpr size_t kPointSize = 24;
 constexpr uint32_t kMaxGrids = 64;
 constexpr uint32_t kMaxGridSize = 1024;
+constexpr uint32_t kMaxEnvVars = 4096;
+constexpr uint32_t kMaxEnvVarName = 1024;
+constexpr uint32_t kMaxEnvOps = 65536;
 
 using port::ReadLE32;
 using port::ReadLEFloat;
@@ -57,12 +62,12 @@ float GetHalf(const uint8_t* p) {
 uint32_t GradeLutId(const uint8_t* lut) {
   constexpr uint32_t n = kGradeLutSize;
   bool identity = true;
-  uint32_t hash = 2166136261u;
+  uint32_t hash = port::kFnv32Basis;
   for (uint32_t i = 0; i < n * n * n; ++i) {
     const uint32_t coord[3] = {i % n, i / n % n, i / (n * n)};
     for (int c = 0; c < 4; ++c) {
       const uint8_t v = lut[i * 4 + c];
-      hash = (hash ^ v) * 16777619u;
+      hash = port::Fnv1a32Step(hash, v);
       if (c < 3 && std::fabs(float(v) - float(coord[c]) * (255.f / float(n - 1))) > 4.f) {
         identity = false;
       }
@@ -152,6 +157,73 @@ bool ParseTiles(const std::vector<uint8_t>& data, size_t& at, PortRoomEnvTiles::
   return true;
 }
 
+// A light's links, animation block and splines at `at` (version 19's, from u32 links on).
+constexpr size_t kTimelineAnimBytes = 36;
+constexpr size_t kTimelineLeast = 4 + kTimelineAnimBytes + 4 * kLightSplines;
+bool ParseTimeline(const std::vector<uint8_t>& data, size_t& at, LightTimeline& l, std::string& error) {
+  if (data.size() - at < 4) {
+    error = "cut short";
+    return false;
+  }
+  const uint32_t links = ReadLE32(data.data() + at);
+  at += 4;
+  if (links > kMaxGradeLinks || (data.size() - at) / 8 < links) {
+    error = "cut short";
+    return false;
+  }
+  l.links.resize(links);
+  for (GradeLink& link : l.links) {
+    const uint8_t* k = data.data() + at;
+    link.sender = ReadLE32(k);
+    link.state = k[4];
+    link.action = k[5];
+    at += 8;
+  }
+  if (data.size() - at < kTimelineAnimBytes) {
+    error = "cut short";
+    return false;
+  }
+  const uint8_t* a = data.data() + at;
+  l.animated = a[0] != 0;
+  l.playing = a[1] != 0;
+  l.loop = a[2] != 0;
+  l.offAtStart = a[3] != 0;
+  l.animFalloff = a[4];
+  l.length = ReadLEFloat(a + 8);
+  l.scale[0] = ReadLEFloat(a + 12);
+  l.scale[1] = ReadLEFloat(a + 16);
+  l.intensity = ReadLEFloat(a + 20);
+  for (int i = 0; i < 3; ++i) {
+    l.rgb[i] = ReadLEFloat(a + 24 + 4 * i);
+  }
+  at += kTimelineAnimBytes;
+  if (!std::isfinite(l.length) || l.length < 0.f) {
+    l.length = 0.f;
+  }
+  for (int i = 0; i < kLightSplines; ++i) {
+    if (data.size() - at < 4) {
+      error = "cut short";
+      return false;
+    }
+    const uint32_t size = ReadLE32(data.data() + at);
+    at += 4;
+    const size_t padded = (size_t(size) + 3) & ~size_t(3);
+    if (data.size() - at < padded) {
+      error = "cut short";
+      return false;
+    }
+    if (size != 0) {
+      if (!l.splines[i].Load(data.data() + at, size)) {
+        error = "bad light spline";
+        return false;
+      }
+      l.hasSpline[i] = true;
+    }
+    at += padded;
+  }
+  return true;
+}
+
 } // namespace
 
 bool ParseTileSet(const std::vector<uint8_t>& data, size_t& at, PortRoomEnvTiles::TileSet& set, std::string& error) {
@@ -232,7 +304,7 @@ bool Parse(std::vector<uint8_t>&& data, File& out, std::string& error) {
       probe.scale = 1.f;
     }
     SetExtents(probe);
-    if (probe.cube >= cubes) {
+    if (probe.cube >= cubes && probe.cube != kProbeNoCube) {
       error = "a probe names a cube the file does not have";
       return false;
     }
@@ -429,6 +501,7 @@ bool Parse(std::vector<uint8_t>&& data, File& out, std::string& error) {
         }
         const uint8_t* q = data.data() + at;
         grade.on = q[0] != 0;
+        grade.master = q[1] != 0;
         grade.priority = int32_t(ReadLE32(q + 4));
         const uint32_t links = ReadLE32(q + 8);
         at += 12;
@@ -491,6 +564,7 @@ bool Parse(std::vector<uint8_t>&& data, File& out, std::string& error) {
       light.fadeIn = ReadLEFloat(p + 4);
       light.fadeOut = ReadLEFloat(p + 8);
       light.on = p[12] != 0;
+      light.master = p[13] != 0;
       light.priority = int32_t(ReadLE32(p + 16));
       light.top = ReadLEFloat(p + 20);
       light.back = ReadLEFloat(p + 24);
@@ -544,6 +618,7 @@ bool Parse(std::vector<uint8_t>&& data, File& out, std::string& error) {
       fog.fadeIn = ReadLEFloat(p + 4);
       fog.fadeOut = ReadLEFloat(p + 8);
       fog.on = p[12] != 0;
+      fog.master = p[13] != 0;
       fog.priority = int32_t(ReadLE32(p + 16));
       float* scalars[10] = {&fog.range,    &fog.scatter,    &fog.absorb,       &fog.m1z,         &fog.decay,
                             &fog.attenSlope, &fog.attenBias, &fog.noiseFreq, &fog.noiseStrength, &fog.lightCap};
@@ -811,13 +886,18 @@ bool Parse(std::vector<uint8_t>&& data, File& out, std::string& error) {
     }
     const uint32_t suns = ReadLE32(data.data() + at);
     at += 4;
-    const size_t size = version >= 17 ? 36 : 32;
-    if ((data.size() - at) / size < suns) {
+    const size_t size = version >= 24 ? 40 : version >= 17 ? 36 : 32;
+    const size_t least = size + (version >= 29 ? kTimelineLeast : 0);
+    if ((data.size() - at) / least < suns) {
       error = "cut short";
       return false;
     }
     out.suns.resize(suns);
     for (SunLight& s : out.suns) {
+      if (data.size() - at < size) {
+        error = "cut short";
+        return false;
+      }
       const uint8_t* q = data.data() + at;
       s.layer = int32_t(ReadLE32(q));
       s.on = q[4] != 0;
@@ -828,7 +908,11 @@ bool Parse(std::vector<uint8_t>&& data, File& out, std::string& error) {
       if (version >= 17) {
         s.group = ReadLE32(q + 32);
       }
+      s.casts = version >= 24 && q[36] != 0;
       at += size;
+      if (version >= 29 && !ParseTimeline(data, at, s, error)) {
+        return false;
+      }
     }
   }
   if (version >= 18) {
@@ -872,8 +956,7 @@ bool Parse(std::vector<uint8_t>&& data, File& out, std::string& error) {
     at += 4;
     // The fixed part, the link count, the animation block and the spline sizes.
     constexpr size_t kSize = 64;
-    constexpr size_t kAnimBytes = 36;
-    constexpr size_t kLeast = kSize + 4 + kAnimBytes + 4 * kLightSplines;
+    constexpr size_t kLeast = kSize + kTimelineLeast;
     if ((data.size() - at) / kLeast < lights) {
       error = "cut short";
       return false;
@@ -900,61 +983,8 @@ bool Parse(std::vector<uint8_t>&& data, File& out, std::string& error) {
       }
       l.group = ReadLE32(q + 60);
       at += kSize;
-      const uint32_t links = ReadLE32(data.data() + at);
-      at += 4;
-      if (links > kMaxGradeLinks || (data.size() - at) / 8 < links) {
-        error = "cut short";
+      if (!ParseTimeline(data, at, l, error)) {
         return false;
-      }
-      l.links.resize(links);
-      for (GradeLink& link : l.links) {
-        const uint8_t* k = data.data() + at;
-        link.sender = ReadLE32(k);
-        link.state = k[4];
-        link.action = k[5];
-        at += 8;
-      }
-      if (data.size() - at < kAnimBytes) {
-        error = "cut short";
-        return false;
-      }
-      const uint8_t* a = data.data() + at;
-      l.animated = a[0] != 0;
-      l.playing = a[1] != 0;
-      l.loop = a[2] != 0;
-      l.offAtStart = a[3] != 0;
-      l.animFalloff = a[4];
-      l.length = ReadLEFloat(a + 8);
-      l.scale[0] = ReadLEFloat(a + 12);
-      l.scale[1] = ReadLEFloat(a + 16);
-      l.intensity = ReadLEFloat(a + 20);
-      for (int i = 0; i < 3; ++i) {
-        l.rgb[i] = ReadLEFloat(a + 24 + 4 * i);
-      }
-      at += kAnimBytes;
-      if (!std::isfinite(l.length) || l.length < 0.f) {
-        l.length = 0.f;
-      }
-      for (int i = 0; i < kLightSplines; ++i) {
-        if (data.size() - at < 4) {
-          error = "cut short";
-          return false;
-        }
-        const uint32_t size = ReadLE32(data.data() + at);
-        at += 4;
-        const size_t padded = (size_t(size) + 3) & ~size_t(3);
-        if (data.size() - at < padded) {
-          error = "cut short";
-          return false;
-        }
-        if (size != 0) {
-          if (!l.splines[i].Load(data.data() + at, size)) {
-            error = "bad light spline";
-            return false;
-          }
-          l.hasSpline[i] = true;
-        }
-        at += padded;
       }
     }
   }
@@ -965,22 +995,50 @@ bool Parse(std::vector<uint8_t>&& data, File& out, std::string& error) {
     }
     const uint32_t hints = ReadLE32(data.data() + at);
     at += 4;
-    constexpr size_t kHintBytes = 24;
+    // Version 28 follows each with its links (a count, then 8 bytes each).
+    const size_t kHintBytes = version >= 28 ? 32 : version >= 27 ? 28 : 24;
     if ((data.size() - at) / kHintBytes < hints) {
       error = "cut short";
       return false;
     }
-    for (uint32_t i = 0; i < hints; ++i, at += kHintBytes) {
+    for (uint32_t i = 0; i < hints; ++i) {
+      if (data.size() - at < kHintBytes) {
+        error = "cut short";
+        return false;
+      }
       const uint8_t* q = data.data() + at;
+      at += kHintBytes;
       FluidHint h;
+      if (version >= 28) {
+        const uint32_t links = ReadLE32(q + 28);
+        if (links > kMaxGradeLinks || (data.size() - at) / 8 < links) {
+          error = "cut short";
+          return false;
+        }
+        h.links.resize(links);
+        for (GradeLink& link : h.links) {
+          link.sender = ReadLE32(data.data() + at);
+          link.state = data[at + 4];
+          link.action = data[at + 5];
+          at += 8;
+        }
+      }
       h.mode = q[0];
+      if (version >= 27) {
+        h.on = q[3] != 0;
+        h.priority = int32_t(ReadLE32(q + 24));
+      }
+      if (version >= 25 && q[1] <= 2) {
+        h.role = q[1];
+        h.pair = q[2];
+      }
       h.exposure[0] = ReadLEFloat(q + 4);
       h.exposure[1] = ReadLEFloat(q + 8);
       h.bias = ReadLEFloat(q + 12);
       h.sigma = ReadLEFloat(q + 16);
       h.staticLerp = ReadLEFloat(q + 20);
-      if ((h.mode != 1 && h.mode != 2) || !std::isfinite(h.exposure[0]) || !std::isfinite(h.exposure[1]) ||
-          h.exposure[1] < h.exposure[0]) {
+      if (h.mode > 2 || (version < 27 && h.role == 0 && h.mode == 0) ||
+          !std::isfinite(h.exposure[0]) || !std::isfinite(h.exposure[1]) || h.exposure[1] < h.exposure[0]) {
         continue;
       }
       if (!std::isfinite(h.bias)) {
@@ -995,47 +1053,514 @@ bool Parse(std::vector<uint8_t>&& data, File& out, std::string& error) {
       out.fluidHints.push_back(h);
     }
   }
+  if (version >= 22) {
+    if (data.size() - at < 4) {
+      error = "cut short";
+      return false;
+    }
+    const uint32_t volumes = ReadLE32(data.data() + at);
+    at += 4;
+    constexpr size_t kVolumeBytes = 15 * 4;
+    if (volumes > kMaxWorldVolumes || (data.size() - at) / kVolumeBytes < volumes) {
+      error = "cut short";
+      return false;
+    }
+    out.worldVolumes.resize(volumes);
+    for (uint32_t i = 0; i < volumes; ++i, at += kVolumeBytes) {
+      WorldVolume& v = out.worldVolumes[i];
+      float* const fields[3] = {v.centre, v.half, v.axes};
+      const size_t counts[3] = {3, 3, 9};
+      size_t o = at;
+      for (int f = 0; f < 3; ++f) {
+        for (size_t k = 0; k < counts[f]; ++k, o += 4) {
+          fields[f][k] = ReadLEFloat(data.data() + o);
+        }
+      }
+      // A box that reads wrong holds no point (its index stays, as links name it).
+      bool ok = true;
+      for (float x : v.centre) ok = ok && std::isfinite(x);
+      for (float x : v.half) ok = ok && std::isfinite(x);
+      for (float x : v.axes) ok = ok && std::isfinite(x);
+      if (!ok) {
+        v = WorldVolume{};
+        v.half[0] = v.half[1] = v.half[2] = -1.f;
+      }
+    }
+  }
+  if (version >= 23) {
+    if (data.size() - at < 12) {
+      error = "cut short";
+      return false;
+    }
+    for (int i = 0; i < 3; ++i, at += 4) {
+      const float v = ReadLEFloat(data.data() + at);
+      out.worldShift[i] = std::isfinite(v) ? v : 0.f;
+    }
+    for (FogHint& fog : out.fogs) {
+      std::copy(out.worldShift, out.worldShift + 3, fog.worldShift);
+    }
+  }
+  if (version >= 26) {
+    if (data.size() - at < 4) {
+      error = "cut short";
+      return false;
+    }
+    const float v = ReadLEFloat(data.data() + at);
+    at += 4;
+    out.envFxIntensity = std::isfinite(v) && v >= 0.f ? v : 1.f;
+  }
+  if (version >= 30) {
+    if (data.size() - at < 4) {
+      error = "cut short";
+      return false;
+    }
+    const uint32_t volumes = ReadLE32(data.data() + at);
+    at += 4;
+    constexpr size_t kVolumeBytes = 15 * 4 + 4;
+    if (volumes > kMaxRoomVolumes || (data.size() - at) / kVolumeBytes < volumes) {
+      error = "cut short";
+      return false;
+    }
+    out.roomVolumes.resize(volumes);
+    for (uint32_t i = 0; i < volumes; ++i) {
+      RoomVolume& v = out.roomVolumes[i];
+      float* const fields[3] = {v.centre, v.half, v.axes};
+      const size_t counts[3] = {3, 3, 9};
+      size_t o = at;
+      for (int f = 0; f < 3; ++f) {
+        for (size_t k = 0; k < counts[f]; ++k, o += 4) {
+          fields[f][k] = ReadLEFloat(data.data() + o);
+        }
+      }
+      v.detect = data[o] & (kRoomVolumePlayer | kRoomVolumeCamera);
+      // A box that reads wrong detects nothing (its index stays, as links name it).
+      bool ok = true;
+      for (float x : v.centre) ok = ok && std::isfinite(x);
+      for (float x : v.half) ok = ok && std::isfinite(x);
+      for (float x : v.axes) ok = ok && std::isfinite(x);
+      if (!ok) {
+        v = RoomVolume{};
+        v.half[0] = v.half[1] = v.half[2] = -1.f;
+      }
+      at += kVolumeBytes;
+      if (version >= 32) {
+        // Whether the trigger is active at load, and the script that switches it (its own links).
+        if (data.size() - at < 8) {
+          error = "cut short";
+          return false;
+        }
+        v.on = data[at] != 0;
+        const uint32_t links = ReadLE32(data.data() + at + 4);
+        at += 8;
+        if (links > kMaxGradeLinks || (data.size() - at) / 8 < links) {
+          error = "cut short";
+          return false;
+        }
+        v.links.resize(links);
+        for (GradeLink& link : v.links) {
+          link.sender = ReadLE32(data.data() + at);
+          link.state = data[at + 4];
+          link.action = data[at + 5];
+          at += 8;
+        }
+      }
+    }
+  }
+  if (version >= 31) {
+    if (data.size() - at < 4) {
+      error = "cut short";
+      return false;
+    }
+    const uint32_t detects = ReadLE32(data.data() + at);
+    at += 4;
+    if (detects != out.worldVolumes.size() || data.size() - at < detects) {
+      error = "cut short";
+      return false;
+    }
+    for (uint32_t i = 0; i < detects; ++i) {
+      out.worldVolumes[i].detect = data[at++] & (kRoomVolumePlayer | kRoomVolumeCamera);
+    }
+    if (data.size() - at < 4) {
+      error = "cut short";
+      return false;
+    }
+    const uint32_t vars = ReadLE32(data.data() + at);
+    at += 4;
+    if (vars > kMaxEnvVars) {
+      error = "cut short";
+      return false;
+    }
+    out.envVars.resize(vars);
+    for (EnvVar& v : out.envVars) {
+      if (data.size() - at < 20) {
+        error = "cut short";
+        return false;
+      }
+      std::copy(data.begin() + at, data.begin() + at + 16, v.guid.begin());
+      const uint32_t length = ReadLE32(data.data() + at + 16);
+      at += 20;
+      if (length > kMaxEnvVarName || data.size() - at < size_t(length) + 16) {
+        error = "cut short";
+        return false;
+      }
+      v.name.assign(reinterpret_cast<const char*>(data.data() + at), length);
+      at += length;
+      v.value = int32_t(ReadLE32(data.data() + at));
+      v.flags = ReadLE32(data.data() + at + 4);
+      v.min = int32_t(ReadLE32(data.data() + at + 8));
+      v.max = int32_t(ReadLE32(data.data() + at + 12));
+      at += 16;
+    }
+    if (data.size() - at < 4) {
+      error = "cut short";
+      return false;
+    }
+    const uint32_t ops = ReadLE32(data.data() + at);
+    at += 4;
+    constexpr size_t kOpBytes = 4 + 4 + 4 + 16;
+    if (ops > kMaxEnvOps || (data.size() - at) / kOpBytes < ops) {
+      error = "cut short";
+      return false;
+    }
+    out.envOps.resize(ops);
+    for (EnvOp& op : out.envOps) {
+      op.sender = ReadLE32(data.data() + at);
+      op.state = data[at + 4];
+      op.op = data[at + 5];
+      op.value = int32_t(ReadLE32(data.data() + at + 8));
+      std::copy(data.begin() + at + 12, data.begin() + at + 28, op.var.begin());
+      at += kOpBytes;
+    }
+    if (data.size() - at < 4) {
+      error = "cut short";
+      return false;
+    }
+    const uint32_t branches = ReadLE32(data.data() + at);
+    at += 4;
+    constexpr size_t kBranchBytes = 16 + 4 + 4 + 4;
+    if (branches > kMaxEnvBranches || (data.size() - at) / kBranchBytes < branches) {
+      error = "cut short";
+      return false;
+    }
+    out.envBranches.resize(branches);
+    for (EnvBranch& b : out.envBranches) {
+      std::copy(data.begin() + at, data.begin() + at + 16, b.var.begin());
+      b.relop = data[at + 16];
+      b.flags = data[at + 17];
+      b.value = int32_t(ReadLE32(data.data() + at + 20));
+      b.query = ReadLE32(data.data() + at + 24);
+      at += kBranchBytes;
+    }
+  }
+  if (version >= 33) {
+    if (data.size() - at < 4) {
+      error = "cut short";
+      return false;
+    }
+    const uint32_t darkeners = ReadLE32(data.data() + at);
+    at += 4;
+    constexpr uint32_t kMaxIceDarkeners = 64;
+    if (darkeners > kMaxIceDarkeners || (data.size() - at) / 8 < darkeners) {
+      error = "cut short";
+      return false;
+    }
+    out.iceDarkeners.resize(darkeners);
+    for (IceDarkener& d : out.iceDarkeners) {
+      d.factor = ReadLEFloat(data.data() + at);
+      d.delay = ReadLEFloat(data.data() + at + 4);
+      if (!std::isfinite(d.factor)) {
+        d.factor = 1.f;
+      }
+      if (!std::isfinite(d.delay) || d.delay < 0.f) {
+        d.delay = 0.f;
+      }
+      at += 8;
+    }
+  }
+  if (version >= 34) {
+    if (data.size() - at < 4) {
+      error = "cut short";
+      return false;
+    }
+    const uint32_t hints = ReadLE32(data.data() + at);
+    at += 4;
+    constexpr uint32_t kMaxLightHints = 64;
+    constexpr size_t kHintBytes = 20;
+    if (hints > kMaxLightHints || (data.size() - at) / kHintBytes < hints) {
+      error = "cut short";
+      return false;
+    }
+    out.lightHints.resize(hints);
+    for (LightHint& h : out.lightHints) {
+      h.layer = int32_t(ReadLE32(data.data() + at));
+      h.on = data[at + 4] != 0;
+      for (int i = 0; i < 3; ++i) {
+        h.dir[i] = ReadLEFloat(data.data() + at + 8 + 4 * i);
+      }
+      const float len = std::sqrt(h.dir[0] * h.dir[0] + h.dir[1] * h.dir[1] + h.dir[2] * h.dir[2]);
+      if (!std::isfinite(len) || len < 1e-6f) {
+        error = "bad light hint";
+        return false;
+      }
+      for (float& v : h.dir) {
+        v /= len;
+      }
+      at += kHintBytes;
+    }
+  }
   out.data = std::move(data);
   return true;
 }
 
-bool ExposureHints::Load(const std::vector<FluidHint>& hints, bool cameraInside) {
+bool InsideRoomVolume(const RoomVolume& volume, const float camera[3], const float playerMin[3],
+                      const float playerMax[3], bool hasPlayer) {
+  for (float h : volume.half) {
+    if (!(h >= 0.f)) {
+      return false;
+    }
+  }
+  if ((volume.detect & kRoomVolumeCamera) != 0 && camera != nullptr) {
+    const float d[3] = {camera[0] - volume.centre[0], camera[1] - volume.centre[1], camera[2] - volume.centre[2]};
+    bool inside = true;
+    for (int axis = 0; axis < 3 && inside; ++axis) {
+      const float* const a = volume.axes + axis * 3;
+      inside = std::fabs(d[0] * a[0] + d[1] * a[1] + d[2] * a[2]) <= volume.half[axis];
+    }
+    if (inside) {
+      return true;
+    }
+  }
+  if ((volume.detect & kRoomVolumePlayer) != 0 && hasPlayer && playerMin != nullptr && playerMax != nullptr) {
+    // The box's extent along each of the area's axes.
+    bool overlap = true;
+    for (int j = 0; j < 3 && overlap; ++j) {
+      float extent = 0.f;
+      for (int i = 0; i < 3; ++i) {
+        extent += std::fabs(volume.axes[i * 3 + j]) * volume.half[i];
+      }
+      overlap = playerMax[j] >= volume.centre[j] - extent && playerMin[j] <= volume.centre[j] + extent;
+    }
+    if (overlap) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool InsideWorldVolume(const WorldVolume& volume, const float pos[3]) {
+  const float d[3] = {pos[0] - volume.centre[0], pos[1] - volume.centre[1], pos[2] - volume.centre[2]};
+  for (int axis = 0; axis < 3; ++axis) {
+    const float* const a = volume.axes + 3 * axis;
+    if (!(std::fabs(d[0] * a[0] + d[1] * a[1] + d[2] * a[2]) <= volume.half[axis])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool SameWorldVolumes(const std::vector<WorldVolume>& a, const std::vector<WorldVolume>& b) {
+  return a.size() == b.size() &&
+         (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(WorldVolume)) == 0);
+}
+
+void WorldVolumeState::Clear() {
+  inside.clear();
+  entered.clear();
+  exited.clear();
+  seq = 0;
+}
+
+void WorldVolumeState::Update(const std::vector<WorldVolume>& volumes, const float pos[3], std::vector<Event>& out) {
+  Update(volumes, pos, nullptr, nullptr, false, out);
+}
+
+void WorldVolumeState::Update(const std::vector<WorldVolume>& volumes, const float pos[3], const float playerMin[3],
+                              const float playerMax[3], bool hasPlayer, std::vector<Event>& out) {
+  if (inside.size() != volumes.size()) {
+    Clear();
+    inside.assign(volumes.size(), 0);
+    entered.assign(volumes.size(), 0);
+    exited.assign(volumes.size(), 0);
+  }
+  for (size_t i = 0; i < volumes.size(); ++i) {
+    const WorldVolume& w = volumes[i];
+    RoomVolume r;
+    std::copy(w.centre, w.centre + 3, r.centre);
+    std::copy(w.half, w.half + 3, r.half);
+    std::copy(w.axes, w.axes + 9, r.axes);
+    r.detect = w.detect;
+    const bool now = InsideRoomVolume(r, pos, playerMin, playerMax, hasPlayer);
+    if (now == (inside[i] != 0)) {
+      continue;
+    }
+    inside[i] = now ? 1 : 0;
+    (now ? entered : exited)[i] = ++seq;
+    out.push_back({uint32_t(i), now ? 0 : 1});
+  }
+}
+
+bool EnvBranchHolds(const EnvBranch& branch, int32_t value) {
+  const int32_t c = branch.value;
+  switch (branch.relop) {
+  case 0: return c == value;
+  case 1: return c != value;
+  case 2: return c < value;
+  case 3: return c <= value;
+  case 4: return value < c;
+  case 5: return value <= c;
+  default: return false;
+  }
+}
+
+int32_t ApplyEnvOp(const EnvVar& var, int32_t current, uint8_t op, int32_t value) {
+  int64_t next = current;
+  switch (op) {
+  case kEnvSet: next = value; break;
+  case kEnvAdd: next = int64_t(current) + value; break;
+  case kEnvSub: next = int64_t(current) - value; break;
+  default: return current;
+  }
+  if ((var.flags & kEnvVarMin) != 0 && next < var.min) {
+    next = var.min;
+  }
+  if ((var.flags & kEnvVarMax) != 0 && next > var.max) {
+    next = var.max;
+  }
+  next = std::clamp<int64_t>(next, INT32_MIN, INT32_MAX);
+  return int32_t(next);
+}
+
+void WorldVolumeState::Replay(std::vector<Event>& out) const {
+  std::vector<std::pair<uint64_t, Event>> events;
+  for (size_t i = 0; i < entered.size() && i < exited.size(); ++i) {
+    if (entered[i] != 0) {
+      events.push_back({entered[i], {uint32_t(i), 0}});
+      if (exited[i] > entered[i]) {
+        events.push_back({exited[i], {uint32_t(i), 1}});
+      }
+    }
+  }
+  std::sort(events.begin(), events.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+  for (const auto& e : events) {
+    out.push_back(e.second);
+  }
+}
+
+bool ExposureHints::Load(const std::vector<FluidHint>& hints, bool cameraInside, uint8_t state) {
   inside = false;
+  seen = false;
+  pairState = state;
   active.assign(hints.size(), 0);
+  disabled.assign(hints.size(), 0);
   order.assign(hints.size(), 0);
-  return Set(hints, cameraInside);
+  on.resize(hints.size());
+  for (size_t i = 0; i < hints.size(); ++i) {
+    on[i] = hints[i].on ? 1 : 0;
+  }
+  if (cameraInside) {
+    inside = seen = true;
+  }
+  return Update(hints, false);
 }
 
 bool ExposureHints::Set(const std::vector<FluidHint>& hints, bool cameraInside) {
-  if (active.size() != hints.size()) {
-    active.assign(hints.size(), 0);
-    order.assign(hints.size(), 0);
-  }
   if (cameraInside == inside) {
     return false;
   }
   inside = cameraInside;
-  bool registered = false;
+  seen = true;
+  return Update(hints, true);
+}
+
+bool ExposureHints::SetPair(const std::vector<FluidHint>& hints, uint8_t state) {
+  if (state == pairState) {
+    return false;
+  }
+  pairState = state;
+  return Update(hints, true);
+}
+
+bool ExposureHints::Drive(const std::vector<FluidHint>& hints, uint32_t sender, int state) {
+  if (on.size() != hints.size()) {
+    return false;
+  }
+  bool changed = false;
   for (size_t i = 0; i < hints.size(); ++i) {
-    const uint8_t now = hints[i].mode == 1 ? (cameraInside ? 1 : 0) : (cameraInside ? 0 : 1);
+    for (const GradeLink& link : hints[i].links) {
+      if (link.sender != sender || link.state != state) {
+        continue;
+      }
+      const uint8_t now = link.action == PortRoomGeo::kShow     ? 1
+                          : link.action == PortRoomGeo::kHide   ? 0
+                          : link.action == PortRoomGeo::kToggle ? uint8_t(on[i] == 0)
+                                                                : on[i];
+      changed |= now != on[i];
+      on[i] = now;
+    }
+  }
+  if (changed) {
+    Update(hints, false);
+  }
+  return changed;
+}
+
+bool ExposureHints::Update(const std::vector<FluidHint>& hints, bool snapMode0) {
+  if (active.size() != hints.size()) {
+    active.assign(hints.size(), 0);
+    disabled.assign(hints.size(), 0);
+    order.assign(hints.size(), 0);
+  }
+  if (on.size() != hints.size()) {
+    on.resize(hints.size());
+    for (size_t i = 0; i < hints.size(); ++i) {
+      on[i] = hints[i].on ? 1 : 0;
+    }
+  }
+  const uint64_t firstRegistration = next;
+  priority.resize(hints.size());
+  for (size_t i = 0; i < hints.size(); ++i) {
+    const FluidHint& hint = hints[i];
+    priority[i] = hint.priority;
+    disabled[i] = hint.role == 0 ? 0 : (hint.role == 1 ? pairState == 0 : pairState != 0) ? 1 : 0;
+    bool eligible = false;
+    switch (hint.mode) {
+    case 0:
+      eligible = true;
+      break;
+    case 1:
+      eligible = inside;
+      break;
+    case 2:
+      eligible = seen && !inside;
+      break;
+    default:
+      break;
+    }
+    const uint8_t now = eligible && on[i] != 0 && !disabled[i] ? 1 : 0;
     if (now == active[i]) {
       continue;
     }
     active[i] = now;
     if (now != 0) {
       order[i] = next++;
-      registered = true;
     } else {
       order[i] = 0;
     }
   }
-  return registered;
+  const int selected = Pick(hints.size());
+  // The transition type belongs to the selected registration, not any other
+  // hint that happened to register this frame (UpdateTonemapping 0xaffb18).
+  return selected >= 0 && order[selected] >= firstRegistration && (hints[selected].mode != 0 || snapMode0);
 }
 
 int ExposureHints::Pick(size_t count) const {
   int best = -1;
   for (size_t i = 0; i < count && i < order.size(); ++i) {
-    if (order[i] != 0 && (best < 0 || order[i] > order[best])) {
+    // RegisterAutoExposureHintObject 0xb0029c inserts before the first priority <=
+    // the new one. UpdateTonemapping 0xaffb18 takes the first matching area:
+    // higher priority first, newest registration first only for equal priorities.
+    if (order[i] != 0 && (best < 0 || priority[i] > priority[best] ||
+                         (priority[i] == priority[best] && order[i] > order[best]))) {
       best = int(i);
     }
   }
@@ -1103,6 +1628,40 @@ void Convergence::Step(float target) {
   history[1] = history[0];
   history[0] = next;
   value = float(next);
+}
+
+void ExposureAverage::Reset() {
+  L = -1.f;
+  created = false;
+}
+
+void ExposureAverage::Take(const float rgb[3]) {
+  L = std::max(std::max(rgb[0], rgb[1]), rgb[2]);
+}
+
+float ExposureAverage::Update(bool hint, float tonemapEv, float lo, float hi, float bias, float s, bool snap,
+                              int steps, float* target) {
+  constexpr float kGrey = 0.2158605f; // sRGB 128, linear
+  if (!hint || !(L >= 0.f)) {
+    *target = tonemapEv;
+    return tonemapEv;
+  }
+  if (sigma != s) {
+    sigma = s;
+    ev.SetSigma(s);
+  }
+  *target = std::min(std::max(std::log2(L / kGrey) + 3.f + bias, lo), hi);
+  if (!created) {
+    created = true;
+    ev.SetValue(*target);
+  } else if (snap) {
+    ev.SetValue(*target);
+  } else {
+    for (int i = steps; i > 0; --i) {
+      ev.Step(*target);
+    }
+  }
+  return ev.value;
 }
 
 void SetExtents(Probe& probe) {

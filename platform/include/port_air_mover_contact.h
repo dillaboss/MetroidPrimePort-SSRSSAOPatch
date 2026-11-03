@@ -3,6 +3,7 @@
 // selection and 0xf948d4's per-contact separation gate, so they can be regression-tested.
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 
 namespace PortAirMoverContact {
 
@@ -80,6 +81,56 @@ inline float SeparationDot(Vec3 displacement, Vec3 riderOffset, Vec3 working) {
 
 inline bool Acts(Vec3 displacement, Vec3 riderOffset, Vec3 working) {
   return !(SeparationDot(displacement, riderOffset, working) > 0.f);
+}
+
+// 0xf948d4:354-362: the rider offset is subtracted only for a contact whose owner (+0x30 of
+// its non-self side) is the mover's rider controller (+0x1210), and only while that is valid.
+// NPhysicsUtils::get_rider_controller_offset 0xc18f80 returns R+0x1100 - R+0x1128 plus a
+// rotation term that is zero when R's orientations +0x1118 and +0x1140 compare equal, so
+// for an unrotated rider it is the same pose delta PredictMotion 0xc23e40 carries. Owners use
+// the PortRemasteredGroundRider encoding: 0 is static terrain, never a rider.
+inline Vec3 RiderOffsetFor(std::uint32_t contactOwner, std::uint32_t riderOwner, bool riderActive,
+                           Vec3 riderOffset) {
+  if (!riderActive || contactOwner == 0u || contactOwner != riderOwner) {
+    return {};
+  }
+  return riderOffset;
+}
+
+// 0xc6d4e8-0xc6d5d4: the flat-floor early-out (0xc6d5d8) is reached only when the other
+// object's collidable (+0x168, vt+0x28 = GetObjectType) is type 0 (CCollidableAABox 0xbf60bc)
+// or type 2 (CCollidableOBBox 0xc10e48) with a transform axis within 1e-5 of up; every other
+// type (sphere 1, AABox tree 3, OBBox tree 4 - CCollidableOBBoxTree 0xc0fb1c, the DCLN
+// platforms - capsule 5) goes straight to 0xc6d624.
+enum ECollidableType { kCollidableAABox = 0, kCollidableOBBox = 2, kCollidableOBBoxTree = 4 };
+inline bool FlatFloorEarlyOutApplies(int collidableType, bool obboxAxisAlignedWithUp) {
+  return collidableType == kCollidableAABox ||
+         (collidableType == kCollidableOBBox && obboxAxisAlignedWithUp);
+}
+
+// 0xc6d110 GroundCheckForOffGroundMoverCollider's probe and landing band, along the up axis.
+// The callback gets two motion states: `hiUp` (param_4) and `targetUp` (param_5, whose
+// target transform it probes from). Its two callers in 0xf948d4 pass the bisection's blocked
+// hi state and the accepted lo state for a floor contact, and for the post-step probe while
+// rising the state moved 0.1 down and the state itself (calls at 0xf9524c and 0xf953f4).
+// `stepDown` is the vtable +0x198 call at 0xc6d230: CPlayerMP1::GetStepDownHeight (slot 51;
+// -1 in kMS_Jump, 0.1 in kMS_ApplyJump, else the actor's value), the same as the port's
+// CPlayer::GetStepDownHeight. hiUp is read at 0xc6d238 (`ldr s1, [x21, #4]`, Y-up).
+//  - fVar13 = targetUp - stepDown; probe up = min(max(fVar13, hiUp), targetUp - 0.002)
+//    (both selects are `x - y < 0` compares);
+//  - a contact point lands while `boxMin < pz` is false and `pz <= low` is false, `low`
+//    starting at fVar13 - 0.002; the upper bound is the box minimum at the target, which
+//    the caller supplies.
+struct GroundBand {
+  float probeUp = 0.f; // the box is tested with its translation moved to this height
+  float low = 0.f;     // exclusive lower bound of the landing band
+};
+
+inline GroundBand GroundCheckBand(float targetUp, float stepDown, float hiUp) {
+  const float base = targetUp - stepDown;
+  const float reach = base - hiUp < 0.f ? hiUp : base;
+  const float cap = targetUp - .002f;
+  return {reach - cap < 0.f ? reach : cap, base - .002f};
 }
 
 } // namespace PortAirMoverContact

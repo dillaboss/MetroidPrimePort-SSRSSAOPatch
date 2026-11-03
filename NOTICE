@@ -49,6 +49,8 @@ travels with any build that contains it.
 | FreeType | FreeType Licence | fetched, `freetype-src/docs/FTL.TXT` |
 | xxHash | BSD-2-Clause | fetched, `xxhash-src/` |
 | ARM astc-encoder 5.7.0 — ASTC texture encoder for the Remastered importer | Apache-2.0, © Arm Limited | `extern/astcenc/LICENSE.txt` |
+| tegra_swizzle 0.3.2 and bcdec_rs 0.1.2 — Tegra block linear untiling and BC1–BC7 decoders, ported to C++ in `platform/port_remastered_tegra_swizzle.cpp` and `platform/port_remastered_bcdec.cpp` | MIT, © 2017-2018 IOrange, © 2016-2017 Smith Lin, © 2021 Nathan Kelso, © 2020-2021 hds | header of each file |
+| astc-decode 0.3.1 — ASTC block decoder, ported to C++ in `platform/port_remastered_astc_decode.cpp` | Apache-2.0, © 2021 Weiyi Wang (derived from an Apache-2.0 decoder at UNC Chapel Hill) | header of the file |
 | libadrenotools — loads custom Vulkan drivers (Turnip) on Android | BSD-2-Clause, © Billy Laws | `extern/adrenotools/LICENSE` |
 | liblinkernsbypass — used by libadrenotools | BSD-2-Clause, © Billy Laws | `extern/adrenotools/lib/linkernsbypass/LICENSE` |
 | GamepadMotionHelpers — gyro calibration and player/world space | MIT, © Julian "Jibb" Smart | `extern/GamepadMotionHelpers/LICENSE` |

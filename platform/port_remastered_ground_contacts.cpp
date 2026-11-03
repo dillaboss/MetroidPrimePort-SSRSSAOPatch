@@ -7,6 +7,8 @@ namespace PortRemasteredGroundContacts {
 namespace {
 static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559);
 constexpr float Epsilon = std::numeric_limits<float>::epsilon();
+// 0x0554ad2e: the fmax floor inside CMath::SqrtF 0x65f70 (and 0x699b0's inlined copy).
+constexpr float kSqrtFloor = 1e-35f;
 float FromBits(std::uint32_t b) { float f; std::memcpy(&f, &b, 4); return f; }
 std::uint32_t Bits(float f) { std::uint32_t b; std::memcpy(&b, &f, 4); return b; }
 Vec3 Add(Vec3 a, Vec3 b) { return {a.x+b.x, a.y+b.y, a.z+b.z}; }
@@ -79,6 +81,30 @@ Vec3 Normalize(Vec3 v) {
   return {MulExtended(v.x,reciprocal), MulExtended(v.y,reciprocal), MulExtended(v.z,reciprocal)};
 }
 Vec3 Unit(Vec3 v) { return IsNormalizable(v) ? Normalize(v) : Vec3{}; }
+float SqrtF(float v) {
+  // 0x65f70: `fcmp v,0` + `b.le` is the machine guard, so the rule is !(v > 0) and NaN
+  // returns 0 like the non-positive inputs. The reciprocal square root is the ARM estimate
+  // with TWO frsqrts refinements, then multiplied into the original v.
+  if (!(v > 0.f)) return 0.f;
+  const float x = std::fmax(v, kSqrtFloor);
+  const float estimate = ReciprocalSqrtEstimate(x);
+  const float first = estimate * ReciprocalSqrtStep(x, estimate * estimate);
+  const float second = first * ReciprocalSqrtStep(x, first * first);
+  return v * second;
+}
+float NormalizeWithMagnitude(Vec3& v) {
+  // 0x6b100: the same pairs sum as Normalize ((x*x+z*z)+y*y: the source squares
+  // x,y in one NEON pair, moves z down and faddp's) and the same two frsqrts
+  // refinements; the components are written back with fmulx, and the returned
+  // magnitude is the source's `s0 = fmul v1,v2` - squared * that same final
+  // reciprocal, so m is not an independently computed |v|.
+  const float squared = (v.x*v.x + v.z*v.z) + v.y*v.y;
+  float reciprocal = ReciprocalSqrtEstimate(squared);
+  reciprocal *= ReciprocalSqrtStep(squared, reciprocal*reciprocal);
+  reciprocal *= ReciprocalSqrtStep(squared, reciprocal*reciprocal);
+  v = {MulExtended(v.x,reciprocal), MulExtended(v.y,reciprocal), MulExtended(v.z,reciprocal)};
+  return squared*reciprocal;
+}
 Vec3 Corner(const AABB& b, unsigned i) {
   // 0x98908: X/Z/Y bit order.
   return {i & 1 ? b.max.x : b.min.x, i & 4 ? b.max.y : b.min.y, i & 2 ? b.max.z : b.min.z};

@@ -20,8 +20,11 @@
 #include "port_apclient.h"
 #include "port_hints.h"
 #include "port_log.h"
+#include "port_model_variant.h"
 #include "port_randomizer.h"
+#include "port_room_effects.h"
 #include "port_skip_cutscenes.h"
+#include "port_synthetic_effect.h"
 
 #include <string>
 #include "MetroidPrime/Enemies/CAmbientAI.hpp"
@@ -670,8 +673,16 @@ CEntity* ScriptLoader::LoadSteam(CStateManager& mgr, CInputStream& in, int propC
   float hy = extent.GetY() * 0.5f;
   float hz = extent.GetZ() * 0.5f;
   CAABox aabb = CAABox(CVector3f(-hx, -hy, -hz), CVector3f(hx, hy, hz));
-  return rs_new CScriptSteam(mgr.AllocateUniqueId(), name, info, position, aabb, dInfo,
-                             orientedForce, triggerFlags, active, texture, f1, f2, f3, f4, b2);
+  CScriptSteam* const steam =
+      rs_new CScriptSteam(mgr.AllocateUniqueId(), name, info, position, aabb, dInfo,
+                          orientedForce, triggerFlags, active, texture, f1, f2, f3, f4, b2);
+#ifdef TARGET_PC
+  // PORT: a Steam a mod's Remastered SteamMP1 matched takes its visor steam (port_room_effects.h).
+  if (const PortRoomEffects::Steam* const rm = PortRoomEffects::FindSteam(info.GetEditorId().value)) {
+    steam->PortSetShip1(*rm);
+  }
+#endif
+  return steam;
 }
 
 CEntity* ScriptLoader::LoadRipple(CStateManager& mgr, CInputStream& in, int propCount,
@@ -1203,6 +1214,19 @@ CEntity* ScriptLoader::LoadEffect(CStateManager& mgr, CInputStream& in, int prop
 
   SScaledActorHead head(in, mgr);
   CAssetId partId = in.Get< CAssetId >();
+#ifdef TARGET_PC
+  // PORT: a retail effect a mod's Remastered effect actor matched takes the actor's PART
+  // (port_room_effects.h); the object itself stays, with its connections.
+  const PortRoomEffects::Override* const over = PortRoomEffects::FindOverride(info.GetEditorId().value);
+  if (over != nullptr && over->part != 0xFFFFFFFF && gpResourceFactory->GetResourceTypeById(over->part) != 0)
+    partId = over->part;
+  if (over != nullptr && partId == over->part && over->hasPlacement) {
+    head.x0_actorHead.x10_transform = ConvertEditorEulerToTransform4f(
+        CVector3f(over->rot[0], over->rot[1], over->rot[2]),
+        CVector3f(over->pos[0], over->pos[1], over->pos[2]));
+    head.x40_scale = CVector3f(over->scale[0], over->scale[1], over->scale[2]);
+  }
+#endif
   CAssetId elscId = in.Get< CAssetId >();
   bool hotInThermal = in.ReadBool();
   bool noTimerUnlessAreaOccluded = in.ReadBool();
@@ -1232,13 +1256,19 @@ CEntity* ScriptLoader::LoadEffect(CStateManager& mgr, CInputStream& in, int prop
   bool dieWhenSystemsDone = in.ReadBool();
   CLightParameters lParms = LoadLightParameters(in);
 
-  return rs_new CScriptEffect(
+  CScriptEffect* effect = rs_new CScriptEffect(
       mgr.AllocateUniqueId(), head.x0_actorHead.x0_name, info, head.x0_actorHead.x10_transform,
       head.x40_scale, partId, elscId, hotInThermal, noTimerUnlessAreaOccluded,
       rebuildSystemsOnActivate, active, useRateInverseCamDist, rateInverseCamDist,
       rateInverseCamDistRate, duration, durationResetWhileVisible, useRateCamDistRange,
       rateCamDistRangeMin, rateCamDistRangeMax, rateCamDistRangeFarRate, combatVisorVisible,
       thermalVisorVisible, xrayVisorVisible, lParms, dieWhenSystemsDone);
+#ifdef TARGET_PC
+  // PORT: and the actor's values for its system's particle variables (port_room_effects.h).
+  if (over != nullptr && partId == over->part && !over->vars.empty())
+    effect->PortSetExternalVars(PortRoomEffects::ExternalVars(over->vars));
+#endif
+  return effect;
 }
 
 CEntity* ScriptLoader::LoadTimer(CStateManager& mgr, CInputStream& in, int propCount,
@@ -4146,6 +4176,16 @@ CEntity* ScriptLoader::LoadPuffer(CStateManager& mgr, CInputStream& in, int prop
   CActorParameters actParms = LoadActorParameters(in);
   float hoverSpeed = in.ReadFloat();
   CAssetId cloudEffect = in.ReadLong();
+#ifdef TARGET_PC
+  // Remastered gives the cloud its own effect where retail reuses the
+  // patterned particle (C9D453A3 in both slots, every placement); the mod
+  // imports it under a synthetic id (port_remastered_effect_import.cpp).
+  if (cloudEffect == 0xC9D453A3) {
+    const CAssetId cloud = PortRemastered::SyntheticEffectId("puffercloud");
+    if (gpResourceFactory->CanBuild(SObjectTag('PART', cloud)))
+      cloudEffect = cloud;
+  }
+#endif
   CDamageInfo cloudDamage(in);
   CAssetId cloudSteam = in.ReadLong();
   float f2 = in.ReadFloat();
@@ -4155,9 +4195,20 @@ CEntity* ScriptLoader::LoadPuffer(CStateManager& mgr, CInputStream& in, int prop
   CDamageInfo explosionDamage(in);
   ushort sfxId = in.ReadLong();
 
+  CAssetId acsFile = pInfo.GetAnimationParameters().GetACSFile();
+#ifdef TARGET_PC
+  // Remastered plates the Tower of Light's puffers (its room names skin "Metal"); the mod imports
+  // that look as variant 1 of the puffer's ANCS.
+  if (mgr.GetWorld()->IGetAreaAlways(info.GetAreaId())->IGetAreaAssetId() == 0x0D72F1F7) {
+    const CAssetId variant = PortModelVariant::Id(acsFile, 1);
+    if (gpResourceFactory->GetResourceTypeById(variant) == 'ANCS')
+      acsFile = variant;
+  }
+#endif
+
   return rs_new CPuffer(
       mgr.AllocateUniqueId(), head.x0_actorHead.x0_name, info, head.x0_actorHead.x10_transform,
-      CModelData(CAnimRes(pInfo.GetAnimationParameters().GetACSFile(),
+      CModelData(CAnimRes(acsFile,
                           pInfo.GetAnimationParameters().GetCharacter(), head.x40_scale,
                           pInfo.GetAnimationParameters().GetInitialAnimation(), true)),
       actParms, pInfo, hoverSpeed, cloudEffect, cloudDamage, cloudSteam, f2, b1, b2, b3,

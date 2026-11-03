@@ -148,12 +148,14 @@ private:
 
 struct ModInfo {
   std::string name;
-  bool enabled = true;
+  bool enabled = true; // loaded by the last scan, not the saved enabled intent
+  bool pendingRestart = false; // enabled intent retained; geometry buffers were not reserved at startup
   int files = 0;     // disc files replaced
   int resources = 0; // loose resources used
   int textures = 0;  // <id>.dds images
   bool import = false;       // made by the Remastered import (stamp present, or its folder name)
   bool importStale = false;  // ... and by an older importer than this build's
+  std::string hidden;        // an import's parts the last scan left out (remastered_hide), as set
 };
 
 struct Status {
@@ -224,6 +226,14 @@ std::vector<std::string> GalleryPaths();
 std::string HudBarsPath(uint32_t frame);
 // The thermal.lut a mod supplies (the thermal visor's heat gradient, 256x4 RGBA8); empty when none.
 std::string ThermalLutPath();
+// The envfx.bin a mod supplies (Remastered's EnvironmentFX textures, port_envfx_assets.h); empty when none.
+std::string EnvFxPath();
+// The shell.bin a mod supplies (Remastered's silhouette-shell textures, port_shell_assets.h); empty when none.
+std::string ShellPath();
+// The icy.bin a mod supplies (Remastered's frozen-enemy material, port_icy_assets.h); empty when none.
+std::string IcyPath();
+// The retailplacements.bin a mod supplies (port_retail_placement.h); empty when none.
+std::string RetailPlacementPath();
 // The id a retail asset (a WPSC) reads for an effect in its field ('APS2'...), when a mod's
 // effectids.map gives that effect its own id (the Remastered import does so where two projectiles
 // share a disc id); `id` itself when none does. Safe from any thread.
@@ -232,17 +242,49 @@ uint32_t RemapEffectId(uint32_t owner, uint32_t field, uint32_t id);
 std::string RoomGeoPath(uint32_t mrea);
 // The same for its liquid surfaces (port_room_liquid.h).
 std::string RoomLiquidPath(uint32_t mrea);
+// The same for its Remastered effect actors (port_room_effects.h).
+std::string RoomEffectsPath(uint32_t mrea);
+// Winning loose-resource provenance. Empty for disc/whole-PAK resources; main thread only.
+// Native DDS ownership takes precedence for a TXTR. Used for atomic room-effect groups.
+std::string ResourceProvider(uint32_t type, uint32_t id);
+std::string RoomEffectsProvider(uint32_t mrea);
+uint64_t ResourceGeneration();
 // Every roomgeo/lods.bin the mods supply (port_room_geo.h), in mod order: a later one's
 // entry for a model stands in for an earlier one's.
 std::vector<std::string> RoomLodPaths();
 // Whether any mod folder holds room geometry. Reads the disk, and needs no Initialize:
 // the frame buffers are sized from it before there is a renderer.
 bool HasRoomGeometry();
+// The same for the folders that would load (mods on, the folder not disabled).
+bool HasEnabledRoomGeometry();
+// Whether any mod folder would load: the mods setting is on and a folder is not disabled. Like
+// HasRoomGeometry it reads the disk and needs no Initialize. With none, nothing can bring a
+// PBR material (only a mod's converted materials are PBR).
+bool AnyModEnabled();
 // Whether the loaded mods supply room geometry for any area.
 bool RoomGeometryLoaded();
+// Whether the loaded mods supply a room environment for any area (Remastered's lighting and tone,
+// which CMFGame draws in the HDR scene).
+bool RoomEnvLoaded();
 
 // Folder names the settings disable, '/'-separated (no folder name has one).
 std::vector<std::string> SplitDisabled(const std::string& list);
 std::string JoinDisabled(const std::vector<std::string>& names);
+
+// The parts of an installed Remastered import a scan can leave out, kept as a comma-separated list
+// (remastered_hide; MP_REMASTERED_HIDE overrides it): the disc's own asset stands in for each
+// file left out. Textures and material cubes always load: they have ids of their own, and load
+// only for a model that names them. Unlike remastered_skip, nothing is re-imported.
+inline constexpr const char* kImportParts[] = {"geometry", "effects", "models", "hud",
+                                               "font",     "text",    "map",    "movies"};
+bool ImportPartHidden(const std::string& list, const char* part);
+inline bool SameImportParts(const std::string& a, const std::string& b) {
+  for (const char* part : kImportParts) {
+    if (ImportPartHidden(a, part) != ImportPartHidden(b, part)) {
+      return false;
+    }
+  }
+  return true;
+}
 
 } // namespace PortMods

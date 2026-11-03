@@ -2,6 +2,7 @@
 #include "port_freecam.h"
 
 #include "port_debug.h"
+#include "port_third_person.h"
 #include "Kyoto/Input/CFinalInput.hpp"
 #include "Kyoto/Math/CRelAngle.hpp"
 #include "Kyoto/Math/CTransform4f.hpp"
@@ -23,6 +24,7 @@ bool sActive = false;
 bool sFrozen = false;
 float sSpeed = 10.f;
 bool sShowPlayer = true;
+bool sDrive = false;
 Pose sPose{0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 float sFov = 0.f;
 float sTouchMoveX = 0.f;
@@ -118,6 +120,8 @@ void SetSpeed(float speed) {
 
 bool ShowPlayer() { return sActive && sShowPlayer; }
 void SetShowPlayer(bool show) { sShowPlayer = show; }
+bool Drive() { return sActive && sDrive; }
+void SetDrive(bool drive) { sDrive = drive; }
 
 Pose GetPose() { return sPose; }
 
@@ -171,6 +175,9 @@ bool Input(const CFinalInput& input) {
   if (PortDebug::OverlayVisible()) {
     return true; // the overlay has the pad
   }
+  if (sDrive) {
+    return false; // the player has the pad
+  }
   const float dt = std::clamp(input.Time(), 0.f, 0.1f);
   sPose.yaw -= (input.ARARight() - input.ARALeft()) * kTurnRate * dt;
   sPose.pitch += (input.ARAUp() - input.ARADown()) * kTurnRate * dt;
@@ -203,7 +210,7 @@ bool Input(const CFinalInput& input) {
 
 CTransform4f View(const CTransform4f& game) {
   if (!sActive) {
-    return game;
+    return PortThirdPerson::View(game);
   }
   const Pose pose = PresentedPose();
   CTransform4f xf = ViewRotation(pose);

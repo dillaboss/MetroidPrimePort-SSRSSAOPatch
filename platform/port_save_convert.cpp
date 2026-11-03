@@ -1,4 +1,8 @@
 #include "port_save_convert.h"
+#include "port_hash.h"
+#include "port_bytes.h"
+
+#include "port_map_marks.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -61,6 +65,7 @@ Tab TabOf(Layout layout) {
   case Layout::Pal:
     return {lay::pal::kWorlds, std::size(lay::pal::kWorlds)};
   case Layout::Wii:
+  case Layout::TriGc:
     return {lay::wii::kWorlds, std::size(lay::wii::kWorlds)};
   default:
     return {lay::usa::kWorlds, std::size(lay::usa::kWorlds)};
@@ -96,8 +101,8 @@ LayerKey KeyOf(const lay::WorldEntry& w, const lay::AreaEntry& a, u32 i) {
 // The scan bits of a slot, in stream order: the union over the worlds, sorted
 // by id (stable), duplicates removed. The Trilogy keys by id only.
 const std::vector<std::pair<u32, u32>>& ScanList(Layout layout) {
-  static std::vector<std::pair<u32, u32>> lists[3];
-  static bool built[3] = {};
+  static std::vector<std::pair<u32, u32>> lists[4];
+  static bool built[4] = {};
   auto& list = lists[int(layout)];
   if (!built[int(layout)]) {
     built[int(layout)] = true;
@@ -265,13 +270,7 @@ struct Aes {
   }
 };
 
-u32 BE32(const uint8_t* p) { return u32(p[0]) << 24 | u32(p[1]) << 16 | u32(p[2]) << 8 | p[3]; }
-void PutBE32(uint8_t* p, u32 v) {
-  p[0] = uint8_t(v >> 24);
-  p[1] = uint8_t(v >> 16);
-  p[2] = uint8_t(v >> 8);
-  p[3] = uint8_t(v);
-}
+using port::WriteBE32;
 
 // The card's checksum: crc32 of everything after the first four bytes, inverted.
 u32 CardCrc(const uint8_t* block, size_t size) { return Crc32(block + 4, size - 4) ^ 0xFFFFFFFFu; }
@@ -424,6 +423,13 @@ void ReadSlot(const uint8_t* d, size_t size, const SlotFmt& f, Slot& s, std::set
       s.hasSeen = true;
       for (auto& word : s.seen)
         word = peek.Read(32);
+      // The room marks follow; a cut or absent trailer leaves none.
+      if (!peek.eof && peek.Left() >= PortMapMarks::kHeaderBits && peek.Read(32) == PortMapMarks::kMagic) {
+        const PortMapMarks::List list = PortMapMarks::Get([&peek](unsigned bits) { return peek.Read(int(bits)); });
+        if (!peek.eof) {
+          s.marks.assign(list.packed, list.packed + list.count);
+        }
+      }
     }
   }
   s.present = !r.eof || s.mlvl != 0 || s.timestamp != 0;
@@ -521,6 +527,14 @@ bool WriteSlot(const Slot& s, Layout layout, int flags, size_t slotSize, std::ve
     w.Write(kSeenMagic, 32);
     for (u32 word : s.seen)
       w.Write(word, 32);
+    PortMapMarks::List list;
+    for (size_t i = 0; i < s.marks.size() && i < PortMapMarks::kMaxMarks; ++i) {
+      list.packed[list.count++] = s.marks[i];
+    }
+    const size_t fit = PortMapMarks::Fit(list.count, w.limit, w.pos);
+    if (fit != 0) {
+      PortMapMarks::Put(list, fit, [&w](u32 value, unsigned bits) { w.Write(value, int(bits)); });
+    }
   }
   if (w.overflow)
     ++stats.truncatedSlots;
@@ -577,7 +591,7 @@ std::vector<uint8_t> LeadFor(const System& s, bool pal) {
 }
 
 std::vector<uint8_t> WriteSystem(const System& s, Layout layout) {
-  const bool pal = layout == Layout::Pal;
+  const bool pal = layout == Layout::Pal || layout == Layout::TriGc;
   const size_t total = pal ? kPalSystem : kUsaSystem;
   std::vector<uint8_t> lead = LeadFor(s, pal);
   BitWriter w(total * 8);
@@ -700,7 +714,8 @@ bool ReadUsaContainer(const uint8_t* save, size_t size, Layout layout, int flags
   return true;
 }
 
-bool ReadPalContainer(const uint8_t* gci, size_t size, Save& out, std::string& error) {
+// `layout`: Pal, or TriGc for a Trilogy disc's card file (the same container).
+bool ReadPalContainer(const uint8_t* gci, size_t size, Layout layout, Save& out, std::string& error) {
   if (size < kHeader + 3 * kBlock) {
     error = "the save is cut short";
     return false;
@@ -708,7 +723,7 @@ bool ReadPalContainer(const uint8_t* gci, size_t size, Save& out, std::string& e
   const uint8_t* copies[2] = {gci + kHeader + kBlock, gci + kHeader + 2 * kBlock};
   bool valid[2];
   for (int i = 0; i < 2; ++i)
-    valid[i] = BE32(copies[i]) == CardCrc(copies[i], kBlock);
+    valid[i] = port::ReadBE32(copies[i]) == CardCrc(copies[i], kBlock);
   int pick;
   if (!valid[0] && !valid[1]) {
     error = "both copies of the save fail their checksum";
@@ -716,13 +731,13 @@ bool ReadPalContainer(const uint8_t* gci, size_t size, Save& out, std::string& e
   } else if (valid[0] != valid[1]) {
     pick = valid[0] ? 0 : 1;
   } else {
-    pick = BE32(copies[0] + 4) == BE32(copies[1] + 4) ? 0 : 1;
+    pick = port::ReadBE32(copies[0] + 4) == port::ReadBE32(copies[1] + 4) ? 0 : 1;
   }
   const uint8_t* c = copies[pick];
-  out.layout = Layout::Pal;
-  ReadSystem(c + 0xF, kPalSystem, kPalLead, Lead::Pal, true, true, Layout::Pal, out.system);
+  out.layout = layout;
+  ReadSystem(c + 0xF, kPalSystem, kPalLead, Lead::Pal, true, true, layout, out.system);
   size_t off = kPalSlotBase;
-  const SlotFmt fmt{Layout::Pal, false, 6};
+  const SlotFmt fmt{layout, false, 6};
   for (int i = 0; i < 3; ++i) {
     if (c[0xC + i] == 0)
       continue;
@@ -740,7 +755,7 @@ bool ReadWii(const uint8_t* d, size_t size, Save& out, std::string& error) {
     error = "not a Trilogy save.bin";
     return false;
   }
-  if (BE32(d) != (Crc32(d + 4, 0x1980C - 4) ^ 0xFFFFFFFFu)) {
+  if (port::ReadBE32(d) != (Crc32(d + 4, 0x1980C - 4) ^ 0xFFFFFFFFu)) {
     error = "the Trilogy save fails its checksum";
     return false;
   }
@@ -784,8 +799,8 @@ std::vector<uint8_t> MakeHeader(bool pal, size_t blocks, int64_t now) {
   h[6] = 0xFF;
   h[7] = 0x01;
   PutName(h.data(), pal ? "MetroidPrime" : "MetroidPrime A");
-  PutBE32(&h[0x28], u32(now - 946684800));
-  PutBE32(&h[0x2C], u32(kArtOffset));
+  WriteBE32(&h[0x28], u32(now - 946684800));
+  WriteBE32(&h[0x2C], u32(kArtOffset));
   h[0x30] = 0x00;
   h[0x31] = 0x01;
   h[0x32] = 0x00;
@@ -797,7 +812,7 @@ std::vector<uint8_t> MakeHeader(bool pal, size_t blocks, int64_t now) {
   h[0x38] = uint8_t(blocks >> 8);
   h[0x39] = uint8_t(blocks);
   h[0x3A] = h[0x3B] = 0xFF;
-  PutBE32(&h[0x3C], 4);
+  WriteBE32(&h[0x3C], 4);
   return h;
 }
 
@@ -821,23 +836,7 @@ void PutComment(uint8_t* block, bool pal, int64_t now) {
 
 // ---- public ----------------------------------------------------------------------------
 
-uint32_t Crc32(const uint8_t* data, size_t size) {
-  static u32 table[256];
-  static bool ready = false;
-  if (!ready) {
-    for (u32 i = 0; i < 256; ++i) {
-      u32 c = i;
-      for (int k = 0; k < 8; ++k)
-        c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-      table[i] = c;
-    }
-    ready = true;
-  }
-  u32 crc = 0xFFFFFFFFu;
-  for (size_t i = 0; i < size; ++i)
-    crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
-  return crc ^ 0xFFFFFFFFu;
-}
+uint32_t Crc32(const uint8_t* data, size_t size) { return port::Crc32(data, size); }
 
 void AesCbcDecrypt(const uint8_t key[16], const uint8_t iv[16], const uint8_t* in, size_t size, uint8_t* out) {
   const Aes aes(key);
@@ -864,21 +863,10 @@ const char* FormatName(Format format) {
   case Format::WiiSave:
   case Format::WiiDataBin:
     return "Wii";
+  case Format::TriGci:
+    return "Trilogy (GameCube card)";
   default:
     return "unknown";
-  }
-}
-
-Layout LayoutOf(Format format) {
-  switch (format) {
-  case Format::PalGci:
-  case Format::PalLegacyGci:
-    return Layout::Pal;
-  case Format::WiiSave:
-  case Format::WiiDataBin:
-    return Layout::Wii;
-  default:
-    return Layout::Usa;
   }
 }
 
@@ -914,7 +902,7 @@ bool DecryptDataBin(const uint8_t* d, size_t size, std::vector<uint8_t>& saveBin
     error = "not a Wii data.bin";
     return false;
   }
-  const u32 nfiles = BE32(d + kBk + 0xC);
+  const u32 nfiles = port::ReadBE32(d + kBk + 0xC);
   if (nfiles == 0 || nfiles > 64) {
     error = "the data.bin has an invalid file count";
     return false;
@@ -925,14 +913,14 @@ bool DecryptDataBin(const uint8_t* d, size_t size, std::vector<uint8_t>& saveBin
       error = "the data.bin is cut short";
       return false;
     }
-    if (BE32(d + off) != 0x03ADF17Eu)
+    if (port::ReadBE32(d + off) != 0x03ADF17Eu)
       off += 0x10;
-    if (off + kFileHeader > size || BE32(d + off) != 0x03ADF17Eu) {
+    if (off + kFileHeader > size || port::ReadBE32(d + off) != 0x03ADF17Eu) {
       error = "the data.bin has a bad file header";
       return false;
     }
     const uint8_t* h = d + off;
-    const u32 fsize = BE32(h + 4);
+    const u32 fsize = port::ReadBE32(h + 4);
     const uint8_t type = h[10];
     char name[0x46] = {};
     std::memcpy(name, h + 11, 0x45);
@@ -958,7 +946,9 @@ bool DecryptDataBin(const uint8_t* d, size_t size, std::vector<uint8_t>& saveBin
   return false;
 }
 
-Format NativeFormat(bool pal) { return pal ? Format::PalGci : Format::UsaGci; }
+Format NativeFormat(bool pal, bool trilogy) {
+  return trilogy ? Format::TriGci : pal ? Format::PalGci : Format::UsaGci;
+}
 
 Format Detect(const uint8_t* d, size_t size) {
   if (d == nullptr)
@@ -978,6 +968,10 @@ Format Detect(const uint8_t* d, size_t size) {
       return size >= kHeader + 3 * kBlock ? Format::PalGci : Format::Unknown;
     }
   }
+  // The port's card files for a Trilogy disc (R3ME/R3MP): PAL's container, with
+  // the relays, doors and scans ordered by the Trilogy's own SAVW tables.
+  if (size >= kHeader + 3 * kBlock && d[0] == 'R' && d[1] == '3' && d[2] == 'M' && (d[3] == 'E' || d[3] == 'P'))
+    return Format::TriGci;
   return Format::Unknown;
 }
 
@@ -1006,7 +1000,8 @@ bool Read(const uint8_t* data, size_t size, Format& format, Save& out, std::vect
     break;
   }
   case Format::PalGci:
-    ok = ReadPalContainer(data, size, out, error);
+  case Format::TriGci:
+    ok = ReadPalContainer(data, size, format == Format::TriGci ? Layout::TriGc : Layout::Pal, out, error);
     break;
   case Format::WiiSave:
     ok = ReadWii(data, size, out, error);
@@ -1099,17 +1094,27 @@ void Retarget(Save& save, Layout to, Stats& stats) {
           }
         }
       }
+      // The current area by its MREA; the source index would name whatever room
+      // sits at that index in the target. One the target lacks becomes its
+      // first area, counted. An unresolved source index is kept as it was.
+      n.areaKnown = false;
       if (w.areaKnown) {
+        n.areaRaw = 0;
         for (u32 i = 0; i < dst->nAreas; ++i) {
           if (dst->areas[i].mrea == w.areaMrea) {
             n.areaRaw = i;
+            n.areaKnown = true;
             break;
           }
         }
+        if (!n.areaKnown) {
+          ++stats.areas;
+          Note(stats, "area", w.areaMrea);
+          n.areaKnown = dst->nAreas > 0;
+        }
+        if (n.areaKnown)
+          n.areaMrea = dst->areas[n.areaRaw].mrea;
       }
-      n.areaKnown = n.areaRaw < dst->nAreas;
-      if (n.areaKnown)
-        n.areaMrea = dst->areas[n.areaRaw].mrea;
       worlds[mlvl] = std::move(n);
     }
     s.worlds = std::move(worlds);
@@ -1137,7 +1142,7 @@ void Retarget(Save& save, Layout to, Stats& stats) {
 
 bool WriteGci(const Save& save, bool pal, const std::vector<uint8_t>& art, int64_t now,
               std::vector<uint8_t>& gci, Stats& stats, std::string& error) {
-  const Layout want = pal ? Layout::Pal : Layout::Usa;
+  const Layout want = !pal ? Layout::Usa : save.layout == Layout::TriGc ? Layout::TriGc : Layout::Pal;
   if (save.layout != want) {
     error = "the save is not in the target layout";
     return false;
@@ -1146,6 +1151,9 @@ bool WriteGci(const Save& save, bool pal, const std::vector<uint8_t>& art, int64
     now = int64_t(std::time(nullptr));
   const size_t blocks = pal ? 3 : 1;
   gci = MakeHeader(pal, blocks, now);
+  // Named for a Trilogy disc so it reads back as one; the card sets R3ME or R3MP.
+  if (want == Layout::TriGc)
+    std::memcpy(gci.data(), "R3ME", 4);
   gci.resize(kHeader + blocks * kBlock, 0);
   uint8_t* sector0 = gci.data() + kHeader;
   PutComment(sector0, pal, now);
@@ -1171,13 +1179,13 @@ bool WriteGci(const Save& save, bool pal, const std::vector<uint8_t>& art, int64
       std::memcpy(d + off, s.data(), s.size());
       off += s.size();
     }
-    PutBE32(sector0, CardCrc(sector0, kBlock));
+    WriteBE32(sector0, CardCrc(sector0, kBlock));
     return true;
   }
   for (int c = 0; c < 2; ++c) {
     uint8_t* d = gci.data() + kHeader + (1 + c) * kBlock;
-    PutBE32(d + 4, 0);
-    PutBE32(d + 8, 0);
+    WriteBE32(d + 4, 0);
+    WriteBE32(d + 8, 0);
     std::memcpy(d + 0xC, present, 3);
     std::memcpy(d + 0xF, sys.data(), sys.size());
     size_t off = kPalSlotBase;
@@ -1185,20 +1193,21 @@ bool WriteGci(const Save& save, bool pal, const std::vector<uint8_t>& art, int64
       std::memcpy(d + off, s.data(), s.size());
       off += s.size();
     }
-    PutBE32(d, CardCrc(d, kBlock));
+    WriteBE32(d, CardCrc(d, kBlock));
   }
-  PutBE32(sector0, CardCrc(sector0, kBlock));
+  WriteBE32(sector0, CardCrc(sector0, kBlock));
   return true;
 }
 
 bool ConvertTo(const uint8_t* data, size_t size, Format target, const std::vector<uint8_t>& art,
                Conversion& out, std::string& error) {
   out = Conversion{};
-  if (target != Format::UsaGci && target != Format::PalGci) {
+  if (target != Format::UsaGci && target != Format::PalGci && target != Format::TriGci) {
     error = std::string("cannot write ") + FormatName(target) + " saves";
     return false;
   }
-  const bool pal = target == Format::PalGci;
+  const bool pal = target != Format::UsaGci;
+  const Layout layout = target == Format::TriGci ? Layout::TriGc : pal ? Layout::Pal : Layout::Usa;
   Save save;
   std::vector<uint8_t> sourceArt;
   if (!Read(data, size, out.from, save, &sourceArt, error))
@@ -1207,7 +1216,7 @@ bool ConvertTo(const uint8_t* data, size_t size, Format target, const std::vecto
     if (s.present)
       out.newest = std::max(out.newest, s.timestamp);
   }
-  Retarget(save, pal ? Layout::Pal : Layout::Usa, out.stats);
+  Retarget(save, layout, out.stats);
   return WriteGci(save, pal, sourceArt.empty() ? art : sourceArt, 0, out.gci, out.stats, error);
 }
 
@@ -1291,8 +1300,15 @@ bool WriteWii(const Save& save, const uint8_t* base, size_t size, std::vector<ui
     const bool used = WiiFileUsed(d, i);
     if (!used) {
       if (model >= 0) {
+        // The summary copy covers the Mii owner id (sum+0x3F): a file another
+        // Mii already owns keeps its own.
+        const bool owned = WiiFileOwned(d, i);
+        uint8_t owner[8];
+        std::memcpy(owner, sum + 0x3F, sizeof(owner));
         std::memcpy(entry, d + kWiiEntry + 7 * size_t(model), 7);
         std::memcpy(sum, d + kWiiSummary[model], kWiiSummaryMp1);
+        if (owned)
+          std::memcpy(sum + 0x3F, owner, sizeof(owner));
         std::memcpy(slot, d + kWiiSlot[model], kWiiSlotSize / 2);
       } else {
         static constexpr uint8_t kEntry[7] = {1, 1, 0, 0, 1, 0, 0}; // a real PAL save's
@@ -1334,33 +1350,33 @@ bool WriteWii(const Save& save, const uint8_t* base, size_t size, std::vector<ui
     // progress: the second u32, the three bytes and the last two, whose
     // meaning is unknown, and a difficulty above Veteran on a hard slot.
     uint8_t* m = sum + kWiiSummaryMp1;
-    const bool hadMp1 = BE32(m + 4) != 0xFFFFFFFFu && BE32(m + 24) == 3;
-    const u32 second = hadMp1 ? BE32(m + 4) : 4;
-    const u32 difficulty = hadMp1 && s.hard && BE32(m) > 1 ? BE32(m) : (s.hard ? 1 : 0);
+    const bool hadMp1 = port::ReadBE32(m + 4) != 0xFFFFFFFFu && port::ReadBE32(m + 24) == 3;
+    const u32 second = hadMp1 ? port::ReadBE32(m + 4) : 4;
+    const u32 difficulty = hadMp1 && s.hard && port::ReadBE32(m) > 1 ? port::ReadBE32(m) : (s.hard ? 1 : 0);
     uint8_t keep[5] = {};
     if (hadMp1) {
       std::memcpy(keep, m + 28, 3);
       std::memcpy(keep + 3, m + 39, 2);
     }
     std::memset(m, 0, 41);
-    PutBE32(m, difficulty);
-    PutBE32(m + 4, second);
-    PutBE32(m + 8, ItemPercent(s));
-    PutBE32(m + 12, s.playHi);
-    PutBE32(m + 16, s.playLo);
-    PutBE32(m + 20, s.capacity[24]);
-    PutBE32(m + 24, 3);
+    WriteBE32(m, difficulty);
+    WriteBE32(m + 4, second);
+    WriteBE32(m + 8, ItemPercent(s));
+    WriteBE32(m + 12, s.playHi);
+    WriteBE32(m + 16, s.playLo);
+    WriteBE32(m + 20, s.capacity[24]);
+    WriteBE32(m + 24, 3);
     std::memcpy(m + 28, keep, 3);
-    PutBE32(m + 35, s.mlvl);
+    WriteBE32(m + 35, s.mlvl);
     std::memcpy(m + 39, keep + 3, 2);
   }
   if (!any) {
     error = "the save has no slots";
     return false;
   }
-  if (BE32(d + kWiiHash) == 0)
-    PutBE32(d + kWiiHash, kWiiHashValue);
-  PutBE32(d, Crc32(d + 4, kWiiCrcEnd - 4) ^ 0xFFFFFFFFu);
+  if (port::ReadBE32(d + kWiiHash) == 0)
+    WriteBE32(d + kWiiHash, kWiiHashValue);
+  WriteBE32(d, Crc32(d + 4, kWiiCrcEnd - 4) ^ 0xFFFFFFFFu);
   return true;
 }
 
@@ -1375,7 +1391,7 @@ bool ConvertToTrilogy(const uint8_t* data, size_t size, const uint8_t* base, siz
   // file a Mii owns (the header's current one when owned, else the first).
   int target = -1;
   if (baseSize == kWiiSave) {
-    const u32 current = BE32(base + 8);
+    const u32 current = port::ReadBE32(base + 8);
     for (int i = 0; i < 3 && target < 0; ++i) {
       if (WiiFileOwned(base, i))
         target = i;

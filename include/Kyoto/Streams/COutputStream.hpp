@@ -73,6 +73,13 @@ public:
   }
 
   uint GetWrittenBytes() const { return mNumWrites; }
+#ifdef TARGET_PC
+  // Port: bits written so far, counting the ones still in the shift register.
+  uint PortBitsWritten() const { return mNumWrites * 8 + (32 - mShiftRegisterOffset); }
+  // Port: the most bits this stream can hold (a memory stream truncates past
+  // its buffer), or no limit.
+  virtual uint PortCapacityBits() const { return 0xFFFFFFFFu; }
+#endif
 
 private:
   uint mUnwrittenLen;

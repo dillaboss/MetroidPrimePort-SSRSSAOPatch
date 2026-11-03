@@ -17,9 +17,17 @@ MSVC developer environment/Windows SDK. Older compiler versions are unverified.
 
 Aurora and MusyX are vendored snapshots; a normal clone is sufficient. Aurora
 fetches pinned transitive dependencies on the first configure. On Linux install
-SDL build prerequisites (X11/Wayland, ALSA/PulseAudio, EGL/OpenGL, FreeType, PNG);
-see `.github/workflows/native-linux.yml` for the Ubuntu package list and
-`extern/aurora/docs/building.md` for dependency-provider options.
+SDL build prerequisites (X11/Wayland, ALSA/PulseAudio, EGL/OpenGL, FreeType, PNG).
+On Ubuntu 24.04:
+
+```sh
+sudo apt-get install ninja-build g++-14 libasound2-dev libpulse-dev libx11-dev \
+  libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev \
+  libxtst-dev libwayland-dev libxkbcommon-dev libegl1-mesa-dev libgl-dev \
+  libfreetype-dev libpng-dev
+```
+
+See `extern/aurora/docs/building.md` for dependency-provider options.
 
 ```sh
 cmake -S . -B build/native -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -31,6 +39,20 @@ ctest --test-dir build/native -L port --output-on-failure
 For Windows, run from an MSVC developer shell and add
 `-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl` to configure.
 Plain MSVC `cl.exe` and MinGW builds are not currently validated.
+
+CI builds and tests Linux (GCC 14 and Clang 18) on each push to `port` and
+each pull request; Windows (clang-cl) and macOS (arm64, experimental) run
+weekly and can be started by hand from the Actions tab (`.github/workflows/`).
+CI configures with `-DAURORA_ENABLE_TESTS=ON`, which adds Aurora's GPU-free
+FIFO/GX tests (`gx_fifo_tests`); turn it on to run the same suite locally.
+
+Configure downloads about a dozen pinned dependencies (checked by SHA-256). On
+a machine without access to GitHub, clone them yourself and point CMake at the
+copies with `-DFETCHCONTENT_SOURCE_DIR_<NAME>=<dir>`, the way
+`flatpak/io.github.odrannnn.metroidprimeport.yml` does.
+
+Android builds through Gradle: `tools/make_android_keystore.sh` once, then
+`tools/android_apk.sh :app:assembleRelease`; see `docs/ANDROID.md`.
 
 macOS (Apple Silicon, macOS 13+) is experimental: `.github/workflows/macos.yml`
 builds it on `macos-15` with Homebrew's `ninja` and `openssl@3` and renders
@@ -57,7 +79,7 @@ One configuration takes about 0.5 GB of cache (`ccache -M` sets the limit).
 
 No disc or generated game-asset headers are needed to compile. The two embedded
 default-font resources are read from the mounted retail DOL at runtime, using
-the addresses in `config/GM8E01_00/symbols.txt`. Native builds do not depend on
+the addresses in `decomp/config/GM8E01_00/symbols.txt`. Native builds do not depend on
 `build/GM8E01_00/include` or distribute extracted font data.
 
 ### Linking and packaging
@@ -94,14 +116,21 @@ image. Otherwise, when no disc is found it opens the platform's file dialog and
 remembers the answer as `disc_path` in the settings file. There is no prompt
 when the port has no window to show one on, or with `MP_NO_DISC_DIALOG=1`
 (for scripted runs that do have a window, as on a build runner). The disc must
-identify as **GM8E01, disc 0, revision 0, 1 or 2** (USA 1.00, 1.01 or 1.02) or **GM8P01** (PAL).
+identify as **GM8E01, disc 0, revision 0, 1 or 2** (USA 1.00, 1.01 or 1.02), **GM8P01** (PAL) or
+**R3ME01** or **R3MP01** (Metroid Prime Trilogy, USA or PAL; experimental). A Trilogy disc runs its Metroid Prime: the
+`MP1` directory is the disc's root (with the rest of the disc still visible) and `rs5mp1_p.dol` its
+DOL. That data is the PAL revision's, so it runs like a PAL disc (PAL skips and script fixes, except
+PAL's extra Main Quarry lock, which Trilogy lacks). The front end plays Trilogy's own Metroid Prime
+menu movies from `fe/Video/mp1`. Saves are an `R3ME` (USA) or `R3MP` (PAL) file, apart from the GameCube ones: PAL's container, with relays, doors and scans in the Trilogy's own order (a GameCube save is converted, not copied). The two
+Trilogy discs have the same Metroid Prime world data; the PAL one differs in its DOL build, its
+`Strings.pak` and some movies.
 PAL support is experimental: a PAL disc runs the same 1.00 code on its own data, at 60 Hz, with every port
 feature (Remastered import, randomizer, Archipelago, cutscene skips) and its
 languages; its saves are kept apart from USA ones. USA 1.01 runs the same
 way; its data differs from 1.00 only in a few rooms' scripts and one credits
 name. USA 1.02 runs the same way (its rooms' scripts differ more, and the
-cutscene skips and the Arboretum gate fix have 1.02 variants); Japanese, Korean and Wii discs
-are rejected. Nod/Aurora supports additional image
+cutscene skips and the Arboretum gate fix have 1.02 variants); Japanese, Korean and other Wii
+discs are rejected. Nod/Aurora supports additional image
 containers, but the same retail content is required.
 
 `metroid_prime_port --version` prints the source revision without initializing
@@ -135,7 +164,8 @@ managers cannot reach. F1 > System > Data folder moves it to
 `/storage/emulated/0/MetroidPrime/` (the shared storage root): it asks for "All
 files access" (Android 11+; storage permission on 9/10), copies saves, settings,
 mods, save states, the texture pack and the copied disc there with a progress
-bar (built-in textures and the pipeline cache stay behind), then restarts the
+bar (built-in textures, the pipeline cache and the app's own Remastered import
+stay behind; docs/MODS.md), then restarts the
 game. If the shared folder already holds data, it offers to use that data or to
 copy over it. The choice is kept in `data_folder.txt` in app storage; "Move
 back to app storage" reverses it, and "Delete the old copy" frees the space the
@@ -143,7 +173,8 @@ old folder still takes. If access is revoked later, the game starts from app
 storage and says so, with buttons to grant access again or stay there.
 
 `MP_USER_PATH` overrides the folder
-and `MP_CACHE_PATH` the caches alone; use separate directories for automated
+and `MP_CACHE_PATH` the caches alone (neither moves the built-in Remastered
+import, which stays in app storage); use separate directories for automated
 testing so runs do not share normal saves/settings (the memory card stays with
 the executable either way). Screenshots are written to `screenshots/` in the
 working directory.
@@ -423,6 +454,38 @@ cutscene skipping is independent.
 ### Controls and settings
 
 Moved to `docs/SETTINGS.md`; the debug console now lives in `docs/CONSOLE.md`.
+## Where port code goes
+
+The game code under `src/` and `include/` is the decompilation and stays
+recognisably so: it is what upstream PrimeDecomp fixes are merged into (see
+`tools/upstream_screen.py`), and what reviewers compare against the original.
+Port behaviour therefore lives in `platform/`, and a decomp file gets only a
+short `#ifdef TARGET_PC` hook that calls into it, as in `CPlayer.cpp`:
+
+```cpp
+#ifdef TARGET_PC
+  if (const float hurt = PortConsoleTakePendingHurt(); hurt > 0.f) {
+    TakeDamage(true, GetTranslation(), hurt, kWT_AI, mgr);
+  }
+#endif
+```
+
+The `Port*` function or namespace (declared in `platform/include/port_*.h`,
+defined in `platform/port_*.cpp`) holds the logic, its state and its settings,
+and can be unit tested in `tests/` against that header, without the game.
+A hook passes in the game objects it needs and acts on what comes back; it
+does not grow into tens or hundreds of inline lines in the decomp file. Keep
+retail behaviour the default path, so the hook reads as an exception to the
+original code, not a rewrite of it.
+
+Port code that was moved out of a decomp file but still defines members of
+decomp classes or depends on decomp headers the way game code does (for
+example `platform/port_remastered_movers.cpp`, which holds the Remastered
+player movers called from `CGameCollision::MovePlayer`) is appended to
+`MP_GAME_SOURCES` in `CMakeLists.txt` rather than `MP_PORT_SOURCES`. It is then
+compiled exactly as the file it came from (same flags, definitions and forced
+`platform/compat.h`), so moving it does not change the generated code.
+
 ## Ownership and threading rules
 
 - Use `rstl::auto_ptr<T[]>` / `single_ptr<T[]>` for host arrays and scalar owners
@@ -560,8 +623,8 @@ listener heading) about three times a second, and `MP_MUTE_SMP=65535,93` silence
 voices by sample id so a persistent one can be identified by ear. Streamed
 voices report sample id 65535. `MP_LOG_3D=1` logs any 3D emitter whose Doppler
 factor is not 1. The overlay's Debug > Audio > **Sounds playing** list shows the live voices (loudest
-first) with a per-sample mute checkbox and an "Unmute all" button; the muted ids
-are saved to `voices_muted` in the settings file.
+first) with a per-sample mute checkbox and an "Unmute all" button, which also
+turns both audio paths back on. Mutes are not saved: a relaunch has full sound.
 
 A main-loop iteration that takes longer than 250 ms logs `MP stall: frame N took
 … ms (events, input, tick, draw)`, at most one line every two seconds, and a run

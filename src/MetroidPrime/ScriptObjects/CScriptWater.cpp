@@ -40,7 +40,7 @@ static float kMaxRayLength = 120.f;
 static int kMaxTilesPerPatch = 7;
 
 const float CScriptWater::kSplashScales[6] = {
-    1.0f, 3.0f, 0.709f, 1.19f, 0.709f, 1.0f,
+    1.0f, 3.0f, 0.71f, 1.19f, 0.71f, 1.0f,
 };
 
 CScriptWater::CScriptWater(
@@ -277,7 +277,7 @@ void CScriptWater::Render(const CStateManager& mgr) const {
 #ifdef TARGET_PC
     // A mod's surface stands in for the fluid plane (port_room_liquid.h).
     remastered = PortRoomLiquid::Draw(mgr, mgr.GetWorld()->GetAreaAlways(GetCurrentAreaId()), GetUniqueId().value,
-                                      GetTranslation(), x1b4_fluidPlane->GetFluidType(),
+                                      GetEditorId().value, GetTranslation(), x1b4_fluidPlane->GetFluidType(),
                                       GetTranslation().GetZ() + x130_bounds.GetMaxPoint().GetZ());
 #endif
     if (!remastered)

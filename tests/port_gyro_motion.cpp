@@ -1,17 +1,10 @@
 #include "port_gyro_motion.h"
+#include "port_test.h"
 
 #include <cmath>
 #include <cstdio>
 
 namespace {
-int sFailures = 0;
-
-void Check(bool ok, const char* what) {
-  if (!ok) {
-    std::fprintf(stderr, "FAIL: %s\n", what);
-    ++sFailures;
-  }
-}
 
 constexpr float kDt = 1.f / 60.f;
 constexpr float kG = 9.80665f;
@@ -29,32 +22,32 @@ int main() {
   {
     PortGyro::Activation activation;
     activation.Update(4, false);
-    Check(!activation.Active(), "toggle starts off");
+    CHECK_MSG(!activation.Active(), "toggle starts off");
     activation.Update(4, true);
-    Check(activation.Active(), "first press enables gyro");
+    CHECK_MSG(activation.Active(), "first press enables gyro");
     activation.Update(4, true);
-    Check(activation.Active(), "held button does not repeat toggle");
+    CHECK_MSG(activation.Active(), "held button does not repeat toggle");
     activation.Update(4, false);
-    Check(activation.Active(), "release keeps gyro enabled");
+    CHECK_MSG(activation.Active(), "release keeps gyro enabled");
     activation.Update(4, true);
-    Check(!activation.Active(), "second press disables gyro");
+    CHECK_MSG(!activation.Active(), "second press disables gyro");
     activation.Update(2, true);
-    Check(activation.Active(), "always mode");
+    CHECK_MSG(activation.Active(), "always mode");
     activation.Update(4, true);
-    Check(!activation.Active(), "mode change resets toggle despite held button");
+    CHECK_MSG(!activation.Active(), "mode change resets toggle despite held button");
     activation.Update(4, false);
     activation.Update(4, true);
-    Check(activation.Active(), "fresh press after mode change enables gyro");
+    CHECK_MSG(activation.Active(), "fresh press after mode change enables gyro");
     activation.Update(0, true);
-    Check(!activation.Active(), "off mode");
+    CHECK_MSG(!activation.Active(), "off mode");
     activation.Update(1, true);
-    Check(activation.Active(), "hold-to-aim held");
+    CHECK_MSG(activation.Active(), "hold-to-aim held");
     activation.Update(1, false);
-    Check(!activation.Active(), "hold-to-aim released");
+    CHECK_MSG(!activation.Active(), "hold-to-aim released");
     activation.Update(3, false);
-    Check(activation.Active(), "hold-to-pause released");
+    CHECK_MSG(activation.Active(), "hold-to-pause released");
     activation.Update(3, true);
-    Check(!activation.Active(), "hold-to-pause held");
+    CHECK_MSG(!activation.Active(), "hold-to-pause held");
   }
   float pitch = 0.f;
   float yaw = 0.f;
@@ -65,7 +58,7 @@ int main() {
     PortGyro::Motion m;
     const float gyro[3] = {0.5f, -1.f, 0.f};
     m.Process(gyro, nullptr, kDt, PortGyro::kPlayer, true, pitch, yaw);
-    Check(pitch == 0.5f && yaw == 1.f, "no accel passes through");
+    CHECK_MSG(pitch == 0.5f && yaw == 1.f, "no accel passes through");
   }
 
   // Held flat (the pad's face up) and turned right: the same yaw in every space
@@ -80,7 +73,7 @@ int main() {
     Run(m, still, flat, 10.f, space, false, pitch, yaw);
     const float turn[3] = {0.f, -1.f, 0.f};
     Run(m, turn, flat, 0.05f, space, false, pitch, yaw);
-    Check(std::fabs(yaw - 1.f) < 0.05f && std::fabs(pitch) < 0.05f, "flat turn right");
+    CHECK_MSG(std::fabs(yaw - 1.f) < 0.05f && std::fabs(pitch) < 0.05f, "flat turn right");
   }
 
   // Far edge tilted up 90 degrees (the face toward the player, up is the pad's
@@ -95,9 +88,9 @@ int main() {
       Run(m, still, upright, 10.f, space, false, pitch, yaw);
       Run(m, turn, upright, 0.05f, space, false, pitch, yaw);
       if (space == PortGyro::kLocal) {
-        Check(std::fabs(yaw) < 0.05f, "upright local yaw ignores the turn");
+        CHECK_MSG(std::fabs(yaw) < 0.05f, "upright local yaw ignores the turn");
       } else {
-        Check(std::fabs(yaw - 1.f) < 0.1f, "upright turn right");
+        CHECK_MSG(std::fabs(yaw - 1.f) < 0.1f, "upright turn right");
       }
     }
   }
@@ -108,14 +101,39 @@ int main() {
     const float flat[3] = {0.f, kG, 0.f};
     PortGyro::Motion cal;
     Run(cal, drift, flat, 8.f, PortGyro::kLocal, true, pitch, yaw);
-    Check(std::fabs(yaw) < 0.003f, "auto calibration removes drift");
-    Check(cal.Confidence() > 0.5f, "calibration confident");
+    CHECK_MSG(std::fabs(yaw) < 0.003f, "auto calibration removes drift");
+    CHECK_MSG(cal.Confidence() > 0.5f, "calibration confident");
     PortGyro::Motion raw;
     Run(raw, drift, flat, 8.f, PortGyro::kLocal, false, pitch, yaw);
-    Check(std::fabs(yaw - 0.03f) < 0.001f, "no calibration keeps drift");
-    // Turning calibration off forgets the learned offset.
+    CHECK_MSG(std::fabs(yaw - 0.03f) < 0.001f, "no calibration keeps drift");
+    // Turning calibration off keeps the learned offset.
     Run(cal, drift, flat, 0.1f, PortGyro::kLocal, false, pitch, yaw);
-    Check(std::fabs(yaw - 0.03f) < 0.001f, "calibration off resets offset");
+    CHECK_MSG(std::fabs(yaw) < 0.003f, "calibration off keeps offset");
+    cal.Reset();
+    Run(cal, drift, flat, 0.1f, PortGyro::kLocal, false, pitch, yaw);
+    CHECK_MSG(std::fabs(yaw - 0.03f) < 0.001f, "reset forgets offset");
+  }
+
+  // Manual calibration averages the still pad, with auto calibration off or
+  // paused, and keeps the result at full confidence.
+  {
+    const float drift[3] = {0.f, -0.03f, 0.f};
+    const float flat[3] = {0.f, kG, 0.f};
+    for (const bool autoCalibrate : {false, true}) {
+      PortGyro::Motion m;
+      m.BeginManualCalibration();
+      CHECK_MSG(m.ManualCalibrating(), "manual calibration running");
+      Run(m, drift, flat, 1.f, PortGyro::kLocal, autoCalibrate, pitch, yaw);
+      CHECK_MSG(m.Confidence() < 0.01f, "auto calibration paused while manual samples");
+      m.EndManualCalibration();
+      CHECK_MSG(!m.ManualCalibrating() && m.Confidence() > 0.99f, "manual calibration done, confident");
+      Run(m, drift, flat, 0.1f, PortGyro::kLocal, autoCalibrate, pitch, yaw);
+      CHECK_MSG(std::fabs(yaw) < 0.001f, "manual calibration removes drift");
+    }
+    PortGyro::Motion idle;
+    idle.BeginManualCalibration();
+    idle.EndManualCalibration();
+    CHECK_MSG(idle.Confidence() < 0.01f, "manual calibration without samples isn't trusted");
   }
 
   // Without an accelerometer the local spaces still apply, player/world act as
@@ -124,12 +142,12 @@ int main() {
     PortGyro::Motion m;
     const float roll[3] = {0.f, 0.f, 1.f};
     m.Process(roll, nullptr, kDt, PortGyro::kLocalRoll, true, pitch, yaw);
-    Check(std::fabs(yaw - 1.f) < 1e-5f, "raw local roll");
+    CHECK_MSG(std::fabs(yaw - 1.f) < 1e-5f, "raw local roll");
     m.Process(roll, nullptr, kDt, PortGyro::kPlayer, true, pitch, yaw);
-    Check(std::fabs(yaw) < 1e-5f, "raw player acts as local yaw");
+    CHECK_MSG(std::fabs(yaw) < 1e-5f, "raw player acts as local yaw");
     const float both[3] = {0.f, 0.6f, -0.8f};
     m.Process(both, nullptr, kDt, PortGyro::kLocalBoth, true, pitch, yaw);
-    Check(std::fabs(yaw + 1.f) < 1e-5f, "yaw and roll: combined size, larger axis's sign");
+    CHECK_MSG(std::fabs(yaw + 1.f) < 1e-5f, "yaw and roll: combined size, larger axis's sign");
   }
 
   // Tightening scales slow turns down and leaves fast ones alone.
@@ -139,10 +157,10 @@ int main() {
     float p = 0.f;
     float y = 2.f * kRad;
     f.Apply(p, y, kDt, 0.f, 4.f);
-    Check(std::fabs(y - kRad) < 1e-5f, "tightening halves a turn at half the threshold");
+    CHECK_MSG(std::fabs(y - kRad) < 1e-5f, "tightening halves a turn at half the threshold");
     y = 10.f * kRad;
     f.Apply(p, y, kDt, 0.f, 4.f);
-    Check(std::fabs(y - 10.f * kRad) < 1e-6f, "tightening leaves fast turns");
+    CHECK_MSG(std::fabs(y - 10.f * kRad) < 1e-6f, "tightening leaves fast turns");
   }
 
   // Smoothing averages slow turns over the window and passes fast ones through.
@@ -157,14 +175,14 @@ int main() {
       y = (i % 2 == 0 ? 2.f : -2.f) * kRad;
       f.Apply(p, y, kDt, 5.f, 0.f);
     }
-    Check(std::fabs(y) < 0.2f * kRad, "smoothing averages slow jitter");
+    CHECK_MSG(std::fabs(y) < 0.2f * kRad, "smoothing averages slow jitter");
     // A steady slow turn keeps its speed once the window fills.
     for (int i = 0; i < 60; ++i) {
       p = 0.f;
       y = 3.f * kRad;
       f.Apply(p, y, kDt, 5.f, 0.f);
     }
-    Check(std::fabs(y - 3.f * kRad) < 1e-5f, "smoothing keeps a steady turn");
+    CHECK_MSG(std::fabs(y - 3.f * kRad) < 1e-5f, "smoothing keeps a steady turn");
     // Above twice the threshold the turn is direct once the window's slow
     // samples have aged out.
     for (int i = 0; i < 10; ++i) {
@@ -172,11 +190,11 @@ int main() {
       y = 20.f * kRad;
       f.Apply(p, y, kDt, 5.f, 0.f);
     }
-    Check(std::fabs(y - 20.f * kRad) < 1e-5f, "fast turn direct");
+    CHECK_MSG(std::fabs(y - 20.f * kRad) < 1e-5f, "fast turn direct");
   }
 
-  if (sFailures == 0) {
+  if (port_test::Failures() == 0) {
     std::printf("port_gyro_motion: ok\n");
   }
-  return sFailures == 0 ? 0 : 1;
+  return PORT_TEST_RESULT();
 }

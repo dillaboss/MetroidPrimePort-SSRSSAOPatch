@@ -1675,30 +1675,44 @@ TEST_F(GXFifoTest, PBRLightScale_PropagatesAndResets) {
   EXPECT_EQ(g_gxState.pbrLightScale.w(), 0.f);
 }
 
-// An HDR light lands in its own light's three rows (colour with falloff + 1, position with r0,
-// r1); a repeat is dropped, and off clears the rows.
+// An HDR light lands in its own light's four rows (colour with falloff + 1, position with r0,
+// r1 with widen and the cone, the spot's way to the light); a repeat is dropped, and off clears
+// the rows.
 TEST_F(GXFifoTest, PBRLightHdr_PropagatesAndTurnsOff) {
   const f32 color[3] = {9.f, 3.5f, 0.1f};
   const f32 pos[3] = {1.f, -2.f, -5.f};
-  GXSetPBRLightHdr(GX_LIGHT2, color, pos, 0.f, 2.3f, 2);
+  GXSetPBRLightHdr(GX_LIGHT2, color, pos, 0.f, 2.3f, 2, 0.75f, nullptr, 0.f, 0.f);
   auto bytes = capture_fifo();
   EXPECT_TRUE(has_aurora_cmd(bytes, GX_AURORA_SET_PBR_LIGHT_HDR));
   reset_gx_state();
   decode_fifo(bytes);
-  EXPECT_EQ(g_gxState.pbrLightHdr[6].x(), 9.f);
-  EXPECT_EQ(g_gxState.pbrLightHdr[6].w(), 3.f);
-  EXPECT_EQ(g_gxState.pbrLightHdr[7].y(), -2.f);
-  EXPECT_EQ(g_gxState.pbrLightHdr[7].w(), 0.f);
-  EXPECT_EQ(g_gxState.pbrLightHdr[8].x(), 2.3f);
+  EXPECT_EQ(g_gxState.pbrLightHdr[8].x(), 9.f);
+  EXPECT_EQ(g_gxState.pbrLightHdr[8].w(), 3.f);
+  EXPECT_EQ(g_gxState.pbrLightHdr[9].y(), -2.f);
+  EXPECT_EQ(g_gxState.pbrLightHdr[9].w(), 0.f);
+  EXPECT_EQ(g_gxState.pbrLightHdr[10].x(), 2.3f);
+  EXPECT_EQ(g_gxState.pbrLightHdr[10].y(), 0.75f);
+  // A point light (null toLight) is cone scale 0, bias 1 whatever is passed.
+  EXPECT_EQ(g_gxState.pbrLightHdr[10].z(), 0.f);
+  EXPECT_EQ(g_gxState.pbrLightHdr[10].w(), 1.f);
   EXPECT_EQ(g_gxState.pbrLightHdr[0].w(), 0.f);
 
-  GXSetPBRLightHdr(GX_LIGHT2, color, pos, 0.f, 2.3f, 2);
+  GXSetPBRLightHdr(GX_LIGHT2, color, pos, 0.f, 2.3f, 2, 0.75f, nullptr, 0.f, 0.f);
   EXPECT_FALSE(has_aurora_cmd(capture_fifo(), GX_AURORA_SET_PBR_LIGHT_HDR));
 
-  GXSetPBRLightHdr(GX_LIGHT2, nullptr, nullptr, 0.f, 0.f, 0);
+  const f32 toLight[3] = {0.f, 0.f, 1.f};
+  GXSetPBRLightHdr(GX_LIGHT2, color, pos, 0.f, 2.3f, 2, 0.75f, toLight, 3.5f, -2.5f);
   decode_fifo(capture_fifo());
-  EXPECT_EQ(g_gxState.pbrLightHdr[6].w(), 0.f);
-  EXPECT_EQ(g_gxState.pbrLightHdr[8].x(), 0.f);
+  EXPECT_EQ(g_gxState.pbrLightHdr[10].z(), 3.5f);
+  EXPECT_EQ(g_gxState.pbrLightHdr[10].w(), -2.5f);
+  EXPECT_EQ(g_gxState.pbrLightHdr[11].z(), 1.f);
+
+  GXSetPBRLightHdr(GX_LIGHT2, nullptr, nullptr, 0.f, 0.f, 0, 0.f, nullptr, 0.f, 0.f);
+  decode_fifo(capture_fifo());
+  EXPECT_EQ(g_gxState.pbrLightHdr[8].w(), 0.f);
+  EXPECT_EQ(g_gxState.pbrLightHdr[10].x(), 0.f);
+  EXPECT_EQ(g_gxState.pbrLightHdr[10].y(), 0.f);
+  EXPECT_EQ(g_gxState.pbrLightHdr[11].z(), 0.f);
 }
 
 // The baked-light modulation propagates, a repeat is dropped, and null is white.
@@ -1770,6 +1784,36 @@ TEST_F(GXFifoTest, PBRModelModulation_PropagatesDedupsAndResets) {
   EXPECT_EQ(g_gxState.pbrModelDiffuse, (aurora::Vec4<float>{1.f, 1.f, 1.f, 1.f}));
   EXPECT_EQ(g_gxState.pbrModelIncan, (aurora::Vec4<float>{0.f, 0.f, 0.f, 1.f}));
   EXPECT_EQ(g_gxState.pbrModelCoverage, (aurora::Vec4<float>{1.f, 0.f, 0.f, 0.f}));
+}
+
+// The thermal override (GXSetPBRThermal) carries c.x, c.y and the blended flag with w = 1 while on;
+// a repeat is dropped, and off is all zero whatever was passed.
+TEST_F(GXFifoTest, PBRThermal_PropagatesDedupsAndResets) {
+  EXPECT_EQ(g_gxState.pbrThermal, (aurora::Vec4<float>{}));
+
+  GXSetPBRThermal(GX_TRUE, 0.4f, 0.6f, GX_TRUE);
+  auto bytes = capture_fifo();
+  EXPECT_TRUE(has_aurora_cmd(bytes, GX_AURORA_SET_PBR_THERMAL));
+  reset_gx_state();
+  decode_fifo(bytes);
+  EXPECT_EQ(g_gxState.pbrThermal, (aurora::Vec4<float>{0.4f, 0.6f, 1.f, 1.f}));
+
+  GXSetPBRThermal(GX_TRUE, 0.4f, 0.6f, GX_TRUE);
+  EXPECT_FALSE(has_aurora_cmd(capture_fifo(), GX_AURORA_SET_PBR_THERMAL));
+
+  // Only the blend changes: still a command.
+  GXSetPBRThermal(GX_TRUE, 0.4f, 0.6f, GX_FALSE);
+  bytes = capture_fifo();
+  EXPECT_TRUE(has_aurora_cmd(bytes, GX_AURORA_SET_PBR_THERMAL));
+  decode_fifo(bytes);
+  EXPECT_EQ(g_gxState.pbrThermal, (aurora::Vec4<float>{0.4f, 0.6f, 0.f, 1.f}));
+
+  GXSetPBRThermal(GX_FALSE, 0.2f, 0.3f, GX_TRUE);
+  decode_fifo(capture_fifo());
+  EXPECT_EQ(g_gxState.pbrThermal, (aurora::Vec4<float>{}));
+  // Off again with other values is the same write.
+  GXSetPBRThermal(GX_FALSE, 0.5f, 0.5f, GX_FALSE);
+  EXPECT_FALSE(has_aurora_cmd(capture_fifo(), GX_AURORA_SET_PBR_THERMAL));
 }
 
 // The character backlight's plane, back direction and strengths propagate, a repeat is
@@ -1847,6 +1891,59 @@ TEST_F(GXFifoTest, LoadTexObj_EncodesSdkBpBurstAndAuroraMetadata) {
   EXPECT_EQ(slot.image3 >> 24, 0x96u);
   EXPECT_NE(slot.texObjId, 0u);
   EXPECT_EQ(slot.texDataVersion, 1u);
+}
+
+TEST_F(GXFifoTest, TextureMinFiltersRoundTrip) {
+  alignas(32) u8 image[64]{};
+  const GXTexFilter filters[] = {GX_NEAR, GX_LINEAR, GX_NEAR_MIP_NEAR,
+                                 GX_LIN_MIP_NEAR, GX_NEAR_MIP_LIN, GX_LIN_MIP_LIN};
+  for (const auto filter : filters) {
+    SCOPED_TRACE(static_cast<int>(filter));
+    GXTexObj obj{};
+    GXInitTexObj(&obj, image, 8, 8, GX_TF_I8, GX_REPEAT, GX_REPEAT, GX_TRUE);
+    GXInitTexObjLOD(&obj, filter, GX_LINEAR, 0.f, 3.f, 0.f, GX_FALSE, GX_FALSE, GX_ANISO_1);
+    GXLoadTexObj(&obj, GX_TEXMAP0);
+    decode_fifo(capture_fifo());
+    EXPECT_EQ(gxState().loadedTextures[GX_TEXMAP0].min_filter(), filter);
+    EXPECT_EQ(gxState().loadedTextures[GX_TEXMAP0].mag_filter(), GX_LINEAR);
+
+    GXInitTexObjFilter(&obj, GX_NEAR, GX_LINEAR);
+    GXInitTexObjFilter(&obj, filter, GX_NEAR);
+    GXLoadTexObj(&obj, GX_TEXMAP0);
+    decode_fifo(capture_fifo());
+    EXPECT_EQ(gxState().loadedTextures[GX_TEXMAP0].min_filter(), filter);
+    EXPECT_EQ(gxState().loadedTextures[GX_TEXMAP0].mag_filter(), GX_NEAR);
+  }
+}
+
+TEST_F(GXFifoTest, TextureLodBiasRoundTrip) {
+  alignas(32) u8 image[64]{};
+  struct Case {
+    float input;
+    float expected;
+  };
+  const Case cases[] = {{-8.f, -4.f}, {-4.f, -4.f}, {-1.5f, -1.5f},
+                        {-0.04f, -1.f / 32.f}, {-0.01f, 0.f}, {0.f, 0.f},
+                        {0.04f, 1.f / 32.f}, {1.5f, 1.5f}, {8.f, 127.f / 32.f}};
+  for (const auto& test : cases) {
+    SCOPED_TRACE(test.input);
+    GXTexObj obj{};
+    GXInitTexObj(&obj, image, 8, 8, GX_TF_I8, GX_REPEAT, GX_REPEAT, GX_TRUE);
+    GXInitTexObjLOD(&obj, GX_LIN_MIP_LIN, GX_LINEAR, 0.f, 3.f, test.input,
+                    GX_TRUE, GX_FALSE, GX_ANISO_2);
+    GXLoadTexObj(&obj, GX_TEXMAP0);
+    decode_fifo(capture_fifo());
+    EXPECT_FLOAT_EQ(gxState().loadedTextures[GX_TEXMAP0].lod_bias(), test.expected);
+
+    GXInitTexObjLODBias(&obj, 0.f);
+    GXInitTexObjLODBias(&obj, test.input);
+    GXLoadTexObj(&obj, GX_TEXMAP0);
+    decode_fifo(capture_fifo());
+    const auto& texture = gxState().loadedTextures[GX_TEXMAP0];
+    EXPECT_FLOAT_EQ(texture.lod_bias(), test.expected);
+    EXPECT_EQ(texture.min_filter(), GX_LIN_MIP_LIN);
+    EXPECT_EQ(texture.mag_filter(), GX_LINEAR);
+  }
 }
 
 TEST_F(GXFifoTest, LoadTexObjPcFormat_PreservesFullFormatMetadata) {
@@ -2794,6 +2891,7 @@ TEST_F(GXFifoTest, GetProjectionAndScissorShadowState) {
 }
 
 TEST_F(GXFifoTest, Scissor_EncodesBpAndDecodesLogicalState) {
+  GXSetScissorBoxOffset(0, 0);
   GXSetScissor(16, 24, 320, 240);
   auto bytes = capture_fifo();
 

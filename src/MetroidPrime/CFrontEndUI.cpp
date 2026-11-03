@@ -111,6 +111,42 @@ static const FEMovie FEMovies[] = {
     {"Video/08_GBA_fileselect.thp", false},
     {"Video/08_GBA_fileselect.thp", false},
 };
+
+#ifdef TARGET_PC
+// Port: Trilogy's MP1 has none of the GameCube front-end movies; its own MP1 menu
+// movies sit in fe/Video/mp1. Each GameCube movie falls back to the nearest one there.
+static const char* PortFrontEndMovie(const char* path) {
+  static const struct {
+    const char* prefix;
+    const char* trilogy;
+  } skTrilogyMovies[] = {
+      {"Video/00_", "fe/Video/mp1/Mp1_wii_Titles_To_Logo.thp"},
+      {"Video/01_", "fe/Video/mp1/Mp1_wii_Logo_Loop.thp"},
+      {"Video/02_", "fe/Video/mp1/Mp1_wii_Logo_To_Main.thp"},
+      {"Video/03_", "fe/Video/mp1/Mp1_wii_Main_Menu_Loop.thp"},
+      {"Video/04_", "fe/Video/mp1/Mp1_wii_Main_To_Game.thp"},
+      {"Video/06_", "fe/Video/mp1/Mp1_wii_Main_Menu_Loop.thp"},
+      {"Video/07_", "fe/Video/mp1/Mp1_wii_Main_Menu_Loop.thp"},
+      {"Video/08_", "fe/Video/mp1/Mp1_wii_Main_Menu_Loop.thp"},
+      {"Video/attract0.", "fe/Video/mp1/Attract01.thp"},
+      {"Video/attract1.", "fe/Video/mp1/Attract02.thp"},
+  };
+  if (CDvdFile::FileExists(path)) {
+    return path;
+  }
+  for (int i = 0; i < static_cast< int >(sizeof(skTrilogyMovies) / sizeof(skTrilogyMovies[0]));
+       ++i) {
+    if (strncmp(path, skTrilogyMovies[i].prefix, strlen(skTrilogyMovies[i].prefix)) == 0 &&
+        CDvdFile::FileExists(skTrilogyMovies[i].trilogy)) {
+      return skTrilogyMovies[i].trilogy;
+    }
+  }
+  return path;
+}
+#define PORT_FE_MOVIE(path) PortFrontEndMovie(path)
+#else
+#define PORT_FE_MOVIE(path) (path)
+#endif
 // TODO: set this to the default value and bake version string as a post-build step
 #if VERSION == VERSION_GM8E_00
 const char MetroidBuildInfo[] = BUILD_INFO_TAG "Build v1.088 10/29/2002 2:21:25\0PAD";
@@ -655,6 +691,39 @@ bool CFrontEndUI::SFrontEndFrame::PumpLoad() {
   return false;
 }
 
+#ifdef TARGET_PC
+// Port: a PAL disc's front-end menus add a language row (`textpane_lang`) the
+// code doesn't handle (issue #152), which moves the rows after it down one. The
+// no-card menu's rows, in the order DoAdvance numbers them, by the text pane
+// each holds.
+static const char* const kPortMainMenuPanes[] = {"textpane_start", "textpane_gba",
+                                                 "textpane_options", "textpane_cheats"};
+
+// The row of `table` that is `pane` or holds it, or -1.
+static int PortRowOf(CGuiTableGroup* table, const CGuiWidget* pane) {
+  for (int i = 0; pane != nullptr; ++i) {
+    const CGuiWidget* worker = table->GetWorkerWidget(i);
+    if (worker == nullptr) {
+      break;
+    }
+    if (worker == pane || worker == pane->GetParent()) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// The DoAdvance number of the no-card menu's row `row`, or -1 for a row it doesn't know.
+static int PortMainMenuRow(CGuiFrame* frame, CGuiTableGroup* table, int row) {
+  for (int k = 0; k < 4; ++k) {
+    if (PortRowOf(table, frame->FindWidget(kPortMainMenuPanes[k])) == row) {
+      return k;
+    }
+  }
+  return -1;
+}
+#endif
+
 void CFrontEndUI::SFrontEndFrame::FinishedLoading() {
   x18_tablegroup_mainmenu =
       static_cast< CGuiTableGroup* >(x14_loadedFrme->FindWidget("tablegroup_mainmenu"));
@@ -685,11 +754,25 @@ void CFrontEndUI::SFrontEndFrame::FinishedLoading() {
       TFunctor1FromMethod< SFrontEndFrame, CGuiTableGroup* const >::Make(
           *this, &SFrontEndFrame::DoCancel));
 
+#ifdef TARGET_PC
+  for (int i = 0; x18_tablegroup_mainmenu->GetWorkerWidget(i) != nullptr; ++i) {
+    if (PortMainMenuRow(x14_loadedFrme, x18_tablegroup_mainmenu, i) < 0) {
+      x18_tablegroup_mainmenu->GetWorkerWidget(i)->SetIsSelectable(false);
+    }
+  }
+#endif
+
   HandleActiveChange(x18_tablegroup_mainmenu);
 }
 
 void CFrontEndUI::SFrontEndFrame::Update(float dt) {
+#ifdef TARGET_PC
+  int galleryRow = PortRowOf(x18_tablegroup_mainmenu, x24_cheatPair.x0_textPane);
+  CGuiWidget* imageGallery =
+      x18_tablegroup_mainmenu->GetWorkerWidget(galleryRow < 0 ? 3 : galleryRow);
+#else
   CGuiWidget* imageGallery = x18_tablegroup_mainmenu->GetWorkerWidget(3);
+#endif
 
   if (CSlideShow::SlideShowGalleryFlags()) {
     imageGallery->SetIsSelectable(true);
@@ -729,7 +812,12 @@ void CFrontEndUI::SFrontEndFrame::Draw() {
 }
 
 void CFrontEndUI::SFrontEndFrame::DoAdvance(CGuiTableGroup* caller) {
+#ifdef TARGET_PC
+  switch (PortMainMenuRow(x14_loadedFrme, x18_tablegroup_mainmenu,
+                          x18_tablegroup_mainmenu->GetUserSelection())) {
+#else
   switch (x18_tablegroup_mainmenu->GetUserSelection()) {
+#endif
   case 0:
     CSfxManager::SfxStart(FETransitionForwardSFX[x0_rnd][0], 0x7f, 0x40, false,
                           CSfxManager::kMedPriority, false, CSfxManager::kAllAreas);
@@ -907,6 +995,22 @@ void CFrontEndUI::SNewFileSelectFrame::FinishedLoading() {
   x104_rowPitch = (x64_fileSelections[1].x0_base->GetLocalPosition() -
                    x64_fileSelections[0].x0_base->GetLocalPosition())
                       .GetZ();
+#ifdef TARGET_PC
+  // Port: a PAL disc's FRME_NewFileSelect has a language row (`textpane_lang`,
+  // never filled in) after Erase (issue #152), which moves Fusion and the
+  // gallery down one. Rows past the files are told apart by widget, and a row
+  // the code doesn't know is never selected, by a tap or the pad.
+  for (int i = 3;; ++i) {
+    CGuiWidget* worker = x20_tablegroup_fileselect->GetWorkerWidget(i);
+    if (worker == nullptr) {
+      break;
+    }
+    if (worker != x28_textpane_erase.x0_textPane && worker != x38_textpane_gba.x0_textPane &&
+        worker != x30_textpane_cheats.x0_textPane) {
+      worker->SetIsSelectable(false);
+    }
+  }
+#endif
 }
 
 uint CFrontEndUI::SNewFileSelectFrame::GetUserFileSelection() const {
@@ -1025,6 +1129,19 @@ void CFrontEndUI::SNewFileSelectFrame::HandleActiveChange(CGuiWidget* active) {
 
 void CFrontEndUI::SNewFileSelectFrame::DoFileselectAdvance(CGuiTableGroup* caller) {
   int userSel = x20_tablegroup_fileselect->GetUserSelection();
+#ifdef TARGET_PC
+  // Port: the PAL frame's extra row shifts these (see FinishedLoading).
+  if (userSel >= 3) {
+    const CGuiWidget* worker = x20_tablegroup_fileselect->GetWorkerWidget(userSel);
+    userSel = worker == x28_textpane_erase.x0_textPane ? 3
+              : worker == x38_textpane_gba.x0_textPane ? 4
+              : worker == x30_textpane_cheats.x0_textPane ? 5
+                                                         : -1;
+    if (userSel < 0) {
+      return;
+    }
+  }
+#endif
   if (userSel < 3) {
     if (x8_subMenu == kSM_EraseGame) {
       if (x4_saveUI->GetGameData(userSel) != nullptr) {
@@ -1167,8 +1284,13 @@ void CFrontEndUI::SNewFileSelectFrame::ClearFrameContents() {
   }
 
   x20_tablegroup_fileselect->SetUserSelection(0);
+#ifdef TARGET_PC
+  // Port: by widget, not row 5 (the PAL frame's extra row; see FinishedLoading).
+  CGuiTextPane* cheats = x30_textpane_cheats.x0_textPane;
+#else
   CGuiTextPane* cheats =
       static_cast< CGuiTextPane* >(x20_tablegroup_fileselect->GetWorkerWidget(5));
+#endif
   if (CSlideShow::SlideShowGalleryFlags()) {
     cheats->SetIsSelectable(true);
     x30_textpane_cheats.x0_textPane->TextSupport().SetFontColor(CColor::White());
@@ -1728,9 +1850,12 @@ bool PortResumePromptInput(const CFinalInput& input) {
   if (input.PDPLeft() || input.PDPRight() || input.PDPUp() || input.PDPDown()) {
     sResumeYes = !sResumeYes;
     sResumeSound = true;
-  } else if (input.PA() || input.PStart()) {
+  } else if ((input.PA() || input.PStart()) && PortDebug::MouseHeldButtons() == 0) {
     // Only an explicit choice answers; B (Android's back gesture, a stray
     // touch) does nothing. No keeps the state: the next play replaces it.
+    // A mouse button down is a click on the window, whose buttons answer
+    // (issue #166): one that also reaches the pad as A must not accept the
+    // highlighted Yes before the click on No lands.
     sResumeSound = true;
     AnswerResume(sResumeYes);
   }
@@ -2322,7 +2447,7 @@ bool CFrontEndUI::PumpMovieLoad() {
         path[strlen(path) - 5] = static_cast< char >(x1c_rndB + 'A');
       }
 
-      x6c_menuMovies[i].x0_movie = rs_new CMoviePlayer(path, 0.05f, movie->loop, true);
+      x6c_menuMovies[i].x0_movie = rs_new CMoviePlayer(PORT_FE_MOVIE(path), 0.05f, movie->loop, true);
       x6c_menuMovies[i].x0_movie->SetPlayMode(CMoviePlayer::kPM_Stopped);
       return false;
     }
@@ -2763,7 +2888,7 @@ const char* CFrontEndUI::GetNextAttractMovieFileName() {
 }
 
 const char* CFrontEndUI::GetAttractMovieFileName(int idx) {
-  return CBasics::Stringize("Video/attract%d.thp", idx);
+  return PORT_FE_MOVIE(CBasics::Stringize("Video/attract%d.thp", idx));
 }
 
 #ifdef TARGET_PC

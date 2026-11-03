@@ -12,15 +12,15 @@
 //
 // - LTM2 is written as LTME, one frame shorter; LFOT and LTYP enum bytes go
 //   back down by one.
-// - MPCB around a vector is stripped; its angle form (MPAC) and ANCR with an
-//   unrotated cone become retail's ANGC. MPRD becomes RAND.
+// - MPCB around a vector is stripped; its angle form (MPAC) becomes retail's
+//   ANGC. MPRD becomes RAND.
 // - ROTA is negated back.
 // - TEXR's `CNST(id), NONE` becomes retail's `CNST(CNST id)`, and an MTIN
 //   material stands in for a missing TEXR through its texture.
 // - Ids become 32-bit retail ids through ConvertIO.
-// - ASPR becomes ASPH; a cone or sphere turned about X (REUL) becomes an X
-//   bias; RNDV becomes a whole-sphere ANGC; a GRAD gradient becomes 101
-//   percent keyframes (KEYP) over the particle's life.
+// - ANCR and ASPR become the port's own elements of the same fourccs, with
+//   their REUL (axis order 0) as three angle reals (CVEPortAngleCone,
+//   CEEPortAngleSphere); RNDV and GRAD likewise run Remastered's own code.
 // - DFCP/DFCS (a ramp of the depth from the camera) are written as the port's own
 //   real elements of the same fourccs (CREDistanceFromCameraBlend).
 // - Keyframe blocks and words are byte-swapped; a colour's half keys are
@@ -34,7 +34,8 @@
 //   (RECIPES.md) also writes VMAT (the shader's features, textures and uniform
 //   sources), VTMT (TMTR's UV transforms), VPMT (PMTR) and VSMT (SMTR's CCH0
 //   uniforms), SSZE, VORN (ORNT), ITEN and SCTR (as VMAT's sprite centre). A
-//   shader with no recipe writes none and is listed in `approximated`.
+//   shader with no recipe writes none and is listed in `approximated`. A sprite
+//   drawing its header MTRL also writes VTRS (its TEXR's TRST).
 // - Port-only (build/mpr/vfx/RESOLVED-xfmd.md): XFMD 3 and 4 (particles that
 //   follow the emitter) are written as they are; SMVR is read only as XFMD 4's
 //   mover.
@@ -56,8 +57,10 @@
 
 #include "port_remastered_effect.h"
 
+#include <array>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -73,6 +76,9 @@ struct FlipbookAtlas {
 };
 
 struct EffectConvertIO {
+  // A PART under XFMD 2 or 5 with no ITPE gets Remastered's default 1 (a PITP flagged as the
+  // default). The import sets it; left false, an absent ITPE writes nothing.
+  bool spreadDefault = false;
   // The retail id an asset id stands for, as the type it is read as ('TXTR',
   // 'CMDL', 'PART', 'SWHC', 'ELSC'), or 0 when it has none. Left empty, only
   // ids carried over from retail (EffectRetailId) resolve.
@@ -87,19 +93,22 @@ struct EffectConvertIO {
   // A texture a VMAT slot draws, imported as a TXTR the import writes: a single texture comes
   // back with cols = rows = frames = 1, an array packed as by `flipbook`. Id 0: it cannot be.
   std::function<FlipbookAtlas(const EffectGuid& texture)> vfxTexture;
+  // A Remastered TXTR's full (top mip) size, which an ATEX's tile rects divide by. Left empty,
+  // a header sprite's ATEX is refused.
+  std::function<bool(const EffectGuid& texture, uint32_t& width, uint32_t& height)> textureSize;
   // The VMSH blob of a converted model (one the import wrote under this retail CMDL id), or
   // empty for one that is not (a disc model). Left empty, no VMSH is written.
   std::function<std::vector<uint8_t>(uint32_t model)> modelMesh;
+  // Whether the Remastered model an effect names (its stored id) has an ANUV program: false
+  // when it cannot be read. Left empty, a PMPH is refused.
+  std::function<bool(const EffectGuid& model, bool& animatesUv)> modelAnimatesUv;
 };
 
 struct ConvertedPart {
   EffectGuid id{};  // the child id it was embedded under; zero for the root
   uint32_t type = 0;  // the retail asset type: 'PART', 'SWHC' or 'ELSC'
   bool root = false;  // the effect's own PART, not an embedded child
-  // Written to draw no quads because Remastered draws none either: its material is a
-  // placeholder whose colour texture is nil.
-  bool placeholder = false;
-  bool drawsNothing = false;  // a PART generator with no texture, material or model
+  bool drawsNothing = false;  // inactive primitive or proven null sprite material resource
   std::vector<uint8_t> part;          // the retail file, of that type
   std::vector<std::string> dropped;   // "FOURCC: why", one per left-out property
   // Properties retail reads that were left out. Remastered-only ones are not
@@ -137,5 +146,14 @@ bool SplitRetailPart(const uint8_t* data, size_t size, std::vector<RetailPartPro
 // as CParticleSwooshDataFactory and CParticleElectricDataFactory do.
 bool SplitRetailEffect(uint32_t type, const uint8_t* data, size_t size, std::vector<RetailPartProperty>& out,
                        std::string& error);
+
+// A MATI's parameters as the effect converter reads them: each texture's GUID, in the
+// MATI's byte order, and each vec4 constant, by tag. False when `mati` is too short to be one.
+struct MaterialParams {
+  uint32_t shader = 0;  // the shader id, big-endian as the MATI holds it (700e8e71 for the icy one)
+  std::map<std::string, EffectGuid> textures;
+  std::map<std::string, std::array<float, 4>> vectors;
+};
+bool ReadMaterialParams(const std::vector<uint8_t>& mati, MaterialParams& out);
 
 }  // namespace PortRemastered

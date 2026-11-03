@@ -6,20 +6,13 @@
 #include "Kyoto/Basics/CBasics.hpp"
 #include "Kyoto/Math/CLine.hpp"
 #include "WorldFormat/CAreaOctTree.hpp"
+#include "port_test.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <vector>
-
-static int gFailures = 0;
-static void Check(bool ok, const char* what) {
-  if (!ok) {
-    ++gFailures;
-    std::printf("FAIL %s\n", what);
-  }
-}
 
 namespace {
 struct V {
@@ -135,33 +128,33 @@ int main() {
   float t = 0, nz = 0;
 
   // below, travelling +Z: T0 is a back face, T1 a front face
-  Check(fx.Cast({1, 1, -1}, {0, 0, 1}, false, false, 10, t, nz) && std::fabs(t - 1.f) < 1e-4f &&
-            nz > 0.f,
-        "default two-sided: nearest back face");
-  Check(fx.Cast({1, 1, -1}, {0, 0, 1}, true, false, 10, t, nz) && std::fabs(t - 1.f) < 1e-4f,
-        "explicit false == default");
-  Check(fx.Cast({1, 1, -1}, {0, 0, 1}, true, true, 10, t, nz) && std::fabs(t - 3.f) < 1e-4f &&
-            nz < 0.f,
-        "frontOnly skips near back face, continues to far front face");
+  CHECK_MSG(fx.Cast({1, 1, -1}, {0, 0, 1}, false, false, 10, t, nz) && std::fabs(t - 1.f) < 1e-4f &&
+                nz > 0.f,
+            "default two-sided: nearest back face");
+  CHECK_MSG(fx.Cast({1, 1, -1}, {0, 0, 1}, true, false, 10, t, nz) && std::fabs(t - 1.f) < 1e-4f,
+            "explicit false == default");
+  CHECK_MSG(fx.Cast({1, 1, -1}, {0, 0, 1}, true, true, 10, t, nz) && std::fabs(t - 3.f) < 1e-4f &&
+                nz < 0.f,
+            "frontOnly skips near back face, continues to far front face");
   // above, travelling -Z: T1 back face first, T0 front face behind it
-  Check(fx.Cast({1, 1, 5}, {0, 0, -1}, false, false, 10, t, nz) && std::fabs(t - 3.f) < 1e-4f,
-        "default from above: back face T1");
-  Check(fx.Cast({1, 1, 5}, {0, 0, -1}, true, true, 10, t, nz) && std::fabs(t - 5.f) < 1e-4f &&
-            nz > 0.f,
-        "frontOnly from above: front face T0");
+  CHECK_MSG(fx.Cast({1, 1, 5}, {0, 0, -1}, false, false, 10, t, nz) && std::fabs(t - 3.f) < 1e-4f,
+            "default from above: back face T1");
+  CHECK_MSG(fx.Cast({1, 1, 5}, {0, 0, -1}, true, true, 10, t, nz) && std::fabs(t - 5.f) < 1e-4f &&
+                nz > 0.f,
+            "frontOnly from above: front face T0");
   // only a back face within range: front-only misses
-  Check(!fx.Cast({1, 1, -1}, {0, 0, 1}, true, true, 2, t, nz), "frontOnly misses when only back");
-  Check(fx.Cast({1, 1, -1}, {0, 0, 1}, true, false, 2, t, nz), "two-sided hits same range");
+  CHECK_MSG(!fx.Cast({1, 1, -1}, {0, 0, 1}, true, true, 2, t, nz), "frontOnly misses when only back");
+  CHECK_MSG(fx.Cast({1, 1, -1}, {0, 0, 1}, true, false, 2, t, nz), "two-sided hits same range");
   // coplanar
-  Check(!fx.Cast({-1, 1, 0}, {1, 0, 0}, true, true, 10, t, nz), "coplanar frontOnly miss");
-  Check(!fx.Cast({-1, 1, 0}, {1, 0, 0}, true, false, 10, t, nz), "coplanar two-sided miss");
+  CHECK_MSG(!fx.Cast({-1, 1, 0}, {1, 0, 0}, true, true, 10, t, nz), "coplanar frontOnly miss");
+  CHECK_MSG(!fx.Cast({-1, 1, 0}, {1, 0, 0}, true, false, 10, t, nz), "coplanar two-sided miss");
   // t == 0 on the near front face
-  Check(fx.Cast({1, 1, 0}, {0, 0, -1}, true, true, 10, t, nz) && t == 0.f && nz > 0.f,
-        "t=0 front face hit frontOnly");
-  Check(fx.Cast({1, 1, 0}, {0, 0, -1}, false, false, 10, t, nz) && t == 0.f,
-        "t=0 default hit");
+  CHECK_MSG(fx.Cast({1, 1, 0}, {0, 0, -1}, true, true, 10, t, nz) && t == 0.f && nz > 0.f,
+            "t=0 front face hit frontOnly");
+  CHECK_MSG(fx.Cast({1, 1, 0}, {0, 0, -1}, false, false, 10, t, nz) && t == 0.f,
+            "t=0 default hit");
   // t == 0 on a back face
-  Check(!fx.Cast({1, 1, 0}, {0, 0, 1}, true, true, 1, t, nz), "t=0 back face frontOnly miss");
+  CHECK_MSG(!fx.Cast({1, 1, 0}, {0, 0, 1}, true, true, 1, t, nz), "t=0 back face frontOnly miss");
 
   // Recursive paths: near child holds only a back face, far child a front face.
   // z=0 plane normal +Z (back face for a +Z ray); z=2 plane normal -Z (front face).
@@ -183,17 +176,19 @@ int main() {
     char msg[96];
     float rt = 0, rn = 0;
     std::snprintf(msg, sizeof msg, "%s default returns near back face", name);
-    Check(br.Cast({-5, -5, -8}, {0, 0, 1}, false, false, 20, rt, rn) && std::fabs(rt - 4.f) < 1e-3f &&
-              rn > 0.f,
-          msg);
+    CHECK_MSG(br.Cast({-5, -5, -8}, {0, 0, 1}, false, false, 20, rt, rn) && std::fabs(rt - 4.f) < 1e-3f &&
+                  rn > 0.f,
+              msg);
     std::snprintf(msg, sizeof msg, "%s frontOnly skips near, returns far front", name);
-    Check(br.Cast({-5, -5, -8}, {0, 0, 1}, true, true, 20, rt, rn) && std::fabs(rt - 12.f) < 1e-3f &&
-              rn < 0.f,
-          msg);
+    CHECK_MSG(br.Cast({-5, -5, -8}, {0, 0, 1}, true, true, 20, rt, rn) && std::fabs(rt - 12.f) < 1e-3f &&
+                  rn < 0.f,
+              msg);
     std::snprintf(msg, sizeof msg, "%s frontOnly misses when range ends before far", name);
-    Check(!br.Cast({-5, -5, -8}, {0, 0, 1}, true, true, 6, rt, rn), msg);
+    CHECK_MSG(!br.Cast({-5, -5, -8}, {0, 0, 1}, true, true, 6, rt, rn), msg);
   }
 
-  std::printf(gFailures ? "FAILED %d\n" : "ok\n", gFailures);
-  return gFailures ? 1 : 0;
+  if (port_test::Failures() == 0) {
+    std::printf("ok\n");
+  }
+  return PORT_TEST_RESULT();
 }

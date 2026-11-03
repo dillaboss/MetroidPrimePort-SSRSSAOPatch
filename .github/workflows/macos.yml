@@ -63,21 +63,13 @@ jobs:
           -DCMAKE_DISABLE_FIND_PACKAGE_zstd=ON
           -DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=ON
 
-      - name: Build
-        # -k 0: report every failing file in one run while the port is brought up.
-        run: cmake --build build-mac -j -- -k 0
-
-      - name: Test
-        run: ctest --test-dir build-mac -L port --output-on-failure
-
-      - name: Show the TLS handshake result
-        run: ./build-mac/port_ws_tests
-
-      - name: Build FIFO regressions
-        run: cmake --build build-mac --target gx_fifo_tests -j
-
-      - name: Test FIFO regressions
-        run: ./build-mac/extern/aurora/tests/gx_fifo_tests --gtest_brief=1
+      # Build, the port's tests, the TLS log and the GX FIFO regressions.
+      - uses: ./.github/actions/build-and-test
+        with:
+          build-dir: build-mac
+          jobs: "-j"
+          # -k 0: report every failing file in one run while the port is brought up.
+          build-args: "-- -k 0"
 
       # The Remastered import decodes that game's H.264 movies with ffmpeg, run
       # as a separate program, and macOS has none of its own. The app carries
@@ -136,21 +128,13 @@ jobs:
           plutil -lint "$app/Contents/Info.plist"
           codesign --force --sign - "$app/Contents/MacOS/ffmpeg"
           codesign --force --sign - "$app"
-          mkdir -p dist/licenses
+          # The same notices as the Linux packages, plus the two only this
+          # package carries: ffmpeg's and the statically linked OpenSSL's.
+          bash tools/collect_licenses.sh build-mac dist/licenses
           cp ffmpeg-min/out/COPYING.LGPLv2.1 dist/licenses/ffmpeg-LGPLv2.1.txt
           cp ffmpeg-min/out/ffmpeg-build.txt dist/licenses/ffmpeg-build.txt
-          cp LICENSE dist/licenses/port-license.txt
-          cp NOTICE dist/licenses/port-notice.txt
-          cp extern/aurora/LICENSE dist/licenses/aurora.txt
-          cp extern/musyx/LICENSE dist/licenses/musyx.txt
-          cp extern/astcenc/LICENSE.txt dist/licenses/astcenc.txt
-          cp extern/GamepadMotionHelpers/LICENSE dist/licenses/gamepadmotionhelpers.txt
-          cp packaging/licenses/*.txt dist/licenses/
           cp "$(brew --prefix openssl@3)/LICENSE.txt" dist/licenses/openssl.txt 2>/dev/null ||
             curl -fsSL -o dist/licenses/openssl.txt https://raw.githubusercontent.com/openssl/openssl/openssl-3.5/LICENSE.txt
-          if [ -f build-mac/_deps/freetype-src/docs/FTL.TXT ]; then cp build-mac/_deps/freetype-src/docs/FTL.TXT dist/licenses/freetype-FTL.txt; fi
-          (cd build-mac/_deps && find . -type f \( -name 'LICENSE*' -o -name 'COPYING*' -o -name 'NOTICE*' \) -not -path '*/build/*' |
-            while read -r f; do mkdir -p "../../dist/licenses/$(dirname "$f")"; cp "$f" "../../dist/licenses/$f"; done)
           cp docs/NATIVE_PORT.md dist/README.md
           cp docs/SETTINGS.md dist/SETTINGS.md
           cp docs/MODS.md dist/MODS.md

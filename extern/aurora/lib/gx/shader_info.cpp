@@ -2,6 +2,7 @@
 
 #include "../gfx/recording.hpp"
 
+#include <cassert>
 #include <cmath>
 
 #include <tracy/Tracy.hpp>
@@ -304,6 +305,23 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     }
   }
 
+  // Texgens can consume a color channel even when TEV never reads it directly.
+  // Include these channels before calculating lighting and uniform requirements.
+  for (int i = 0; i < info.sampledTexCoords.size(); ++i) {
+    if (!info.sampledTexCoords.test(i)) {
+      continue;
+    }
+    const auto& tcg = config.tcgs[i];
+    if (tcg.type >= GX_TG_BUMP0 && tcg.type <= GX_TG_BUMP7) {
+      continue;
+    }
+    if (tcg.src == GX_TG_COLOR0) {
+      info.sampledColorChannels.set(0);
+    } else if (tcg.src == GX_TG_COLOR1) {
+      info.sampledColorChannels.set(1);
+    }
+  }
+
   info.uniformSize += info.loadsTevReg.count() * sizeof(Vec4<float>);
   for (int i = 0; i < info.sampledColorChannels.size(); ++i) {
     if (info.sampledColorChannels.test(i)) {
@@ -354,14 +372,34 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     // linear light colours, then 3 HDR rows per light, then shield 8, the lightmap 4, the room lights and the model
     // modulation (diffuse, incandescence, coverage)
     info.uniformSize += sizeof(Mat3x4<float>) + sizeof(Vec4<float>) * (27 + GX::MaxLights * 4 + 8 + 4 + 1 + 3);
+    if (config.pbrThermal) {
+      info.usesPbrThermal = true;
+      info.uniformSize += sizeof(Vec4<float>);
+    }
   } else if (config.sceneHdr) {
-    // The tone curve the TEV result goes back through into the HDR scene (PBR reads pbr_tone).
+    // The TEV inverse tone curve and actual-blend compatibility flag (PBR reads pbr_tone).
     info.usesHdrTone = true;
-    info.uniformSize += sizeof(Vec4<float>) * 3;
+    info.uniformSize += sizeof(Vec4<float>) * 4; // three tone rows, then hdr_tev_blend
   }
   if (config.hudSample >= 2) {
     info.usesHudDyin = true;
     info.uniformSize += sizeof(Vec4<float>);
+  }
+  if (config.clipPlane) {
+    info.usesClipPlane = true;
+    info.uniformSize += sizeof(Vec4<float>);
+  }
+  if (config.shell != 0) {
+    // CCH0..CCH4, (time, depth shift, TCH0 sRGB, 0), (1 / target size), then the tone curve
+    // (pbrTone); the colour pass samples TCH0
+    // and TCH1 on maps 0 and 1 and the scene copy on map 2 (bound by build_bind_groups).
+    info.usesShell = true;
+    info.uniformSize += sizeof(g_gxState.shellUniform) + sizeof(g_gxState.pbrTone);
+    if (config.shell == 2) {
+      info.shellScene = true;
+      info.sampledTextures.set(GX_TEXMAP0);
+      info.sampledTextures.set(GX_TEXMAP1);
+    }
   }
   if (info.usesPTTexMtx.any()) {
     info.uniformSize += sizeof(Mat3x4<float>) * MaxPTTexMtx;
@@ -386,6 +424,10 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     info.actorDecal = info.shadowReceive && config.actorDecal != 0;
     // The caster and receiver matrices, the sun's direction and colour (GXState::shadowUniform)
     info.uniformSize += sizeof(g_gxState.shadowUniform);
+  }
+  if (config.alphaCompare.ref0 == AlphaRefUniform || config.alphaCompare.ref1 == AlphaRefUniform) {
+    info.usesAlphaRef = true;
+    info.uniformSize += sizeof(Vec4<u32>);
   }
   info.uniformSize = gfx::align_uniform(info.uniformSize);
   if (info.uniformSize > MaxUniformSize) {
@@ -532,14 +574,47 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
     buf.append(g_gxState.pbrModelDiffuse);
     buf.append(g_gxState.pbrModelIncan);
     buf.append(g_gxState.pbrModelCoverage);
+    if (info.usesPbrThermal) {
+      buf.append(g_gxState.pbrThermal);
+    }
   }
   if (info.usesHdrTone) {
     for (const auto& v : g_gxState.pbrTone) {
       buf.append(v);
     }
+    // x: a source weighted by its alpha, SRCALPHA/ONE (additive) or SRCALPHA/INVSRCALPHA (alpha over), goes
+    // through the inverse curve already weighted (hdr_tev_srcalpha_add). ONE/INVSRCALPHA needs nothing: its
+    // source is premultiplied, so the plain inverse already gives the source term exactly.
+    const bool compatSrcAlphaAdditive =
+        g_gxState.blendMode == GX_BM_BLEND && g_gxState.blendFacSrc == GX_BL_SRCALPHA &&
+        (g_gxState.blendFacDst == GX_BL_ONE || g_gxState.blendFacDst == GX_BL_INVSRCALPHA);
+    // y: the source colour scales the destination (hdr_tev_dst_factor): 1 dst * src, 2 dst * (1 + src).
+    float dstFactor = 0.f;
+    if (g_gxState.blendMode == GX_BM_BLEND) {
+      const auto src = g_gxState.blendFacSrc;
+      const auto dst = g_gxState.blendFacDst;
+      if ((src == GX_BL_ZERO && dst == GX_BL_SRCCLR) || (src == GX_BL_DSTCLR && dst == GX_BL_ZERO)) {
+        dstFactor = 1.f;
+      } else if (src == GX_BL_DSTCLR && dst == GX_BL_ONE) {
+        dstFactor = 2.f;
+      }
+    }
+    buf.append(Vec4<float>{compatSrcAlphaAdditive ? 1.f : 0.f, dstFactor, 0.f, 0.f});
   }
   if (info.usesHudDyin) {
     buf.append(g_gxState.hudDyin);
+  }
+  if (info.usesClipPlane) {
+    buf.append(g_gxState.clipPlaneEq);
+  }
+  if (info.usesShell) {
+    for (const auto& v : g_gxState.shellUniform) {
+      buf.append(v);
+    }
+    // shell_tone: the curve the LDR colour pass decodes the scene copy with (shader.cpp).
+    for (const auto& v : g_gxState.pbrTone) {
+      buf.append(v);
+    }
   }
   if (info.usesPTTexMtx.any()) {
     for (int i = 0; i < info.usesPTTexMtx.size(); ++i) {
@@ -548,22 +623,13 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
   }
   if (info.usesFog) {
     const auto& state = g_gxState.fog;
-    const float logicalWidth = std::max(g_gxState.logicalViewport.width, 1.f);
-    const float renderWidth = std::max(g_gxState.renderViewport.width, 1.f);
     Fog fog{
         .color = state.color,
         .a = state.a,
         .b = state.b,
         .c = state.c,
-        .rangeCenter = ((static_cast<float>(state.rangeCenter) - g_gxState.logicalViewport.left) / logicalWidth) * 2.f -
-                       1.f + (g_gxState.renderViewport.left / renderWidth) * 2.f,
+        .type = static_cast<u32>(state.type),
     };
-    for (u32 i = 0; i < state.rangeK.size(); ++i) {
-      const u32 source = (i & ~1u) | (1u - (i & 1u));
-      fog.rangeK[i / 4][i % 4] = static_cast<float>(state.rangeK[source]) / 64.f;
-    }
-    fog.rangeK[2][2] = fog.rangeK[2][1];
-    fog.rangeK[2][3] = fog.rangeK[2][1];
     buf.append(fog);
   }
   if (info.usesVolFog) {
@@ -593,6 +659,9 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
       buf.append(v);
     }
   }
+  if (info.usesAlphaRef) {
+    buf.append(Vec4<u32>{g_gxState.alphaCompare.ref0, g_gxState.alphaCompare.ref1, 0, 0});
+  }
 }
 
 gfx::Range build_uniform(const ShaderInfo& info) noexcept {
@@ -606,6 +675,8 @@ gfx::Range build_uniform(const ShaderInfo& info) noexcept {
   }
   ByteBuffer buf{out, MaxUniformSize};
   fill_uniform(buf, info);
+  // build_shader_info's size formula must match the bytes fill_uniform appends (debug builds only).
+  assert(gfx::align_uniform(buf.size()) == info.uniformSize && "uniformSize formula out of step with fill_uniform");
   gfx::unmap_uniform(range, buf.size());
   return range;
 }

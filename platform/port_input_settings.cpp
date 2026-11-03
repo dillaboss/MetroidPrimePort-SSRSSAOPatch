@@ -5,11 +5,16 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <iterator>
 #include <mutex>
 #include <ostream>
+#include <string_view>
 
 namespace PortInput {
 namespace {
+
+// Settings::padPreset's values, as ApplyPadPresetNamed takes them.
+constexpr std::string_view kPadPresetNames[] = {"gamecube", "remastered", "modern", "southpaw"};
 
 std::mutex sLayoutMutex;
 std::string sLayout;
@@ -58,6 +63,9 @@ bool ApplySetting(std::string_view keyView, std::string_view valueView) {
     s.mouseAim = ParseBool(value);
   } else if (key == "twin_stick") {
     s.twinStick = ParseBool(value);
+  } else if (key == "pad_preset") {
+    const auto it = std::find(std::begin(kPadPresetNames), std::end(kPadPresetNames), value);
+    s.padPreset = it != std::end(kPadPresetNames) ? int(it - std::begin(kPadPresetNames)) : -1;
   } else if (key == "touch_colors") {
     s.touchColors = ParseBool(value);
   } else if (key == "touch_labels") {
@@ -73,6 +81,13 @@ bool ApplySetting(std::string_view keyView, std::string_view valueView) {
     }
   } else if (key == "stick_aim_split") {
     s.stickAimSplit = ParseBool(value);
+  } else if (key == "flick_stick") {
+    s.flickStick = ParseBool(value);
+  } else if (key == "flick_stick_outer_deadzone") {
+    const float f = ParseFloat(value);
+    if (std::isfinite(f) && f >= 0.f && f <= kFlickOuterDeadZoneMax) {
+      s.flickOuterDeadZone = f;
+    }
   } else if (key == "stick_aim_rate_y") {
     const float f = ParseFloat(value);
     if (std::isfinite(f) && f >= 50.f && f <= 10000.f) {
@@ -94,7 +109,16 @@ bool ApplySetting(std::string_view keyView, std::string_view valueView) {
       s.gyroSpace = static_cast< int >(v);
     }
   } else if (key == "gyro_auto_calibrate") {
-    s.gyroAutoCalibrate = ParseBool(value);
+    // 0/1 were the old on/off; 2 is only in menus.
+    char* end = nullptr;
+    const long v = std::strtol(value.c_str(), &end, 10);
+    if (end != value.c_str()) {
+      if (v >= 0 && v <= 2) {
+        s.gyroAutoCalibrate = static_cast< int >(v);
+      }
+    } else {
+      s.gyroAutoCalibrate = ParseBool(value) ? 1 : 0;
+    }
   } else if (key == "gyro_smoothing" || key == "gyro_tightening") {
     const float f = ParseFloat(value);
     if (std::isfinite(f) && f >= 0.f && f <= kGyroThresholdMax) {
@@ -107,11 +131,20 @@ bool ApplySetting(std::string_view keyView, std::string_view valueView) {
     }
   } else if (key == "gyro_cursor_camera") {
     s.gyroCursorCamera = ParseBool(value);
+  } else if (key == "reset_aim_both") {
+    s.resetAimBoth = ParseBool(value);
   } else if (key == "gyro_sensitivity") {
     const float f = ParseFloat(value);
     if (std::isfinite(f) && f >= kGyroSensitivityMin && f <= kGyroSensitivityMax) {
       s.gyroSensitivity = f;
       s.gyroSensitivityRead = true;
+    }
+  } else if (key == "gyro_split") {
+    s.gyroSplit = ParseBool(value);
+  } else if (key == "gyro_sensitivity_y") {
+    const float f = ParseFloat(value);
+    if (std::isfinite(f) && f >= kGyroSensitivityMin && f <= kGyroSensitivityMax) {
+      s.gyroSensitivityY = f;
     }
   } else if (key == "gyro_rate") {
     const float f = ParseFloat(value);
@@ -126,6 +159,8 @@ bool ApplySetting(std::string_view keyView, std::string_view valueView) {
     s.touchClassic = ParseBool(value);
   } else if (key == "touch_twin_stick") {
     s.touchTwinStick = ParseBool(value);
+  } else if (key == "touch_flick_stick") {
+    s.touchFlickStick = ParseBool(value);
   } else if (key == "touch_wheels") {
     s.touchWheels = ParseBool(value);
   } else if (key == "touch_visor_tap_scan") {
@@ -134,6 +169,13 @@ bool ApplySetting(std::string_view keyView, std::string_view valueView) {
     const float f = ParseFloat(value);
     if (std::isfinite(f) && f >= 0.25f && f <= 10.f) {
       s.touchAimSpeed = f;
+    }
+  } else if (key == "touch_aim_split") {
+    s.touchAimSplit = ParseBool(value);
+  } else if (key == "touch_aim_speed_y") {
+    const float f = ParseFloat(value);
+    if (std::isfinite(f) && f >= 0.25f && f <= 10.f) {
+      s.touchAimSpeedY = f;
     }
   } else if (key == "touch_side_margin" || key == "touch_stick_inset" ||
              key == "touch_button_inset") {
@@ -144,6 +186,8 @@ bool ApplySetting(std::string_view keyView, std::string_view valueView) {
                                     : s.touchButtonInset)
           .store(f);
     }
+  } else if (key == "touch_controls") {
+    s.touchControls.store(ParseBool(value));
   } else if (key == "touch_opacity") {
     const float f = ParseFloat(value);
     if (std::isfinite(f) && f >= kTouchOpacityMin && f <= kTouchOpacityMax) {
@@ -160,6 +204,10 @@ bool ApplySetting(std::string_view keyView, std::string_view valueView) {
     s.mouseInvertX = ParseBool(value);
   } else if (key == "mouse_invert_y") {
     s.mouseInvertY = ParseBool(value);
+  } else if (key == "map_invert_x") {
+    s.mapInvertX = ParseBool(value);
+  } else if (key == "map_invert_y") {
+    s.mapInvertY = ParseBool(value);
   } else if (key == "mouse_buttons") {
     s.mouseButtons = ParseBool(value);
   } else if (key == "mouse_crosshair") {
@@ -176,6 +224,10 @@ bool ApplySetting(std::string_view keyView, std::string_view valueView) {
     if (v >= kPointerAimTurnMin && v <= kPointerAimTurnMax) {
       s.pointerAimTurn = v;
     }
+  } else if (key == "lock_on_free_aim") {
+    s.lockOnFreeAim = ParseBool(value);
+  } else if (key == "hand_on_cannon") {
+    s.handOnCannon = ParseBool(value);
   } else if (key == "crosshair_size") {
     const int v = std::atoi(value.c_str());
     if (v >= kCrosshairSizeMin && v <= kCrosshairSizeMax) {
@@ -186,6 +238,13 @@ bool ApplySetting(std::string_view keyView, std::string_view valueView) {
     if (std::isfinite(f) && f > 0.f && f <= 1.f) {
       s.mouseSensitivity = f;
     }
+  } else if (key == "mouse_sensitivity_split") {
+    s.mouseSensitivitySplit = ParseBool(value);
+  } else if (key == "mouse_sensitivity_y") {
+    const float f = ParseFloat(value);
+    if (std::isfinite(f) && f > 0.f && f <= 1.f) {
+      s.mouseSensitivityY = f;
+    }
   } else if (key == "mouse_dpi") {
     const int v = std::atoi(value.c_str());
     if (v >= 100 && v <= 64000) {
@@ -195,6 +254,8 @@ bool ApplySetting(std::string_view keyView, std::string_view valueView) {
     s.springBall = ParseBool(value);
   } else if (key == "swap_scan_xray") {
     s.swapScanXray = ParseBool(value);
+  } else if (key == "radial_menus") {
+    s.radialMenus = ParseBool(value);
   } else if (key == "shift_key" || key == "shift_key_alt" || key == "shift_pad") {
     const int slot = key == "shift_key" ? 0 : key == "shift_key_alt" ? 1 : 2;
     int code = 0;
@@ -229,6 +290,17 @@ bool ApplySetting(std::string_view keyView, std::string_view valueView) {
     s.fastMorph = ParseBool(value);
   } else if (key == "lock_on_toggle") {
     s.lockOnToggle = ParseBool(value);
+    // Toggle Lock-On used to latch grapples too; a file from before
+    // grapple_toggle keeps that (grapple_toggle, written after, overrides).
+    s.grappleToggle = s.lockOnToggle;
+  } else if (key == "grapple_toggle") {
+    s.grappleToggle = ParseBool(value);
+  } else if (key == "grapple_shoot") {
+    s.grappleShoot = ParseBool(value);
+  } else if (key == "spider_toggle") {
+    s.spiderToggle = ParseBool(value);
+  } else if (key == "aim_lock_on") {
+    s.aimLockOn = ParseBool(value);
   } else if (key == "sticky_charge") {
     s.stickyCharge = ParseBool(value);
   } else if (key == "rapid_charge") {
@@ -268,12 +340,16 @@ void WriteControlSettings(std::ostream& out) {
   const Settings& s = Get();
   out << "mouse_aim=" << (s.mouseAim ? 1 : 0) << '\n';
   out << "twin_stick=" << (s.twinStick ? 1 : 0) << '\n';
+  if (s.padPreset >= 0 && s.padPreset < int(std::size(kPadPresetNames))) {
+    out << "pad_preset=" << kPadPresetNames[s.padPreset] << '\n';
+  }
   out << "touch_colors=" << (s.touchColors ? 1 : 0) << '\n';
   out << "touch_labels=" << (s.touchLabels ? 1 : 0) << '\n';
   out << "touch_turbo=" << (s.touchTurbo ? 1 : 0) << '\n';
   out << "touch_floating_stick=" << (s.touchFloatingStick ? 1 : 0) << '\n';
   out << "spring_ball=" << (s.springBall ? 1 : 0) << '\n';
   out << "swap_scan_xray=" << (s.swapScanXray ? 1 : 0) << '\n';
+  out << "radial_menus=" << (s.radialMenus ? 1 : 0) << '\n';
   out << "shift_key=" << s.shiftBindings[0] << '\n';
   out << "shift_key_alt=" << s.shiftBindings[1] << '\n';
   out << "shift_pad=" << s.shiftBindings[2] << '\n';
@@ -291,6 +367,10 @@ void WriteControlSettings(std::ostream& out) {
 void WriteGameplaySettings(std::ostream& out) {
   const Settings& s = Get();
   out << "lock_on_toggle=" << (s.lockOnToggle ? 1 : 0) << '\n';
+  out << "grapple_toggle=" << (s.grappleToggle ? 1 : 0) << '\n';
+  out << "grapple_shoot=" << (s.grappleShoot ? 1 : 0) << '\n';
+  out << "spider_toggle=" << (s.spiderToggle ? 1 : 0) << '\n';
+  out << "aim_lock_on=" << (s.aimLockOn ? 1 : 0) << '\n';
   out << "sticky_charge=" << (s.stickyCharge ? 1 : 0) << '\n';
   out << "rapid_charge=" << (s.rapidCharge ? 1 : 0) << '\n';
   out << "remastered_movement=" << (s.remasteredMovement ? 1 : 0) << '\n';
@@ -304,29 +384,42 @@ void WriteAimSettings(std::ostream& out) {
   out << "stick_aim_rate=" << s.stickAimRate << '\n';
   out << "stick_aim_split=" << (s.stickAimSplit ? 1 : 0) << '\n';
   out << "stick_aim_rate_y=" << s.stickAimRateY << '\n';
+  out << "flick_stick=" << (s.flickStick ? 1 : 0) << '\n';
+  out << "flick_stick_outer_deadzone=" << s.flickOuterDeadZone << '\n';
   out << "gyro_mode=" << s.gyroMode << '\n';
   out << "gyro_source=" << s.gyroSource << '\n';
   out << "gyro_sensitivity=" << s.gyroSensitivity << '\n';
+  out << "gyro_split=" << (s.gyroSplit ? 1 : 0) << '\n';
+  out << "gyro_sensitivity_y=" << s.gyroSensitivityY << '\n';
   out << "gyro_space=" << s.gyroSpace << '\n';
-  out << "gyro_auto_calibrate=" << (s.gyroAutoCalibrate ? 1 : 0) << '\n';
+  out << "gyro_auto_calibrate=" << s.gyroAutoCalibrate << '\n';
   out << "gyro_smoothing=" << s.gyroSmoothing << '\n';
   out << "gyro_tightening=" << s.gyroTightening << '\n';
   out << "gyro_cursor_angle=" << s.gyroCursorAngle << '\n';
   out << "gyro_cursor_camera=" << (s.gyroCursorCamera ? 1 : 0) << '\n';
+  out << "reset_aim_both=" << (s.resetAimBoth ? 1 : 0) << '\n';
   out << "touch_aim=" << (s.touchAim ? 1 : 0) << '\n';
   out << "touch_aim_speed=" << s.touchAimSpeed << '\n';
+  out << "touch_aim_split=" << (s.touchAimSplit ? 1 : 0) << '\n';
+  out << "touch_aim_speed_y=" << s.touchAimSpeedY << '\n';
   out << "touch_side_margin=" << s.touchSideMargin.load() << '\n';
   out << "touch_stick_inset=" << s.touchStickInset.load() << '\n';
   out << "touch_button_inset=" << s.touchButtonInset.load() << '\n';
+  out << "touch_controls=" << (s.touchControls.load() ? 1 : 0) << '\n';
   out << "touch_opacity=" << s.touchOpacity.load() << '\n';
   out << "touch_layout=" << TouchLayout() << '\n';
   out << "touch_map_tap=" << (s.touchMapTap ? 1 : 0) << '\n';
   out << "touch_classic_gc=" << (s.touchClassic ? 1 : 0) << '\n';
   out << "touch_twin_stick=" << (s.touchTwinStick ? 1 : 0) << '\n';
-  out << "touch_wheels=" << (s.touchWheels ? 1 : 0) << '\n';
+  out << "touch_flick_stick=" << (s.touchFlickStick ? 1 : 0) << '\n';
+  if (s.touchWheels) {
+    out << "touch_wheels=1\n"; // not migrated yet
+  }
   out << "touch_visor_tap_scan=" << (s.touchVisorTapScan ? 1 : 0) << '\n';
   out << "mouse_invert_x=" << (s.mouseInvertX ? 1 : 0) << '\n';
   out << "mouse_invert_y=" << (s.mouseInvertY ? 1 : 0) << '\n';
+  out << "map_invert_x=" << (s.mapInvertX ? 1 : 0) << '\n';
+  out << "map_invert_y=" << (s.mapInvertY ? 1 : 0) << '\n';
   out << "mouse_buttons=" << (s.mouseButtons ? 1 : 0) << '\n';
   for (int i = 0; i < PortInputMap::kMouseButtonCount; ++i) {
     out << PortInputMap::MouseButtonKey(i) << '=' << PortInputMap::MouseActionInfo(s.mouseActions[i]).name
@@ -335,10 +428,14 @@ void WriteAimSettings(std::ostream& out) {
   out << "mouse_crosshair=" << (s.mouseCrosshair ? 1 : 0) << '\n';
   out << "crosshair_size=" << s.crosshairSize << '\n';
   out << "mouse_sensitivity=" << s.mouseSensitivity << '\n';
+  out << "mouse_sensitivity_split=" << (s.mouseSensitivitySplit ? 1 : 0) << '\n';
+  out << "mouse_sensitivity_y=" << s.mouseSensitivityY << '\n';
   out << "mouse_dpi=" << s.mouseDpi << '\n';
   out << "pointer_aim=" << (s.pointerAim ? 1 : 0) << '\n';
   out << "pointer_aim_box=" << s.pointerAimBox << '\n';
   out << "pointer_aim_turn=" << s.pointerAimTurn << '\n';
+  out << "lock_on_free_aim=" << (s.lockOnFreeAim ? 1 : 0) << '\n';
+  out << "hand_on_cannon=" << (s.handOnCannon ? 1 : 0) << '\n';
 }
 
 void WriteSettings(std::ostream& out) {
@@ -356,6 +453,12 @@ void ApplyEnvOverrides() {
   }
   if (port::EnvFlag("MP_TWIN_STICK")) {
     s.twinStick = true;
+  }
+  if (port::EnvFlag("MP_FLICK_STICK")) {
+    s.flickStick = true;
+  }
+  if (port::EnvFlag("MP_TOUCH_FLICK_STICK")) {
+    s.touchFlickStick = true;
   }
   if (port::EnvFlag("MP_MOUSE_INVERT_X")) {
     s.mouseInvertX = true;

@@ -24,6 +24,7 @@
 #include "math.h"
 #include "stdlib.h"
 #include "string.h"
+#include <cstdio>
 
 const float CCameraBlurPass::skXRayViewportScaleX = 0.9f;
 const float CCameraBlurPass::skXRayViewportScaleY = 0.9f;
@@ -77,6 +78,9 @@ CCameraFilterPass::CCameraFilterPass()
 
 void CCameraFilterPass::SetFilter(const EFilterType type, const EFilterShape shape,
                                   const float time, const CColor& color, const CAssetId txtr) {
+#ifdef TARGET_PC
+  xPortGradientEngaged = false;
+#endif
   if (time == 0.f) {
     xc_duration = 0.f;
     x10_remTime = 0.f;
@@ -384,8 +388,96 @@ void CCameraFilterPass::Draw() const {
     return;
   }
 #endif
+#ifdef TARGET_PC
+  if (x8_shape == kFS_PortRadialGradient) {
+    PortDrawRadialGradient();
+    return;
+  }
+#endif
   DrawFilter(x0_curType, x8_shape, x18_curColor, tex, t);
 }
+
+void CCameraFilterPass::PortDescribe(char* out, unsigned int size) const {
+  std::snprintf(out, size,
+                "type %d -> %d shape %d rgba %.6g %.6g %.6g %.6g texture %08X resident %d fade %.6g/%.6g",
+                int(x0_curType), int(x4_nextType), int(x8_shape), x18_curColor.GetRed(),
+                x18_curColor.GetGreen(), x18_curColor.GetBlue(), x18_curColor.GetAlpha(),
+                unsigned(x20_nextTxtr), int(!x24_texObj.null()), x10_remTime, xc_duration);
+}
+
+#ifdef TARGET_PC
+void CCameraFilterPass::PortSetRadialFilter(EFilterType type, const CColor& color,
+                                            const float c0[4], const float c1[4],
+                                            const float c2[4]) {
+  SetFilter(type, kFS_PortRadialGradient, 0.f, color, kInvalidAssetId);
+  for (int i = 0; i < 4; ++i) {
+    xPortGradient[0][i] = c0[i];
+    xPortGradient[1][i] = c1[i];
+    xPortGradient[2][i] = c2[i];
+  }
+  xPortGradientEngaged = true;
+}
+
+bool CCameraFilterPass::PortRadialGradient(float c0[4], float c1[4], float c2[4]) const {
+  if (x0_curType == kFT_Passthru || x8_shape != kFS_PortRadialGradient || !xPortGradientEngaged) {
+    return false;
+  }
+  for (int i = 0; i < 4; ++i) {
+    c0[i] = xPortGradient[0][i];
+    c1[i] = xPortGradient[1][i];
+    c2[i] = xPortGradient[2][i];
+  }
+  return true;
+}
+
+// DrawFullScreenTintedRadialGradient 0xfaf650, outside the HDR composite: 16 triangles, apex c0
+// at the centre, rim c1 at (6.25 sin a, 3.6 cos a) in NDC. Remastered draws it only folded into
+// the UberPost composite (shader 00075d2: frame * c2 + fan.rgb * fan.a, whatever the filter
+// type); this fixed-function fallback (the free camera) adds the fan the same way and has no c2
+// term (unverified).
+void CCameraFilterPass::PortDrawRadialGradient() const {
+  if (!xPortGradientEngaged || x0_curType == kFT_Passthru) {
+    return;
+  }
+  gpRender->SetBlendMode_AdditiveAlpha();
+  const auto clamp01 = [](float v) { return v < 0.f ? 0.f : v > 1.f ? 1.f : v; };
+  const CColor apex(clamp01(xPortGradient[0][0]), clamp01(xPortGradient[0][1]),
+                    clamp01(xPortGradient[0][2]), clamp01(xPortGradient[0][3]));
+  const CColor rim(clamp01(xPortGradient[1][0]), clamp01(xPortGradient[1][1]),
+                   clamp01(xPortGradient[1][2]), clamp01(xPortGradient[1][3]));
+  rstl::pair< CVector2f, CVector2f > vp = gpRender->SetViewportOrtho(true, -4096.f, 4096.f);
+  const float l = vp.first.GetX() - 1.f;
+  const float r = 1.f + vp.second.GetX();
+  const float t = vp.first.GetY() - 1.f;
+  const float b = 1.f + vp.second.GetY();
+  const float cx = 0.5f * (l + r);
+  const float cz = 0.5f * (t + b);
+  const float hx = 0.5f * (r - l);
+  const float hz = 0.5f * (b - t);
+  gpRender->SetDepthReadWrite(false, false);
+  gpRender->BeginTriangles(48);
+  const float step = 3.14159265358979f / 8.f;
+  for (int k = 0; k < 16; ++k) {
+    const float a0 = step * static_cast< float >(k);
+    const float a1 = step * static_cast< float >(k + 1);
+    gpRender->PrimColor(apex);
+    gpRender->PrimVertex(CVector3f(cx, 0.f, cz));
+    gpRender->PrimColor(rim);
+    gpRender->PrimVertex(CVector3f(cx + 6.25f * sinf(a0) * hx, 0.f, cz + 3.6f * cosf(a0) * hz));
+    gpRender->PrimVertex(CVector3f(cx + 6.25f * sinf(a1) * hx, 0.f, cz + 3.6f * cosf(a1) * hz));
+  }
+  gpRender->EndPrimitive();
+  gpRender->SetBlendMode_AlphaBlended();
+}
+
+bool CCameraFilterPass::PortAddColor(CColor& out) const {
+  if (x0_curType != kFT_Add || x8_shape != kFS_Fullscreen || !x24_texObj.null()) {
+    return false;
+  }
+  out = x18_curColor;
+  return true;
+}
+#endif
 
 void CCameraFilterPass::DrawFilter(EFilterType type, EFilterShape shape, const CColor& color,
                                    const CTexture* tex, float lod) {
@@ -864,7 +956,16 @@ void CCameraBlurPass::GetFbCopy(GXTexFmt fmt, uchar* buf) const {
 
 void CCameraBlurPass::AllocatePersistentFbTexture() {
   GXGetTexBufferSize(320, 224, GX_TF_RGB565, GX_FALSE, 0);
+#ifdef TARGET_PC
+  // Its own address: copies resolve by address to the latest one there, and the
+  // Remastered glass copies the scene into the spare buffer each frame (helmet
+  // included), so the pause screen's held copy would load that one, at another
+  // size, and read black (#208).
+  static uchar sPersistentBuf[640 * 448] ATTRIBUTE_ALIGN(32);
+  x30_persistentBuf = sPersistentBuf;
+#else
   x30_persistentBuf = CGraphics::GetDolphinSpareBuffer();
+#endif
 }
 
 void CCameraBlurPass::FreePersistentFbTexture() { x2d_noPersistentCopy = false; }

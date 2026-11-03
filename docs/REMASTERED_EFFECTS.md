@@ -278,8 +278,11 @@ those back to retail PARTs (checked 2026-10-05):
   u16/192 after 05) gives the slot's GENP and bone; the retail ANCS effect of
   the same name whose locator is that bone gives the PART. It re-derives the 15
   known slots (3 GENPs) with none wrong, and adds 10 GENPs (Scuba*, Eyes,
-  JetPack, LandingSmoke, Fire1-3's three, TwoEyes). Left out: SpeedSwoosh (a
-  retail SWHC, not a PART) and 74d36fa3 on D3BD37FC (one slot, against four for
+  JetPack, LandingSmoke, Fire1-3's three, TwoEyes). SpeedSwoosh (F9F4B18F's
+  Chozo Ghost dash trail, a retail SWHC `43CD9074`, from Remastered's db8e16a5, a
+  generator around one swoosh) is written as that swoosh under the SWHC's id: a
+  paired GENP whose retail id is a SWHC on the disc and that draws nothing and
+  starts one swoosh stands for the swoosh, not a PART (kEffects 96). Left out: 74d36fa3 on D3BD37FC (one slot, against four for
   4d818e87). Only these six CHPRs carry names. Import: 539 imported (529 before).
   Scripts `build/fx-name/` (`vote.py`).
 - Still unpaired (2026-10-08): the CHPR effect sets name 242 fresh GENPs, 103
@@ -339,8 +342,9 @@ by their form: GPSM as PART, SWSH as retail SWHC (`CSwooshDescription`), ELC2
 and ELSM as retail ELSC (`CElectricDescription`). So SSWH/SELC/GPSM references
 between children resolve. Each child type has its own property table from
 retail's reader. In a swoosh, SBDM (0/1) is written as AALP, and MTIN stands in
-for TEXR. A swoosh's PROT is left out: retail's IROT/ROTM are not the same
-property. ELC2 is Remastered's electric form with no LWD/LCL, so as ELSC it
+for TEXR. A swoosh's PROT is not retail's IROT/ROTM: the forms the port runs become port-only
+properties (PROZ for a turn about Z, PRAZ/PRAF for KPIN(RAZY(EMRV, ROTV(v, RLCL), fallback))),
+and the rest is left out and listed ("PROT: ..."). ORNT with SIDE 2 replaces PROT. ELC2 is Remastered's electric form with no LWD/LCL, so as ELSC it
 draws only the generators and swoosh it names. A zero id is written as NONE.
 On the US disc's one exact child pair, ELSC 624A7606 (in FF5DC7A2) converts
 byte for byte. SWHC 88D02992 (in 1A14AD75) matches except COLR (re-authored
@@ -358,8 +362,8 @@ GENP spawns go to their frames, the first SWSH spawn becomes the generator's
 SSWH started at SSSD, and the first ELC2/ELSM its SELC at SESD (unless the
 generator has its own). Noted as approximated: the SEVT events (moves) are
 dropped, tables are merged, a selector other than `CNST(0)` is ignored, and
-spawn conditions are ignored (every spawn starts). Extra swooshes or electric
-children are left out (29 spawns in 27 effects). All 1211 KSSMs in the parsed
+spawn conditions are ignored (every spawn starts). Extra swooshes are kept as the
+port-only PSWX list (id, frame); extra electric children are left out and listed. All 1211 KSSMs in the parsed
 effects convert.
 
 `SplitRetailEffect` (`SplitRetailPart` for PART) reads a retail PART, SWHC or
@@ -410,8 +414,9 @@ from what retail's elements compute (`CVEAngleCone`, `CVEAngleSphere`,
 
 - `ANCR(REUL(x, 0, 0), xr, yr, m)` becomes `ANGC(-x, -0, xr, yr, m)`. ANGC's
   direction is `(-sin y cos x, sin x, cos x cos y)`, so an X bias of 90 points
-  the cone at +Y as `REUL(-90)` turns +Z to +Y. That is exact on the cone's
-  centre line only; rotations about Y or Z are not converted.
+  the cone at +Y as `REUL(-90)` turns +Z to +Y. The port-only ANCR/ASPR keep the
+  REUL's three angles, so rotations about Y or Z convert too (the line above is the
+  retail-only fallback).
 - `ASPR(origin, REUL, xr, yr, a, b)` becomes `ASPH(origin, -x, -0, xr, yr, a,
   b)`, taking `a` as the radius and `b` as the speed (b is the one that is
   sometimes random).
@@ -447,7 +452,7 @@ except where Remastered draws it elsewhere (`kStubReplaces`): the Artifact
 Temple laser hit 53861B29 spawns the same five PARTs as Ridley's 2D16014C,
 which Remastered's c3a53327 now carries, so its stub replaces it.
 Effects with no retail id (most world effects) are not used yet: nothing on
-the disc names them. The step is off by default. Like the rest of the import, the files take effect
+the disc names them. Like the rest of the import, the files take effect
 at the next mods reload (`mods reload` or the debug menu), no restart needed.
 
 ## HDR dynamic lights
@@ -482,9 +487,21 @@ The light reaches the shader through `GXSetPBRLightHdr` (Aurora command
 `GX_AURORA_SET_PBR_LIGHT_HDR`). That call gives a GX light slot its own linear
 colour, view position and falloff (none, linear, quadratic, 1 - smoothstep;
 r1 0 = off) in PBR draws, in place of the GX light's colour and attenuation.
+It also carries a specular widen (Remastered's CLight+0x74, SCachedLight +0xc):
+that light's GGX lobe takes roughness `r + (1 - r) * widen`. Only particle
+lights set it, from their constant LSPS (port-only `PLSP`,
+`CLight::SetPortHdrWiden`); the ball light and room lights keep 0.
 `CLight::SetPortHdr` carries these values, and `CGraphics::LoadLight` sends
 them, or "off", for every light it loads. Retail-material draws keep the
 retail light.
+
+Remastered builds a generator's light once, in its constructor, and only
+`TickSystem_Light` updates it: a primitive-3 generator that makes no
+particles (no LTME, a constant LTME 0, or no GRTE). Every other lit
+generator, the beam impact lights among them, keeps its frame-0 colour,
+intensity and radii; only the position follows the system. The converter
+marks those with port-only `PLON 1`, and `CElementGen::UpdateLightParameters`
+then evaluates the light once. Without it a RAND LINT flickers every frame.
 
 `MP_REMASTERED_BALL_LIGHT=0` keeps retail's light, and
 `MP_REMASTERED_BALL_LIGHT_SCALE=<x>` scales the intensity. The console's

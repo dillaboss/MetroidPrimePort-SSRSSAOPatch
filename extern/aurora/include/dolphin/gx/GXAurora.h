@@ -243,11 +243,11 @@ extern "C" {
 //   f32 diffuse r, g, b, a, f32 incan r, g, b, a, f32 coverage
 #define GX_AURORA_SET_PBR_MODEL_MODULATION 0x006D
 
-// Port extension: Remastered's bloom, colour grade and frame average over the EFB as drawn so
-// far (see GXPortPostProcess). Queued, so the game thread does not wait for the FIFO to be
+// Port extension: Remastered's bloom, colour grade and frame average over the HDR scene as drawn
+// so far (see GXPortPostProcessScene). Queued, so the game thread does not wait for the FIFO to be
 // processed before it can record it.
 // Payload:
-//   32 u32: aurora::gfx::bloom::Params, word for word
+//   49 u32: aurora::gfx::bloom::Params, word for word
 #define GX_AURORA_PORT_POST_PROCESS 0x0052
 
 // Replaces one light's colour, position and attenuation in the following PBR draws with a
@@ -256,7 +256,8 @@ extern "C" {
 // Payload:
 //   u32 light (its GX_LIGHTn bit), f32 r, g, b (linear), f32 view-space x, y, z,
 //   f32 inner radius, f32 outer radius (0 = off), u32 falloff (0 none, 1 linear, 2 quadratic,
-//   3 1 - smoothstep)
+//   3 1 - smoothstep), f32 widen, f32 view-space x, y, z of the way to the light along a spot's
+//   axis, f32 cone scale, f32 cone bias (0, 1 for a point light)
 #define GX_AURORA_SET_PBR_LIGHT_HDR 0x0056
 
 // Multiplies the baked light of the following PBR draws (see GXSetPBRBakedLightModulation).
@@ -336,19 +337,33 @@ extern "C" {
 // Payload: u32 count, then count records of 16 f32 (see GXPortSetRoomLights). Lasts until the
 // end of the frame.
 #define GX_AURORA_PORT_ROOM_LIGHTS 0x0069
-// Port extension: the draws that follow are particles (GXPortSetParticleFog). Payload: u8 on.
+// Port extension: the draws that follow are particles (GXPortSetParticleFog). Payload: u8 on
+// (0 off, 1 particles, 2 unfogged particles).
 #define GX_AURORA_PORT_PARTICLE_FOG 0x006A
 // Port extension: Remastered's X-ray visor post passes (GXPortXRayPass). Payload: 48 u32 words.
 #define GX_AURORA_PORT_XRAY 0x006B
 // Port extension: one pass of Remastered's thermal visor post (GXPortThermalPass). Payload: 20 u32 words.
 #define GX_AURORA_PORT_THERMAL 0x006C
-// Port extension: EFB draws go to the RGBA16F linear HDR scene (GXPortSceneHdr). Payload: u8 on.
+// Port extension: EFB draws go to the RGBA16F linear HDR scene (GXPortSceneHdr).
+// Payload: u8 mode, 0 display / 1 scene / 2 pause (reuse colour, clear depth).
 #define GX_AURORA_PORT_SCENE_HDR 0x006E
 // Port extension: the EFB copies that follow are linear scene copies (GXPortCopyScene). Payload: u8 on.
 #define GX_AURORA_PORT_COPY_SCENE 0x006F
 // Port extension: Remastered's actor shadow (GXPortActorShadow*). Payload: u8 mode (0 end, 1 casters
 // begin, 2 decal begin, 3 render the actor maps), then for 1 and 2 u8 layer and 16 vec4 floats.
 #define GX_AURORA_PORT_ACTOR_SHADOW 0x0070
+// Port extension: a user clip plane for the following triangle draws (GXSetClipPlane): a fragment
+// is kept where dot(view-space position, plane.xyz) + plane.w >= 0. Stays in effect until changed.
+// Payload: u8 on, then 4 f32 (the plane in view space).
+#define GX_AURORA_SET_CLIP_PLANE 0x0071
+// Port extension: Remastered's silhouette shell (GXPortShell). Payload: u8 mode (0 end, 1 depth
+// prepass, 2 colour), then for 1 and 2 24 f32 (CCH0..CCH4, then time, depth shift, tex0 sRGB, 0).
+#define GX_AURORA_PORT_SHELL 0x0072
+
+// Remastered's Model_ThermalOverride on the following PBR draws in the HDR scene (see GXSetPBRThermal).
+// Payload:
+//   f32 x, f32 y, f32 blended, u32 on
+#define GX_AURORA_SET_PBR_THERMAL 0x0073
 
 #define GX2_SET_POLYGON_OFFSET 0x1000
 

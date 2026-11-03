@@ -9,8 +9,8 @@ __pycache__
 .cache/
 
 # Original files
-orig/*/*
-!orig/*/.gitkeep
+decomp/orig/*/*
+!decomp/orig/*/.gitkeep
 
 # Build files
 build/
@@ -68,3 +68,4 @@ android/*.keystore
 /CLAUDE.md
 /STATUS.md
 /STATUS-archive.md
+/orig/

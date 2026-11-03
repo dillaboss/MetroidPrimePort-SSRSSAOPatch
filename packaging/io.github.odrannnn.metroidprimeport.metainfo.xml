@@ -55,9 +55,105 @@
        android/app/build.gradle; tools/make_flatpak.sh refuses to build when the
        two differ, since Flatpak reports the newest entry as the app's version. -->
   <releases>
-    <release version="0.28.0" date="2026-10-16">
+    <release version="0.39.0" date="2026-11-02">
       <description>
-        <p>Remastered actor shadows and a world-wide baked-lighting volume, Wave Beam trails and electric arcs, Remastered jumps and airborne movement, map pickup kinds, a Warp to start option on the save prompt for randomizer seeds, and screenshots that are no longer blank.</p>
+        <p>Controls: flick stick for the right stick, the twin-stick right stick and the touch twin stick, with an outer deadzone setting; R keeps the R-jump under mouse aim and twin stick; a pad preset sticks to controllers connected later, and mouse aim leaves a GameCube-preset pad its classic controls. Touch: the Visor and Beam wheels are buttons you add in the layout editor. Third person: shots leave the cannon's bore, charge effects and the grapple beam form on the body, and the framing follows the screen's shape. Remastered: many more room effects play, driven by Remastered's timers, triggers, relays, followers and ambient spawners; particles gain fixed bounds, sort bias, water sorting, birth orientation, array flipbooks, the dominant light and more header shaders; visor effects such as the water runoff draw after the post like Remastered's; Pyro particles are lit. Performance: the pipeline cache covers the running MSAA setting, fog types and alpha refs. Fixes: the empty-lock reticle marker stays on the view ray, and a Remastered re-import waits for the old import's deletion.</p>
+      </description>
+      <url type="details">https://github.com/Odrannnn/MetroidPrimePort/releases/tag/v0.39.0</url>
+    </release>
+    <release version="0.38.0" date="2026-11-01">
+      <description>
+        <p>Controls: a Grapple binding with Toggle Grapple and Shoot While Grappling options, a Spider Ball toggle, and the left hand resting on the cannon when standing still. HUD: per-visor crosshair toggles for X-Ray and Thermal. Suits: colours for the four Dread Samus suits. Video: a Morph Ball black bars option. Audio: music and sound effects volume above 100%, and fixed sample loop ends. Third person: legs step around on turns, backpedal and sidestep from the ready stance, reach for the ground when falling, and the morph ball camera follows on from the third-person view. Remastered: a performance mode that switches room models to coarser levels sooner, the Puffer's proper skin, and LambertFx materials lit by the room's baked probe. Performance: a world's shader pipelines are prepared on entering it. Fixes: top speed and moving platforms off 60 Hz, the Archipelago Elite Quarters item, chat commands in the solo randomizer server, and the touch back arrow in menus.</p>
+      </description>
+      <url type="details">https://github.com/Odrannnn/MetroidPrimePort/releases/tag/v0.38.0</url>
+    </release>
+    <release version="0.37.0" date="2026-10-31">
+      <description>
+        <p>Controls: an Aim Lock-On option that locks onto the target nearest the crosshair, and a Dodge binding (also a touch button) that dashes sideways while strafing, locked on or not. Cheats: infinite missiles and power bombs. Texture packs: import a pack from a .zip on desktop and Android, and toggle it with a Port binding (F7). Input: saved binding presets cover every device and get their own button. Remastered: frozen enemies draw Remastered's frozen model and icy shell, also in the thermal and X-ray visors; lava pools, crystals and many more materials draw with their proper shading; animated platforms and Monitor Station's spinner bridge move with the game; room lighting is read from the master pak too. Fixes: the Windows log copy, the Archipelago received-items table, the Android settings window in fullscreen, and particle effects no longer rebuild their state every frame.</p>
+      </description>
+      <url type="details">https://github.com/Odrannnn/MetroidPrimePort/releases/tag/v0.37.0</url>
+    </release>
+    <release version="0.36.0" date="2026-10-29">
+      <description>
+        <p>Third person: a sidestep strafe, a backpedal, stopping and idling animations, a grapple arm that reaches for its point, the free arm swinging while aiming, and a crosshair clear of the shoulder pad with the charge effect on the body's cannon. Remastered: room fog and grading switched by trigger volumes, the X-ray visor drawing room geometry, the Chozo Lore sheets, the frozen-enemy icy shell, cutscene suit models, many glow and exposure fixes, a Phazon Suit aura toggle and a choice of which parts of the import load. Input: your own binding presets, inverted map rotation options, larger button prompts. Fixes: skipping the Frigate's item-loss cutscene takes the items, the F1 menu at high frame rates, simulation timing at non-60 Hz rates, stacked beams no longer running out of object slots, safer saving, and the cheat menu's Chozo Artifacts.</p>
+      </description>
+      <url type="details">https://github.com/Odrannnn/MetroidPrimePort/releases/tag/v0.36.0</url>
+    </release>
+    <release version="0.35.1" date="2026-10-28">
+      <description>
+        <p>Bugfixes: GameCube controllers through a Wii U/Mayflash adapter now work on Windows and read raw like a console (no deadzone, origin at plug-in, X+Y+Start for 3 s recalibrates); Trilogy shows GameCube button art for the active input on the map and pause screens, its map text and legend layout match the disc, and a GameCube-made Remastered import no longer crashes Trilogy on the map or pause screen; an optional GameCube crosshair style on Trilogy, and no doubled crosshair under free aim; Dread's shoulder pads sit in its idle pose; mouse aim no longer snaps back under Xwayland; the Flatpak's OpenGL fallback works; the touch map button no longer flickers while looking around; the Linux release binary is much smaller, with its debug info shipped separately.</p>
+      </description>
+      <url type="details">https://github.com/Odrannnn/MetroidPrimePort/releases/tag/v0.35.1</url>
+    </release>
+    <release version="0.35.0" date="2026-10-27">
+      <description>
+        <p>Player-made custom actions you can bind like any other control, with a resizable editor; a Prime Remastered graphics toggle that needs no restart, on Android too; Remastered particles and effects for many more enemies and bosses (Drones, Gun Turrets, Sheegoths, Thardus, the Parasite Queen, Ridley, Metroid Prime, Atomic Betas, Puffers), the visor steam, death particles and animated intro hangar lighting; Trilogy fixes (Wii combat crosshair and Wii Remote glyphs, crosshair settings on Trilogy's cursor, credits text, Remastered movies on a Trilogy disc, card files in Trilogy's format); linear sensitivity sliders; OpenGL 3.3 GPUs without texture views no longer fall back to software rendering, and a driver workaround to decode compressed textures on the CPU.</p>
+      </description>
+      <url type="details">https://github.com/Odrannnn/MetroidPrimePort/releases/tag/v0.35.0</url>
+    </release>
+    <release version="0.34.0" date="2026-10-26">
+      <description>
+        <p>Metroid Prime Trilogy discs (USA and PAL) run as the base game, with Trilogy's HUD, scan visor, radial beam and visor menus and save import and export; an OpenGL renderer on Linux and Windows; Remastered's thermal visor and a Remastered performance mode; a release-to-release save restore; mirrored room geometry, door-frame lighting and pause screen fixes; and many more Prime Remastered models, effects and shaders.</p>
+      </description>
+      <url type="details">https://github.com/Odrannnn/MetroidPrimePort/releases/tag/v0.34.0</url>
+    </release>
+    <release version="0.33.1" date="2026-10-25">
+      <description>
+        <p>Bug fixes: no more crash with MSAA on at fog volumes (Tallon Canyon's Root Cavern door, Magmoor's Tallon elevator room), and a texture copy or depth read the renderer can't do is skipped instead of ending the game; no more crash after switching Remastered off and reloading mods; a door opened before a savestate opens again after loading it; the third-person body blends Samus's own walk, run and aim animations and plays her shipped clips for walking backwards, sprinting, jumping, landing, getting hit and scanning; the Phazon Suit no longer shimmers all over under Remastered; Remastered models that stand in for retail ones now draw (Central Dynamo's grate floor); cheat sliders no longer max capacities or fire on a scroll, gyro moves the lock-on free aim pointer at Pointer speed, an analog L in the Scan Visor locks the point under the pointer, and many Prime Remastered weapon effects (muzzle flashes, projectile lights and explosions, ice shell, hologram beam swap, underwater bubbles) now match the shipped game.</p>
+      </description>
+      <url type="details">https://github.com/Odrannnn/MetroidPrimePort/releases/tag/v0.33.1</url>
+    </release>
+    <release version="0.33.0" date="2026-10-25">
+      <description>
+        <p>Metroid Dread Samus bodies imported from your own Metroid Dread dump, a third-person camera with an aiming cannon arm, Morph Ball control rows and controller presets, a reworked resolution scale and dynamic resolution, lock-on free aim, a walk speed setting, a Phazon Beam cheat, many more Prime Remastered models, effects and lighting through the HDR scene, Remastered rain, snow and underwater flakes, and savestates that keep enemies' AI, generated pickups and debris and the music that was playing.</p>
+      </description>
+      <url type="details">https://github.com/Odrannnn/MetroidPrimePort/releases/tag/v0.33.0</url>
+    </release>
+    <release version="0.32.0" date="2026-10-22">
+      <description>
+        <p>Suit colour customisation with a random colours button, the Fusion Suit from the F1 menu, a touch layout editor that adds your own buttons, deletes stock ones and sets per-control opacity, a fix for the crash in the Meta Ridley fight, Aurora graphics fixes (EFB alpha, partial copy clears, texture coordinate generation and minification), Ridley, Thardus, Flaahgra and Metroid Prime restored mid-fight by savestates, a check of the whole disc image against its Redump release, and safer save, movie and disc reads.</p>
+      </description>
+      <url type="details">https://github.com/Odrannnn/MetroidPrimePort/releases/tag/v0.32.0</url>
+    </release>
+    <release version="0.31.1" date="2026-10-21">
+      <description>
+        <p>Fewer missing or wrongly sized Remastered effects (sprites without a size, shutdown behaviour of trails and child particles, particle depth bias and motion spread), water fogs that follow the Gravity Suit in Tallon Overworld and Phendrana, progressive beam upgrades for Archipelago, a likely fix for a crash after the Frigate escape on Android, and Windows builds from a plain Visual Studio setup.</p>
+      </description>
+      <url type="details">https://github.com/Odrannnn/MetroidPrimePort/releases/tag/v0.31.1</url>
+    </release>
+    <release version="0.31.0" date="2026-10-21">
+      <description>
+        <p>Remastered clustered lighting for lit effects (the Ice Beam's charge collision first), every Remastered point-light effect lit, more effect elements converted so the last effects that failed whole now load, the original ELC2 lightning look, separate vertical sensitivity for mouse, touch and gyro aim, empty lock-on holding the camera pitch under direct aim, Archipelago and offline randomizer pickup jingles for the placed item and scanned artifact hints, savestate fixes for Omega Pirate, moving platforms and spider tracks, and Fungal Hall Access's beam doors unlocking.</p>
+      </description>
+      <url type="details">https://github.com/Odrannnn/MetroidPrimePort/releases/tag/v0.31.0</url>
+    </release>
+    <release version="0.30.1" date="2026-10-20">
+      <description>
+        <p>More Remastered effects drawn with their own shaders (Ice Beam charge and impact shards, missile and fire sprites, disintegration, visor goo splats that now actually draw, visor rain runoff, refraction warps), soft particles, the Plasma Beam's swooshes, resuming boss fights from savestates, charged and combo shots ricocheting off reflective enemies as in the original, real manual gyro calibration, unlocked beam doors kept after copying user data into a new release folder, lower storage use on Android, and a fix for mouse clicks wrongly accepting the resume prompt.</p>
+      </description>
+      <url type="details">https://github.com/Odrannnn/MetroidPrimePort/releases/tag/v0.30.1</url>
+    </release>
+    <release version="0.30.0" date="2026-10-19">
+      <description>
+        <p>Remastered effects now run their particle maths as Metroid Prime Remastered does, generated Gravity, Phazon and Power spider ball looks, the full Flaahgra theme imported from a PAL, JP or Trilogy disc, a stack_beams setting, a first-person FOV limit of 120, gyro aiming improvements, lower memory use on Android, and fixes for savestates, PAL menus and doors saved open.</p>
+      </description>
+      <url type="details">https://github.com/Odrannnn/MetroidPrimePort/releases/tag/v0.30.0</url>
+    </release>
+    <release version="0.29.0" date="2026-10-18">
+      <description>
+        <p>Per-visor HUD opacity, a Remastered-style crosshair, an option to keep beam doors unlocked once opened, a Rumble toggle, an Android setting to turn the on-screen controls off, Remastered movement on moving and rotating platforms, and fixes for rapid charge locking the weapons, bombs after a savestate load in morph ball, twin-stick aim speed, credits layout on wide screens, Archipelago item ids and the Remastered Power charge effect.</p>
+      </description>
+      <url type="details">https://github.com/Odrannnn/MetroidPrimePort/releases/tag/v0.29.0</url>
+    </release>
+    <release version="0.28.1" date="2026-10-17">
+      <description>
+        <p>Smooth right-stick turning at high frame rates, map rotation with one finger on touch (with an option to swap one- and two-finger gestures), lock-on no longer keeping Remastered movement going, and Driver workarounds settings with a more detailed GPU self-test.</p>
+      </description>
+      <url type="details">https://github.com/Odrannnn/MetroidPrimePort/releases/tag/v0.28.1</url>
+    </release>
+    <release version="0.28.0" date="2026-10-17">
+      <description>
+        <p>Gyro aim, mouse sensitivity on the Quake/Source scale, Remastered actor shadows and a world-wide baked-lighting volume, Wave Beam trails and electric arcs, Remastered movement, map pickup kinds and room marks, new randomizer options, smoother dynamic resolution, a faster Remastered import, adjustable touch control opacity on Android, a graphics backend choice on Windows, and screenshots that are no longer blank.</p>
       </description>
       <url type="details">https://github.com/Odrannnn/MetroidPrimePort/releases/tag/v0.28.0</url>
     </release>

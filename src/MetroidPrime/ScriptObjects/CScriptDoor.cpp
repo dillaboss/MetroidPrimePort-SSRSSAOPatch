@@ -1,4 +1,5 @@
 #include "MetroidPrime/ScriptObjects/CScriptDoor.hpp"
+#include "port_env.h"
 
 #include "Collision/CMaterialList.hpp"
 #include "Kyoto/Math/CFrustumPlanes.hpp"
@@ -49,7 +50,7 @@ void PortPrintDoorWait(TUniqueId door, const char* what, const SPortDoorWait& wa
 }
 
 bool PortLogDoors() {
-  static const bool enabled = std::getenv("MP_LOG_DOORS") != nullptr;
+  static const bool enabled = port::EnvFlag("MP_LOG_DOORS");
   return enabled;
 }
 
@@ -144,7 +145,14 @@ CScriptDoor::CScriptDoor(TUniqueId uid, const rstl::string& name, const CEntityI
 , mConditionsMet(false)
 , mProjectilesCollide(projectilesCollide)
 , mBallDoor(ballDoor)
-, mDoClose(false) {
+, mDoClose(false)
+#ifdef TARGET_PC
+, mPortRestoredOpen(false)
+, mPortDockNotified(false)
+, mPortPartnerSide(0)
+, mPortRestoreTicks(0)
+#endif
+{
   SetThermalFlags(kTF_Cold);
 
   if (open) {
@@ -207,16 +215,20 @@ CScriptDoor::EDoorOpenCondition CScriptDoor::GetDoorOpenCondition(CStateManager&
   if (!area->IsLoaded()) {
 #ifdef TARGET_PC
     // Issue #88: a room stays loaded behind a door that closed because another
-    // door opened. Streaming a third room on top can fill the 1024-entry object
+    // door opened. Streaming a third room on top can fill the fixed-size object
     // list (PCA + Phazon Processing Center + Elite Quarters in backwards Lower
     // Mines), and AllocateUniqueId then hangs in the error handler. Release
     // those rooms first, as the doorway trigger's SetToZero would; TravelToArea
-    // deallocates them before it streams the new one. Only in PCA, the one room
-    // where this can happen, so every other door keeps the original behaviour.
+    // deallocates them before it streams the new one. Always in PCA; elsewhere
+    // only once the list is half full, so uncrowded doors keep the original
+    // behaviour. Central Dynamo (621 objects) behind Quarantine Access A (231)
+    // plus Metroid Quarantine A hung the same way on a tablet.
     const CAssetId kProcessingCenterAccess = 0xED6DE73B;
+    const int kCrowdedObjects = 512;
     if (mgr.GetNextAreaId() == dock->GetAreaId() &&
-        mgr.GetWorld()->GetAreaAlways(dock->GetAreaId()).IGetAreaAssetId() ==
-            kProcessingCenterAccess) {
+        (mgr.GetObjectListById(kOL_All).size() >= kCrowdedObjects ||
+         mgr.GetWorld()->GetAreaAlways(dock->GetAreaId()).IGetAreaAssetId() ==
+             kProcessingCenterAccess)) {
       bool otherOpen = false;
       CObjectList& doors = mgr.ObjectListById(kOL_PlatformAndDoor);
       for (int i = doors.GetFirstObjectIndex(); i != -1; i = doors.GetNextObjectIndex(i)) {
@@ -338,13 +350,83 @@ void CScriptDoor::OpenDoor(TUniqueId uid, CStateManager& mgr) {
 }
 
 #ifdef TARGET_PC
-void CScriptDoor::PortRestoreOpen(bool open) {
-  mIsOpen = open;
-  mWasOpen = open;
+void CScriptDoor::PortRestoreDoorState(const PortDoorFlags& state) {
+  mIsOpen = state.open;
+  // A close that was in flight is put back the way a live one leaves it: the door
+  // reads closed and Think still owes the message its own branch sends - the
+  // animation-end branch for a normal close, the mClosing branch for a refused
+  // opening. A refused close does not set mWasOpen (it never opened, and the
+  // animation-end branch would then send a second, fuller Closed). mAnimTime is
+  // left alone: Think advances it only while the door is not open and the branch
+  // that finishes the close resets it, so the animation replays from its start.
+  mWasOpen = state.open || state.normalClosePending;
+  mClosing = state.refusedClosePending;
+  mDoClose = state.doClose;
   mConditionsMet = false;
-  mClosing = false;
-  mDoClose = false;
-  SetDoorAnimation(open ? kDAT_Open : kDAT_Close);
+  // A live open leaves the partner links, the dock's Increment and the connected
+  // room's visibility behind; a save state carries none of them, so Think puts
+  // them back (PortFinishRestoredOpen). A stale link would point at a door that
+  // is no longer there.
+  mPartner1 = kInvalidUniqueId;
+  mPartner2 = kInvalidUniqueId;
+  mPortRestoredOpen = state.open;
+  mPortPartnerSide = state.open ? state.partner & 0x3 : 0;
+  mPortDockNotified = false;
+  mPortRestoreTicks = 0;
+  SetDoorAnimation(state.open ? kDAT_Open : kDAT_Close);
+}
+
+// What OpenDoor leaves that a save state does not carry, for a door restored open.
+// Without the dock's Increment the connected room is loaded but never made visible
+// (a void behind the open door); without the partner link, closing this door never
+// closes the door on the other side, which stays open and holds this one shut
+// ("otherDoor" in GetDoorOpenCondition). The partner is found as OpenDoor finds
+// it, by the door that led the open at the save (issue #201: the follower's close
+// timer never started, so a pair linked the other way round never closes). A save
+// older than the saved side has only the guess the door of the player's room makes.
+// The search is bounded: the other room's door only exists once its area has loaded.
+void CScriptDoor::PortFinishRestoredOpen(CStateManager& mgr) {
+  if (!mIsOpen) {
+    mPortRestoredOpen = false;
+    return;
+  }
+  CScriptDock* const dock = TCastToPtr< CScriptDock >(mgr.ObjectById(mDockId));
+  if (!dock) {
+    mPortRestoredOpen = false;
+    return;
+  }
+  if (!mPortDockNotified) {
+    mPortDockNotified = true;
+    mgr.DeliverScriptMsg(dock, GetUniqueId(), kSM_Increment);
+  }
+  // Unknown (0) searches from the player's room; leads (2) wherever it is; none (1)
+  // and follows (3) never: a follower is linked by its leader.
+  const bool searches = mPortPartnerSide == 2 ||
+                        (mPortPartnerSide == 0 && GetCurrentAreaId() == mgr.GetNextAreaId());
+  if (mPartner1 != kInvalidUniqueId || mPartner2 != kInvalidUniqueId || !searches ||
+      ++mPortRestoreTicks > 600) {
+    mPortRestoredOpen = false;
+    return;
+  }
+  CObjectList& list = mgr.ObjectListById(kOL_PlatformAndDoor);
+  for (int idx = list.GetFirstObjectIndex(); idx != -1; idx = list.GetNextObjectIndex(idx)) {
+    CScriptDoor* const door = TCastToPtr< CScriptDoor >(list[idx]);
+    if (!door || door == this || !door->mIsOpen || door->mPartner1 != kInvalidUniqueId ||
+        door->mPartner2 != kInvalidUniqueId || door->mPortPartnerSide == 1 ||
+        door->mPortPartnerSide == 2) {
+      continue;
+    }
+    if (const CScriptDock* const dock2 =
+            TCastToConstPtr< CScriptDock >(mgr.GetObjectById(door->GetConnectedDockID()))) {
+      if (dock2->GetAreaId() == dock->GetCurrentConnectedAreaId(mgr) &&
+          dock2->GetCurrentConnectedAreaId(mgr) == dock->GetAreaId()) {
+        mPartner2 = door->GetUniqueId();
+        door->mPartner1 = GetUniqueId();
+        mPortRestoredOpen = false;
+        return;
+      }
+    }
+  }
 }
 #endif
 
@@ -481,6 +563,12 @@ void CScriptDoor::Think(float dt, CStateManager& mgr) {
   if (!mIsOpen && mAnimTime < 0.05f) {
     mAnimTime += dt;
   }
+
+#ifdef TARGET_PC
+  if (mPortRestoredOpen) {
+    PortFinishRestoredOpen(mgr);
+  }
+#endif
 
   if (mConditionsMet) {
     const EDoorOpenCondition cond = GetDoorOpenCondition(mgr);

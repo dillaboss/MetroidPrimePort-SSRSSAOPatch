@@ -30,9 +30,25 @@ constexpr int kTouchControlCount = 29;
 constexpr int kTouchBeamShift = 32;
 constexpr int kTouchTurbo = 33;
 constexpr int kTouchMapTap = 34; // one poll of Z after a minimap tap
+// The menus' back arrow: B in menus and the map whatever the pad preset (it used
+// to send the virtual pad's East, which only the GameCube preset maps to B).
+constexpr int kTouchMenuBack = 35;
+// The Morph Ball page's own buttons (Bomb, Boost, Power Bomb, Spider, Unmorph:
+// TouchControlsView's C_BALL + i), drawn only in the ball.
+constexpr int kTouchBallBase = 40;
+constexpr int kTouchBallCount = 5;
+// The buttons the player adds in the layout editor (slot 0..63, its `k<slot>`
+// entry in the touch layout; PortInput::BindTouchButtons).
+constexpr int kTouchCustomBase = 64;
+constexpr int kTouchCustomCount = 64;
 
 struct SPoll {
   PADStatus status{};
+  // The C-stick before Aurora's per-axis PADClamp (-1..1, right and up
+  // positive), which pulls a stick near an axis onto it: flick stick turns by
+  // its angle.
+  float cStickX = 0.f;
+  float cStickY = 0.f;
 };
 
 // One poll of port 0: reads the devices, rebuilds the profile when the settings
@@ -64,6 +80,8 @@ SActiveProfiles ActiveUserProfiles();
 // binding reads it (then the overlay sends only the touch code, not its pad button).
 void SetTouchControl(int control, bool down);
 bool TouchControlBound(int control);
+// The Morph Ball row a stock control does in the ball now, or None.
+PortInput::Action TouchBallRow(int control);
 // Port 0's pad: its SDL GUID (32 hex digits), gamepad type string and name; false
 // (all empty) without one.
 bool ActivePad(std::string& guid, std::string& type, std::string& name);

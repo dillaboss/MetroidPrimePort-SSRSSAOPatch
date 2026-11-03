@@ -15,6 +15,22 @@ inline float SourceFromRadians(float radiansPerCount) {
   return float(radiansPerCount / kSourceRadiansPerUnit);
 }
 inline float RadiansFromSource(float source) { return float(source * kSourceRadiansPerUnit); }
+// The default: 3.0 on that scale, as in Quake, Source and Apex (issue #210).
+constexpr float kDefaultSensitivity = float(3.0 * kSourceRadiansPerUnit);
+// What one pixel of stick and touch aim travel turns, and the sensitivity at which
+// the pointer follows the cursor's speed. Fixed (the old mouse default), so stick and
+// touch speeds do not move with the mouse sensitivity (issue #209).
+constexpr float kAimPixelRadians = 0.0035f;
+// Stick or touch travel (pixels) as mouse counts: the aim turns, and the pointer
+// moves, by the mouse sensitivity, so this divides it out.
+inline float AimPixelsAsCounts(float pixels, float mouseSensitivity) {
+  return pixels * kAimPixelRadians / mouseSensitivity;
+}
+// Pointer aim: counts to pointer units (-1..1 of the half view) along a view
+// extent of extentPixels. At kAimPixelRadians the pointer follows the cursor.
+inline float PointerUnitsPerCount(float extentPixels, float mouseSensitivity) {
+  return 2.f / extentPixels * (mouseSensitivity / kAimPixelRadians);
+}
 // Hand travel for a full turn at a mouse's counts per inch.
 inline float CentimetresPer360(float radiansPerCount, float dpi) {
   if (!(radiansPerCount > 0.f) || !(dpi > 0.f)) return 0.f;
@@ -266,6 +282,37 @@ struct PointerAim {
 
 private:
   static float Clamp1(float v) { return v < -1.f ? -1.f : v > 1.f ? 1.f : v; }
+};
+
+// The game applies the aim twice a tick: CPlayer::ProcessInput with the tick's
+// travel, then CPlayer::Update to revalidate it with none left. Only the first
+// applied update of a tick records the turn drawn after it (AimState::lagYaw,
+// PointerAim::lagX); the second would clear it, and the twin stick would turn
+// the view once a tick between smooth frames (issue #140). Only the first makes
+// the tick's pointer edge turn too: a second turned the view twice the set
+// speed, and the frames between ticks, which draw one tick's turn, jumped by
+// the other half at each tick.
+class TickAim {
+public:
+  void BeginTick() { mRecorded = false; }
+  // No update has been applied yet this tick.
+  bool First() const { return !mRecorded; }
+  // After an applied update; `aim` and `pointer` were `aimBefore` and
+  // `pointerBefore` ahead of it. pointerFree: the update left pointer aim free.
+  void Applied(AimState& aim, const AimState& aimBefore, PointerAim& pointer,
+               const PointerAim& pointerBefore, bool pointerFree) {
+    if (mRecorded) {
+      aim.lagYaw = aimBefore.lagYaw;
+      aim.lagPitch = aimBefore.lagPitch;
+      if (pointerFree) {
+        pointer.lagX = pointerBefore.lagX;
+        pointer.lagY = pointerBefore.lagY;
+      }
+    }
+    mRecorded = true;
+  }
+private:
+  bool mRecorded = false;
 };
 
 class ButtonGate {

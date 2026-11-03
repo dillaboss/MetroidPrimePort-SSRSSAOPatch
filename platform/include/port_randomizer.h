@@ -55,6 +55,10 @@ bool Enabled();
 bool DumpEnabled();
 // Name from the loaded seed, or an empty string when none is available.
 const char* SeedName();
+// The main log's line for a pickup a seed placed, granted by the game itself:
+// what it gave and what the inventory holds after. Only with a seed loaded.
+void LogPickupGrant(uint32_t worldAssetId, uint32_t areaAssetId, uint32_t entityId, int itemType,
+                    int capacity, int amount, int amountAfter, int capacityAfter);
 // Number of pickup checks recorded during this process.
 int CheckCount();
 // Short status line suitable for the F1 overlay.

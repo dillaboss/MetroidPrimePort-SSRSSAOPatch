@@ -1,10 +1,15 @@
 #include "port_input_remap_ui.h"
+#include "port_strings.h"
 
 #include "port_controls.h"
+#include "port_console.h"
+#include "port_custom_actions.h"
 #include "port_debug.h"
 #include "port_input_bindings.h"
 #include "port_input_devices.h"
+#include "port_input_user_presets.h"
 #include "port_pointer.h"
+#include "port_savestate.h"
 
 #include <dolphin/pad.h>
 #include <imgui.h>
@@ -66,37 +71,26 @@ constexpr const char* kFamilies[] = {"Keyboard & mouse", "Controller", "Touch"};
 
 // The touch controls Record can't reach (the overlay hides while F1 is open), as
 // "touch:" names and the editor's labels. The sticks, D-pad and menu button
-// aren't remappable, so they're left out.
+// aren't remappable, nor are the face buttons, pills and minimap tap
+// (PortInput::kTouchStockControls: fixed GameCube actions), so they're left out.
 struct STouchInfo {
   const char* name;
   const char* label;
 };
 constexpr STouchInfo kTouchControls[] = {
-    {"a", "A"},
-    {"b", "B"},
-    {"x", "X"},
-    {"y", "Y"},
-    {"l", "L"},
-    {"r", "R"},
-    {"z", "Z"},
     {"visor", "Visor"},
     {"beam", "Beam"},
-    {"start", "Start"},
     {"map", "Map"},
     {"eye", "Hide controls"},
     {"turbo", "Turbo"},
-    {"jump", "Twin stick: Jump"},
-    {"fire", "Twin stick: Fire"},
-    {"morph", "Twin stick: Morph"},
     {"missile", "Twin stick: Missile"},
-    {"lt", "Twin stick: LT Lock"},
-    {"lb", "Twin stick: LB Jump"},
-    {"rt", "Twin stick: RT Fire"},
-    {"rb", "Twin stick: RB Missile"},
-    {"tz", "Twin stick: Map (Z)"},
     {"tturbo", "Twin stick: Turbo"},
     {"beam_shift", "Twin stick: Beam (held)"},
-    {"map_tap", "Minimap tap"},
+    {"bbomb", "Morph Ball: Bomb"},
+    {"bboost", "Morph Ball: Boost"},
+    {"bpbomb", "Morph Ball: Power Bomb"},
+    {"bspider", "Morph Ball: Spider"},
+    {"bunmorph", "Morph Ball: Unmorph"},
 };
 
 UserBindings sWork;     // what the page edits; written through on every change
@@ -106,7 +100,7 @@ uint64_t sSeenVersion = 0; // the bindings version sWork matches
 // bindings) or a controller profile's match ("type:..." / "guid:..."). Keyboard
 // and touch always edit the Default profile.
 std::string sPadDevice = "pads";
-#ifdef __ANDROID__
+#if defined(PORT_TOUCH_CONTROLS)
 constexpr bool kShowTouch = true;
 #else
 constexpr bool kShowTouch = false; // the touch overlay is Android's
@@ -168,11 +162,7 @@ bool InputStartsAt(const std::string& s, size_t i) {
   return false;
 }
 
-std::string TrimSpaces(std::string s) {
-  s.erase(0, s.find_first_not_of(" \t"));
-  s.erase(s.find_last_not_of(" \t") + 1);
-  return s;
-}
+std::string TrimSpaces(const std::string& s) { return port::Trim(s, " \t"); }
 
 // "a + b + c" (or comma separated) into a binding's inputs.
 bool InputsFromText(const char* text, Binding& b) {
@@ -208,6 +198,27 @@ void Commit() {
     sError.clear();
     sSeenVersion = PortInputDevices::UserBindingsVersion();
   }
+}
+
+// An action's name for the player: the player's own actions carry theirs, the
+// engine's carry the label. A custom id with no definition shows nothing.
+std::string ActionLabel(Action a) {
+  if (!PortInput::IsCustom(a)) return std::string(PortInput::Info(a).label);
+  const uint16_t id = PortInput::CustomId(a);
+  for (const PortInput::CustomActionDef& def : sWork.customActions) {
+    if (def.id == id) return PortCustomActions::DisplayName(def);
+  }
+  return std::string();
+}
+
+// The player's definition of a custom action, or null.
+const PortInput::CustomActionDef* CustomDef(Action a) {
+  if (!PortInput::IsCustom(a)) return nullptr;
+  const uint16_t id = PortInput::CustomId(a);
+  for (const PortInput::CustomActionDef& def : sWork.customActions) {
+    if (def.id == id) return &def;
+  }
+  return nullptr;
 }
 
 // A user profile by match, or null (reading never creates one).
@@ -313,6 +324,22 @@ std::vector<Input> DownInputs(const PortInput::RawState& raw) {
   return down;
 }
 
+// Which trigger an input reads (0 left, 1 right, -1 neither). One pull reports
+// the trigger's half-pull button, its axis and its emulated click (issue #227).
+int TriggerSide(const Input& in) {
+  if (in.device == Device::PadAxis && (in.code == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || in.code == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)) {
+    return in.code == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ? 0 : 1;
+  }
+  if (in.device != Device::PadButton) return -1;
+  switch (in.code) {
+  case PAD_RAW_BUTTON_TRIGGER_LEFT:
+  case PAD_RAW_BUTTON_TRIGGER_LEFT_CLICK: return 0;
+  case PAD_RAW_BUTTON_TRIGGER_RIGHT:
+  case PAD_RAW_BUTTON_TRIGGER_RIGHT_CLICK: return 1;
+  default: return -1;
+  }
+}
+
 // Whether every input of a binding comes from one family (keyboard and mouse are one).
 bool OneFamily(const Binding& b) {
   for (int i = 1; i < b.count; ++i) {
@@ -366,6 +393,12 @@ void UpdateCapture() {
   }
   for (const Input& in : down) {
     if (!sCapture.chord.empty() && PortInput::FamilyOf(in.device) != PortInput::FamilyOf(sCapture.chord[0].device)) {
+      continue;
+    }
+    // A trigger records the first of its inputs to cross (the half-pull button).
+    const int side = TriggerSide(in);
+    if (side >= 0 && std::any_of(sCapture.chord.begin(), sCapture.chord.end(),
+                                 [side](const Input& c) { return TriggerSide(c) == side; })) {
       continue;
     }
     if (std::find(sCapture.chord.begin(), sCapture.chord.end(), in) == sCapture.chord.end() &&
@@ -623,7 +656,7 @@ void TouchPicker() {
 
 void DrawEditor(const SViews& views) {
   const std::string title = std::string(sEditing == kEditNew ? "New binding: " : "Edit binding: ") +
-                            std::string(PortInput::Info(sEditAction).label);
+                            ActionLabel(sEditAction);
   ImGui::SeparatorText(title.c_str());
 
   Binding parsed = sDraft;
@@ -730,6 +763,10 @@ void DrawAdvancedEditor(const Binding& parsed, bool inputsOk) {
     ImGui::Checkbox("Invert", &sDraft.invert);
   }
 
+  if (PortInput::FindBallRow(sDraft.action) != nullptr) {
+    ImGui::TextDisabled("Works only in Morph Ball, where its inputs do nothing else.");
+    return;
+  }
   bool everywhere = sDraft.contexts == PortInput::kCtxAll;
   if (ImGui::Checkbox("Works everywhere", &everywhere)) {
     sDraft.contexts = everywhere ? PortInput::kCtxAll : PortInput::kCtxGameplay;
@@ -809,7 +846,7 @@ void SaveDraft(const SViews& views, Binding parsed) {
 
 void DrawBindingRow(const Binding& b, bool inherited = false) {
   ImGui::TableNextColumn();
-  ImGui::TextUnformatted(std::string(PortInput::Info(b.action).label).c_str());
+  ImGui::TextUnformatted(ActionLabel(b.action).c_str());
   ImGui::TableNextColumn();
   Chip("##in", b, false, false, false);
   if (b.IsChord() && b.anyOrder) {
@@ -885,11 +922,354 @@ void ApplyPending(const SViews& views, const SPending& pending) {
   Commit();
 }
 
+// The custom action editor (Add and Edit) and the delete confirmation. Both are
+// drawn once at the end of the page, outside any table, so their popups' IDs are
+// the same wherever they are opened from.
+struct SCustomDraft {
+  bool open = false;        // the editor is up
+  bool requestOpen = false; // open it at the end of this frame
+  uint16_t editId = 0;      // 0: a new action
+  std::string preset;       // the chosen preset key; "" while the list is up
+  std::string arg;          // the chosen setting, item, slot or language code
+  std::string mode = "toggle";
+  char argText[160] = {};   // a message or a console line
+  char name[96] = {};       // the Name field
+  bool renamed = false;     // the player typed the name: keep it
+  char search[64] = {};
+  char argSearch[64] = {};
+  bool shown = false;       // the room list scrolled to the chosen room once
+  std::string error;
+};
+SCustomDraft sCustom;
+uint16_t sDeleteId = 0; // the custom action the confirmation asks about
+bool sDeleteRequest = false;
+
+// What the editor has so far, as a definition (its id is set on Save).
+PortInput::CustomActionDef DraftDef() {
+  PortInput::CustomActionDef def;
+  def.preset = sCustom.preset;
+  def.arg = sCustom.arg;
+  if (const PortCustomActions::Preset* preset = PortCustomActions::FindPreset(sCustom.preset)) {
+    // Only a preset that has a mode keeps one, so the file stays clean.
+    if (preset->hasMode) def.mode = sCustom.mode;
+    if (preset->arg == PortCustomActions::ArgKind::Text) {
+      if (std::string_view(preset->key) == "command") {
+        def.command = sCustom.argText;
+      } else {
+        def.arg = sCustom.argText;
+      }
+    }
+  }
+  def.renamed = sCustom.renamed;
+  def.name = sCustom.renamed ? std::string(sCustom.name) : std::string();
+  return def;
+}
+
+// Opens the editor on a def, or on a new one when def is null.
+void OpenCustomEditor(const PortInput::CustomActionDef* def) {
+  sCustom = SCustomDraft{};
+  if (def != nullptr) {
+    sCustom.editId = def->id;
+    sCustom.preset = def->preset;
+    sCustom.arg = def->arg;
+    sCustom.mode = def->mode;
+    sCustom.renamed = def->renamed;
+    const PortCustomActions::Preset* preset = PortCustomActions::FindPreset(def->preset);
+    if (preset != nullptr && preset->arg == PortCustomActions::ArgKind::Text) {
+      const std::string& text = std::string_view(preset->key) == "command" ? def->command : def->arg;
+      std::snprintf(sCustom.argText, sizeof(sCustom.argText), "%s", text.c_str());
+    }
+    std::snprintf(sCustom.name, sizeof(sCustom.name), "%s", def->name.c_str());
+  }
+  sCustom.requestOpen = true;
+  EndCapture();
+}
+
+// The presets, grouped by category, with the search box above them.
+void DrawPresetPicker() {
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  ImGui::InputTextWithHint("##actionsearch", "Search actions", sCustom.search, sizeof(sCustom.search));
+  // The list takes the window's height, less the separator and Cancel below it.
+  ImGui::BeginChild("##presets", ImVec2(0.f, -ImGui::GetFrameHeightWithSpacing() - ImGui::GetStyle().ItemSpacing.y));
+  const char* category = nullptr;
+  bool first = true;
+  bool shown = false; // the current category's header is open
+  for (const PortCustomActions::Preset& preset : PortCustomActions::Presets()) {
+    if (!Contains(preset.label, sCustom.search) && !Contains(preset.help, sCustom.search)) continue;
+    if (category == nullptr || std::string_view(category) != preset.category) {
+      category = preset.category;
+      // A filter opens every category, so a match is never hidden in a closed one.
+      if (sCustom.search[0] != '\0') ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+      shown = ImGui::CollapsingHeader(category, first ? ImGuiTreeNodeFlags_DefaultOpen : 0);
+      first = false;
+      if (shown && preset.cheat) ImGui::TextDisabled("Off in the Original experience and with Archipelago");
+    }
+    if (!shown) continue;
+    if (ImGui::Selectable(preset.label)) {
+      sCustom.preset = preset.key;
+      sCustom.arg.clear();
+      sCustom.argText[0] = '\0';
+      sCustom.argSearch[0] = '\0';
+    }
+    ImGui::SetItemTooltip("%s", preset.help);
+  }
+  ImGui::EndChild();
+}
+
+// The option a preset takes, then its mode and its name.
+void DrawPresetOptions(const PortCustomActions::Preset& preset) {
+  using PortCustomActions::ArgKind;
+  const std::string_view key(preset.key);
+  // A list takes the window's height, less the rows below it: the mode, the name,
+  // an error and Save.
+  const int rowsBelow = (preset.hasMode ? 1 : 0) + 2 + (sCustom.error.empty() ? 0 : 1);
+  const ImVec2 listSize(0.f, -rowsBelow * ImGui::GetFrameHeightWithSpacing());
+  if (preset.arg == ArgKind::Setting) {
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##settingsearch", "Search settings", sCustom.argSearch, sizeof(sCustom.argSearch));
+    ImGui::BeginChild("##settings", listSize);
+    const char* section = nullptr;
+    for (const PortCustomActions::BoolSetting& setting : PortCustomActions::BoolSettings()) {
+      if (!Contains(setting.label, sCustom.argSearch) && !Contains(setting.section, sCustom.argSearch)) continue;
+      if (section == nullptr || std::string_view(section) != setting.section) {
+        section = setting.section;
+        ImGui::SeparatorText(section);
+      }
+      if (ImGui::Selectable(setting.label, sCustom.arg == setting.key)) sCustom.arg = setting.key;
+    }
+    ImGui::EndChild();
+  } else if (preset.arg == ArgKind::Item) {
+    ImGui::BeginChild("##items", listSize);
+    for (const PortConsoleItem& item : PortConsoleItems()) {
+      if (ImGui::Selectable(item.label, sCustom.arg == item.key)) sCustom.arg = item.key;
+    }
+    ImGui::EndChild();
+  } else if (preset.arg == ArgKind::Slot) {
+    // Slot 1 unless the player picks another.
+    if (sCustom.arg.empty()) sCustom.arg = "1";
+    for (int slot = 1; slot <= PortSaveState::kSlotCount; ++slot) {
+      const std::string label = "Slot " + std::to_string(slot);
+      if (ImGui::Selectable(label.c_str(), sCustom.arg == std::to_string(slot))) {
+        sCustom.arg = std::to_string(slot);
+      }
+      if (slot != PortSaveState::kSlotCount) ImGui::SameLine();
+    }
+  } else if (preset.arg == ArgKind::Language) {
+    ImGui::BeginChild("##languages", listSize);
+    for (const PortCustomActions::Language& language : PortCustomActions::Languages()) {
+      if (ImGui::Selectable(language.label, sCustom.arg == language.code)) sCustom.arg = language.code;
+    }
+    ImGui::EndChild();
+  } else if (preset.arg == ArgKind::Room) {
+    PortCustomActions::LoadRooms();
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##roomsearch", "Search rooms", sCustom.argSearch, sizeof(sCustom.argSearch));
+    ImGui::BeginChild("##rooms", listSize);
+    if (PortCustomActions::Worlds().empty()) ImGui::TextDisabled("Start a game to list the rooms");
+    for (const PortCustomActions::World& world : PortCustomActions::Worlds()) {
+      // The one level with no front-end name is the ending's, not a place to go.
+      if (world.name.empty()) continue;
+      // A world's name matching lists all its rooms; else only the rooms that match.
+      const bool worldMatch = Contains(world.name, sCustom.argSearch);
+      bool any = worldMatch || !world.loaded;
+      for (size_t i = 0; !any && i < world.rooms.size(); ++i) {
+        any = Contains(world.rooms[i].name, sCustom.argSearch);
+      }
+      if (!any) continue;
+      ImGui::SeparatorText(world.name.c_str());
+      ImGui::PushID(static_cast<int>(world.id));
+      const std::string start = PortCustomActions::RoomArg(world.id, 0);
+      if (worldMatch && ImGui::Selectable("Where the world starts", sCustom.arg == start)) sCustom.arg = start;
+      if (!world.loaded) ImGui::TextDisabled("Reading the room names...");
+      for (const PortCustomActions::Room& room : world.rooms) {
+        if (!world.loaded) break;
+        if (!worldMatch && !Contains(room.name, sCustom.argSearch)) continue;
+        const std::string arg = PortCustomActions::RoomArg(world.id, room.area);
+        ImGui::PushID(static_cast<int>(room.area));
+        if (ImGui::Selectable(room.name.c_str(), sCustom.arg == arg)) {
+          sCustom.arg = arg;
+          sCustom.shown = true;
+        } else if (sCustom.arg == arg && !sCustom.shown) {
+          // Editing: bring the room already picked into view.
+          ImGui::SetScrollHereY(0.5f);
+          sCustom.shown = true;
+        }
+        ImGui::PopID();
+      }
+      ImGui::PopID();
+    }
+    ImGui::EndChild();
+  } else if (preset.arg == ArgKind::Text) {
+    const bool command = key == "command";
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##argtext", command ? "give Missiles 10" : "Text to show", sCustom.argText,
+                             sizeof(sCustom.argText));
+    ImGui::SetItemTooltip("%s", command
+                                  ? "The console command to run (docs/CONSOLE.md), where the game is."
+                                  : "The text the HUD message shows.");
+  }
+
+  if (preset.hasMode) {
+    int mode = sCustom.mode == "on" ? 1 : sCustom.mode == "off" ? 2 : 0;
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("When pressed:");
+    ImGui::SameLine();
+    ImGui::RadioButton("Toggle", &mode, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("Turn on", &mode, 1);
+    ImGui::SameLine();
+    ImGui::RadioButton("Turn off", &mode, 2);
+    sCustom.mode = mode == 1 ? "on" : mode == 2 ? "off" : "toggle";
+  }
+
+  // The name follows the options until the player types one; clearing it goes
+  // back to the automatic name.
+  const PortInput::CustomActionDef draft = DraftDef();
+  if (!sCustom.renamed) {
+    std::snprintf(sCustom.name, sizeof(sCustom.name), "%s", PortCustomActions::AutoName(draft).c_str());
+  }
+  ImGui::SetNextItemWidth(-ImGui::CalcTextSize("Name").x - ImGui::GetStyle().ItemInnerSpacing.x);
+  if (ImGui::InputTextWithHint("Name", "What this action is called", sCustom.name, sizeof(sCustom.name))) {
+    sCustom.renamed = sCustom.name[0] != '\0';
+  }
+  ImGui::SetItemTooltip("The name the binding list and the touch buttons show. Clear it for the name built from "
+                        "the action and its option.");
+}
+
+void SaveCustom() {
+  PortInput::CustomActionDef def = DraftDef();
+  if (sCustom.editId == 0) {
+    const uint16_t id = PortInput::NextCustomId(sWork);
+    const bool taken = std::any_of(sWork.customActions.begin(), sWork.customActions.end(),
+                                   [id](const PortInput::CustomActionDef& other) { return other.id == id; });
+    if (taken) {
+      sCustom.error = "No free id is left for a new action: delete one first.";
+      return;
+    }
+    def.id = id;
+    sWork.customActions.push_back(def);
+  } else {
+    def.id = sCustom.editId;
+    for (PortInput::CustomActionDef& other : sWork.customActions) {
+      if (other.id == def.id) other = def;
+    }
+  }
+  sCustom.open = false;
+  sCustom.editId = 0;
+  sEditing = kEditNone;
+  EndCapture();
+  Commit();
+  ImGui::CloseCurrentPopup();
+}
+
+void DrawCustomEditor() {
+  if (sCustom.preset.empty()) {
+    DrawPresetPicker();
+    ImGui::Separator();
+    if (ImGui::Button("Cancel")) {
+      sCustom.open = false;
+      ImGui::CloseCurrentPopup();
+    }
+    return;
+  }
+  const PortCustomActions::Preset* preset = PortCustomActions::FindPreset(sCustom.preset);
+  if (preset == nullptr) {
+    ImGui::TextDisabled("This action's kind no longer exists: pick another one.");
+    if (ImGui::Button("Change")) {
+      sCustom.preset.clear();
+      sCustom.arg.clear();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) {
+      sCustom.open = false;
+      ImGui::CloseCurrentPopup();
+    }
+    return;
+  }
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted(preset->label);
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Change")) {
+    sCustom.preset.clear();
+    sCustom.arg.clear();
+    return;
+  }
+  ImGui::SetItemTooltip("%s", preset->help);
+  if (preset->cheat) ImGui::TextDisabled("Off in the Original experience and with Archipelago");
+  DrawPresetOptions(*preset);
+
+  const bool command = std::string_view(preset->key) == "command";
+  bool valid = preset->arg == PortCustomActions::ArgKind::None || !sCustom.arg.empty();
+  if (preset->arg == PortCustomActions::ArgKind::Text) valid = sCustom.argText[0] != '\0';
+  // A console command needs a name of its own, to tell it apart from any other.
+  if (command) valid = valid && sCustom.renamed && sCustom.name[0] != '\0';
+  if (!sCustom.error.empty()) ImGui::TextColored(ImVec4(1.f, 0.4f, 0.4f, 1.f), "%s", sCustom.error.c_str());
+  ImGui::BeginDisabled(!valid);
+  if (ImGui::Button("Save")) SaveCustom();
+  ImGui::EndDisabled();
+  if (command && !sCustom.renamed) {
+    ImGui::SetItemTooltip("Give it a name first, so the console command is recognisable in the list.");
+  } else if (!valid) {
+    ImGui::SetItemTooltip("Choose what the action does first.");
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Cancel")) {
+    sCustom.open = false;
+    ImGui::CloseCurrentPopup();
+  }
+}
+
+// The editor's and the delete confirmation's popups, drawn once per frame outside
+// the tables so their IDs don't depend on the row they came from.
+void DrawCustomActionPopups() {
+  if (sCustom.requestOpen) {
+    sCustom.requestOpen = false;
+    sCustom.open = true;
+    sCustom.error.clear();
+    ImGui::OpenPopup("Custom action");
+  }
+  // Resizable, opening at most of the screen; a resize is kept for the next time.
+  const ImGuiViewport* viewport = ImGui::GetMainViewport();
+  ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+  ImGui::SetNextWindowSize(ImVec2(viewport->Size.x * 0.6f, viewport->Size.y * 0.75f), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSizeConstraints(ImVec2(std::min(viewport->Size.x, 420.f), std::min(viewport->Size.y, 360.f)),
+                                      viewport->Size);
+  if (ImGui::BeginPopupModal("Custom action", nullptr)) {
+    DrawCustomEditor();
+    if (!sCustom.open) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+  } else {
+    sCustom.open = false;
+  }
+
+  if (sDeleteRequest) {
+    sDeleteRequest = false;
+    ImGui::OpenPopup("Delete action?");
+  }
+  if (ImGui::BeginPopupModal("Delete action?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+    const PortInput::CustomActionDef* def = CustomDef(PortInput::CustomAction(sDeleteId));
+    const std::string name = def != nullptr ? PortCustomActions::DisplayName(*def) : std::string("this action");
+    ImGui::Text("Delete %s and its buttons?", name.c_str());
+    ImGui::TextUnformatted("The action and every binding of it go; this can't be undone.");
+    if (ImGui::Button("Delete")) {
+      if (PortInput::IsCustom(sEditAction) && PortInput::CustomId(sEditAction) == sDeleteId) sEditing = kEditNone;
+      PortInput::RemoveCustomAction(sWork, sDeleteId);
+      EndCapture();
+      Commit();
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+  }
+}
+
 // The table's sections. Layers are for shift-key setups, so they start closed.
 struct SGroup {
   const char* label;
   std::vector<Action> actions;
   bool open;
+  bool custom = false; // the player's own actions: rows carry Edit and Delete, and the list builds them
 };
 
 const std::vector<SGroup>& Groups() {
@@ -903,19 +1283,23 @@ const std::vector<SGroup>& Groups() {
         // The C-stick is the right stick: twin-stick aim, classic beam picks, map panning.
         {"Move and aim",
          {Action::MainUp, Action::MainDown, Action::MainLeft, Action::MainRight, Action::CUp, Action::CDown,
-          Action::CLeft, Action::CRight},
+          Action::CLeft, Action::CRight, Action::Dodge, Action::Grapple},
          true},
         // Direct picks work in every scheme; the GameCube inputs behind them are listed above.
         {"Beams",
          {Action::BeamPower, Action::BeamWave, Action::BeamIce, Action::BeamPlasma, Action::BeamNext,
-          Action::BeamPrev},
+          Action::BeamPrev, Action::BeamMenu},
          true},
         {"Visors",
          {Action::VisorCombat, Action::VisorScan, Action::VisorThermal, Action::VisorXray, Action::VisorNext,
-          Action::VisorPrev},
+          Action::VisorPrev, Action::VisorMenu},
          true},
-        {"Morph Ball", {Action::SpringBall}, true},
-        {"Gyro", {Action::GyroAim}, true},
+        // Issue #167: the ball's own buttons; an input on one does only that in the ball.
+        {"Morph Ball",
+         {Action::BallBomb, Action::BallPowerBomb, Action::BallBoost, Action::BallSpider, Action::BallUnmorph,
+          Action::SpringBall},
+         true},
+        {"Gyro", {Action::GyroAim, Action::ResetAim}, true},
         // Read instead of the game buttons in menus and on the map ("Separate menu buttons").
         {"Menus and map",
          {Action::MenuA, Action::MenuB, Action::MenuX, Action::MenuY, Action::MenuL, Action::MenuR,
@@ -923,7 +1307,7 @@ const std::vector<SGroup>& Groups() {
           Action::MenuRight},
          true},
         {"Port", {Action::PortMenu, Action::SaveState, Action::LoadState, Action::Screenshot, Action::ToggleOriginal,
-          Action::PhotoMode}, true},
+          Action::ToggleRemastered, Action::ToggleTexturePack, Action::PhotoMode}, true},
         {"Layers (shift keys, advanced)", {Action::Layer1, Action::Layer2, Action::Layer3, Action::Layer4}, false},
     };
     // An action added to the engine but not sorted here still gets a row.
@@ -983,8 +1367,10 @@ const char* GameHint(Action a) {
   case Action::MenuDown:
   case Action::MenuLeft:
   case Action::MenuRight: return "Navigate";
-  default: return nullptr;
+  default: break;
   }
+  const PortInput::BallRow* ball = PortInput::FindBallRow(a);
+  return ball != nullptr ? ball->hint : nullptr;
 }
 
 // A binding's non-default settings, in words ("" when it has none).
@@ -1056,7 +1442,17 @@ void DrawTable(const SViews& views, bool editorDrawn) {
   SPending pending;
   bool editRowShown = false;
   bool saved = false;
-  for (const SGroup& group : Groups()) {
+  // The player's own actions, after Port and before Layers: they come and go with
+  // controls.toml, so they aren't part of the cached Groups().
+  std::vector<SGroup> groups(Groups().begin(), Groups().end());
+  SGroup customGroup{"Custom actions (advanced)", {}, false, true};
+  for (const PortInput::CustomActionDef& def : sWork.customActions) {
+    customGroup.actions.push_back(PortInput::CustomAction(def.id));
+  }
+  const auto layersAt = std::find_if(groups.begin(), groups.end(),
+                                    [](const SGroup& g) { return std::string_view(g.label).starts_with("Layers"); });
+  groups.insert(layersAt, std::move(customGroup));
+  for (const SGroup& group : groups) {
     // A filter opens every section, so a match is never hidden in a closed one.
     if (sFilter[0] != '\0') ImGui::SetNextItemOpen(true, ImGuiCond_Always);
     if (!ImGui::CollapsingHeader(group.label, group.open ? ImGuiTreeNodeFlags_DefaultOpen : 0)) continue;
@@ -1069,9 +1465,11 @@ void DrawTable(const SViews& views, bool editorDrawn) {
       }
       ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 1.f);
       ImGui::TableSetupColumn(inputsLabel.c_str(), ImGuiTableColumnFlags_WidthStretch, 2.4f);
-      // Room for "+" and "Revert" always, so the columns don't move when a row gets a Revert.
-      ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed,
-                              ImGui::CalcTextSize("+Revert").x + style.FramePadding.x * 4.f + style.ItemSpacing.x);
+      // Room for "+", "Edit" and "Delete" (a custom action's row) in every table, so a
+      // row getting a Revert moves nothing and all the sections' columns line up.
+      ImGui::TableSetupColumn(
+          "", ImGuiTableColumnFlags_WidthFixed,
+          ImGui::CalcTextSize("+EditDelete").x + style.FramePadding.x * 6.f + style.ItemSpacing.x * 2.f);
       if (headers) ImGui::TableHeadersRow();
       return true;
     };
@@ -1093,7 +1491,7 @@ void DrawTable(const SViews& views, bool editorDrawn) {
     };
     for (const Action action : group.actions) {
       if (!tableOpen) break;
-      const std::string label(PortInput::Info(action).label);
+      const std::string label = ActionLabel(action);
       const char* hint = GameHint(action);
       if (!Contains(label, sFilter) && (hint == nullptr || !Contains(hint, sFilter))) continue;
       SCell cells[3];
@@ -1113,7 +1511,10 @@ void DrawTable(const SViews& views, bool editorDrawn) {
       if (editingAction) ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1, ImGui::GetColorU32(ImGuiCol_Header));
       ImGui::TableNextColumn();
       ImGui::AlignTextToFramePadding();
+      // The player's own names can be long ("Warp to … (Phendrana Drifts)"): they wrap.
+      if (group.custom) ImGui::PushTextWrapPos(0.f);
       ImGui::TextUnformatted(label.c_str());
+      if (group.custom) ImGui::PopTextWrapPos();
       if (hint != nullptr) {
         ImGui::SameLine();
         ImGui::TextDisabled("%s", hint);
@@ -1204,7 +1605,8 @@ void DrawTable(const SViews& views, bool editorDrawn) {
       }
       ImGui::SetItemTooltip("Add a binding for this action and start recording any key, mouse button or "
                             "controller input. Release it, then Save.");
-      if (overridden != 0) {
+      // A custom action has no defaults to go back to: x removes its inputs.
+      if (overridden != 0 && !group.custom) {
         ImGui::SameLine();
         if (ImGui::SmallButton("Revert")) {
           pending.op = SPending::Op::Revert;
@@ -1213,11 +1615,27 @@ void DrawTable(const SViews& views, bool editorDrawn) {
         }
         ImGui::SetItemTooltip("Back to the default inputs on every device.");
       }
+      if (group.custom) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Edit")) OpenCustomEditor(CustomDef(action));
+        ImGui::SetItemTooltip("Change what this action does.");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Delete")) {
+          sDeleteId = PortInput::CustomId(action);
+          sDeleteRequest = true;
+        }
+        ImGui::SetItemTooltip("Delete this action and its buttons.");
+      }
       ImGui::PopID();
       // Read after the row's buttons: a click this frame opens the editor at once.
       if (sEditing != kEditNone && sEditAction == action) editorHere();
     }
     if (tableOpen) ImGui::EndTable();
+    if (group.custom) {
+      if (ImGui::Button("+ Add action")) OpenCustomEditor(nullptr);
+      ImGui::SetItemTooltip("Make your own action: a setting, a cheat, a save state, a message or a console "
+                            "command. Bind it to any input afterwards, like the actions above.");
+    }
   }
   sEditRowShown = editRowShown;
   // A remove index from before a Save in the same frame may be stale.
@@ -1227,50 +1645,74 @@ void DrawTable(const SViews& views, bool editorDrawn) {
 struct SPreset {
   const char* name;
   const char* id;
+  const char* tooltip;
 };
-constexpr SPreset kKeyPresets[] = {{"Classic", "classic"}, {"Mouse & keyboard", "mouse"}};
+constexpr SPreset kKeyPresets[] = {
+    {"Classic", "classic",
+     "The default layout: WASD move, IJKL C-stick, X/Z/C/V for A/B/X/Y,\n"
+     "Q/E for L/R, F map, arrows D-pad, left shift beam shift.\n"
+     "Sets the keys, mouse buttons and beam shift key."},
+    {"Mouse & keyboard", "mouse",
+     "For mouse aim: WASD move, left click or E fire, Space jump,\n"
+     "left ctrl or C morph ball, F or middle click missile,\n"
+     "right click or Q lock on, left alt free look, Tab or M map,\n"
+     "1-4 beams, 5-8 visors (arrows too), left shift beam shift.\n"
+     "In morph ball Q is Spider Ball. Turns on mouse aim and Twin Stick\n"
+     "Aim, so a controller's right stick aims too."},
+};
 constexpr SPreset kPadPresets[] = {
-    {"GameCube", "gamecube"}, {"Remastered", "remastered"}, {"Modern", "modern"}, {"Southpaw", "southpaw"}};
+    {"GameCube", "gamecube",
+     "The default layout: the face buttons and shoulder as on a GameCube pad.\nTurns off Twin Stick Aim."},
+    {"Remastered", "remastered",
+     "Metroid Prime Remastered's Dual Sticks scheme (Xbox labels): RT or B\n"
+     "fire, LT lock on, A or LB jump, X morph ball, RB missile, Menu map,\n"
+     "View pause, right stick click free look. D-pad: up Combat, right Scan,\n"
+     "left X-Ray, down Thermal visor; hold Y for up Power, right Wave, left\n"
+     "Plasma, down Ice beam; in morph ball Y springs (with Spring Ball on)\n"
+     "and LT is Spider Ball. Turns on Twin Stick Aim and the Scan/X-Ray swap."},
+    {"Modern", "modern",
+     "RT fire, LT lock on, A jump, B morph ball, RB missile, Y map,\n"
+     "right stick click free look; in morph ball LT is Spider Ball.\n"
+     "Turns on Twin Stick Aim; hold LB and press the D-pad to change beams."},
+    {"Southpaw", "southpaw", "The GameCube layout with the two sticks swapped.\nTurns off Twin Stick Aim."},
+};
 
-// One device's reset: back to a preset (or just the defaults), behind the popup's confirmation.
-void ResetSection(const SView& v, const SPreset* presets, int count, int& preset) {
+// Removes the user's own bindings for a view: a family of the Default profile,
+// or a kind or model's whole profile.
+void ClearOwn(const SView& v) {
+  sEditing = kEditNone;
+  EndCapture();
+  if (UserProfile* p = Find(v.match)) {
+    if (v.match.empty()) {
+      PortInput::ClearFamily(*p, v.family);
+    } else {
+      p->bindings.clear();
+      p->unbind.clear();
+    }
+    Commit();
+  }
+}
+
+// One device's reset, behind the popup's confirmation. The keyboard and all
+// controllers go back to their first preset (the first-run layout).
+void ResetSection(const SView& v) {
   using PortInput::Family;
   ImGui::PushID(int(v.family));
   ImGui::SeparatorText(v.family == Family::Pad && !v.match.empty() ? (v.name.empty() ? v.match : v.name).c_str()
                                                                    : kFamilies[int(v.family)]);
-  const bool pads = v.family == Family::Pad;
-  const bool gcAdapter = PADIsGCAdapter(0) != 0;
-  const auto needsPad = [&](int i) {
-    return pads && (std::string_view(presets[i].id) == "remastered" || std::string_view(presets[i].id) == "modern");
-  };
-  if (count > 0) {
-    for (int i = 0; i < count; ++i) {
-      ImGui::BeginDisabled(needsPad(i) && gcAdapter);
-      if (i != 0) ImGui::SameLine();
-      ImGui::RadioButton(presets[i].name, &preset, i);
-      ImGui::EndDisabled();
-    }
-    if (preset >= count || (needsPad(preset) && gcAdapter)) preset = 0;
-    ImGui::TextDisabled("Your own bindings for this device are removed; the others are left alone.");
+  const bool layout = v.match.empty() && v.family != Family::Touch;
+  if (layout) {
+    ImGui::TextDisabled("Your own bindings for this device are removed and the %s layout comes back.",
+                        v.family == Family::Keyboard ? kKeyPresets[0].name : kPadPresets[0].name);
   } else if (v.family == Family::Touch) {
     ImGui::TextDisabled("Removes every touch binding of yours.");
   } else {
     ImGui::TextDisabled("Removes this controller's own bindings, so it uses Controllers' again.");
   }
   if (ImGui::Button("Reset")) {
-    sEditing = kEditNone;
-    EndCapture();
-    if (UserProfile* p = Find(v.match)) {
-      if (v.match.empty()) {
-        PortInput::ClearFamily(*p, v.family);
-      } else {
-        p->bindings.clear();
-        p->unbind.clear();
-      }
-      Commit();
-    }
-    if (count > 0 && v.family == Family::Keyboard) PortControls::ApplyKeyPresetNamed(presets[preset].id);
-    if (count > 0 && pads) PortControls::ApplyPadPresetNamed(presets[preset].id);
+    ClearOwn(v);
+    if (layout && v.family == Family::Keyboard) PortControls::ApplyKeyPresetNamed(kKeyPresets[0].id);
+    if (layout && v.family == Family::Pad) PortControls::ApplyPadPresetNamed(kPadPresets[0].id);
     ImGui::CloseCurrentPopup();
   }
   ImGui::PopID();
@@ -1279,21 +1721,180 @@ void ResetSection(const SView& v, const SPreset* presets, int count, int& preset
 // The reset buttons, one per device, behind a popup.
 void DrawReset(const SViews& views) {
   using PortInput::Family;
-  static int sKeyPreset = 0;
-  static int sPadPreset = 0;
-  if (ImGui::Button("Reset...")) {
-    sKeyPreset = 0;
-    sPadPreset = 0;
-    ImGui::OpenPopup("resetDevice");
-  }
+  if (ImGui::Button("Reset...")) ImGui::OpenPopup("resetDevice");
   if (!ImGui::BeginPopup("resetDevice")) return;
-  ResetSection(views[Family::Keyboard], kKeyPresets, int(std::size(kKeyPresets)), sKeyPreset);
-  const bool allPads = views[Family::Pad].match.empty();
-  ResetSection(views[Family::Pad], allPads ? kPadPresets : nullptr, allPads ? int(std::size(kPadPresets)) : 0,
-               sPadPreset);
-  if (kShowTouch) {
-    int none = 0;
-    ResetSection(views[Family::Touch], nullptr, 0, none);
+  ResetSection(views[Family::Keyboard]);
+  ResetSection(views[Family::Pad]);
+  if (kShowTouch) ResetSection(views[Family::Touch]);
+  ImGui::Separator();
+  if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
+  ImGui::EndPopup();
+}
+
+// A preset's Morph Ball rows, after ClearOwn unbinds them all (so each does its
+// game button). The dual-stick layouts move R to the right stick click, so Spider
+// Ball goes on lock-on instead, as in Remastered (LT, or Q on the keyboard).
+void ApplyBallPreset(PortInput::Family family, std::string_view id) {
+  const char* spider = nullptr;
+  if (family == PortInput::Family::Pad && (id == "remastered" || id == "modern")) spider = "axis:lefttrigger+";
+  if (family == PortInput::Family::Keyboard && id == "mouse") spider = "key:20"; // SDL_SCANCODE_Q
+  Binding b;
+  if (spider == nullptr || !PortInput::InputFromText(spider, b.inputs[0])) return;
+  b.action = PortInput::Action::BallSpider;
+  b.count = 1;
+  PortInput::AddUserBinding(Ensure("", "Default"), b);
+  Commit();
+}
+
+// Takes the saved bindings as the page's copy: a PortControls preset writes them
+// itself, and the next Commit would otherwise put the page's older copy back.
+void Reload() {
+  if (const auto saved = PortInputDevices::UserBindings()) sWork = *saved;
+  sSeenVersion = PortInputDevices::UserBindingsVersion();
+  sLoaded = true;
+}
+
+// The player's saved presets (port_input_user_presets.h), listed once when the
+// popup opens and after each save or delete; the files aren't read per frame.
+std::vector<PortInputUserPresets::Entry> sSaved;
+bool sSavedStale = true;
+char sSaveName[PortInputUserPresets::kMaxName + 1] = {};
+std::string sPendingDelete;
+
+const std::vector<PortInputUserPresets::Entry>& Saved() {
+  if (sSavedStale) {
+    sSaved = PortInputUserPresets::ListAll();
+    sSavedStale = false;
+  }
+  return sSaved;
+}
+
+// The page's copy goes stale when a preset writes the bindings, as for a built-in one.
+void ApplySaved(const std::string& name) {
+  EndCapture();
+  sEditing = kEditNone;
+  PortInputUserPresets::ApplyAll(name);
+  Reload();
+}
+
+// One row of preset buttons. A click replaces the family's own Default-profile
+// bindings with the preset; a kind or model's own bindings stay on top.
+void PresetRow(const SView& v, const SPreset* presets, int count) {
+  using PortInput::Family;
+  ImGui::PushID(int(v.family));
+  ImGui::SeparatorText(kFamilies[int(v.family)]);
+  const bool pads = v.family == Family::Pad;
+  // A GameCube pad has no right stick (click) for the dual-stick layouts.
+  const bool gcAdapter = pads && PADIsGCAdapter(0) != 0;
+  for (int i = 0; i < count; ++i) {
+    const std::string_view id = presets[i].id;
+    if (i != 0) ImGui::SameLine();
+    ImGui::BeginDisabled(gcAdapter && (id == "remastered" || id == "modern"));
+    if (ImGui::Button(presets[i].name)) {
+      ApplyPreset(v.family, id);
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled)) {
+      ImGui::SetTooltip("%s", presets[i].tooltip);
+    }
+  }
+  if (pads && !v.match.empty()) {
+    ImGui::TextDisabled("Applies to all controllers; %s keeps its own bindings on top.",
+                        (v.name.empty() ? v.match : v.name).c_str());
+  }
+  ImGui::PopID();
+}
+
+// The built-in keyboard and controller presets, behind a popup.
+void DrawPresets(const SViews& views) {
+  using PortInput::Family;
+  if (ImGui::Button("Presets...")) ImGui::OpenPopup("presets");
+  ImGui::SetItemTooltip("Ready-made layouts: Classic or Mouse & keyboard for the keyboard; GameCube,\n"
+                        "Remastered, Modern or Southpaw for controllers.");
+  if (!ImGui::BeginPopup("presets")) return;
+  ImGui::TextDisabled("A preset replaces your own bindings for that device.");
+  PresetRow(views[Family::Keyboard], kKeyPresets, int(std::size(kKeyPresets)));
+  PresetRow(views[Family::Pad], kPadPresets, int(std::size(kPadPresets)));
+  ImGui::Separator();
+  if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
+  ImGui::EndPopup();
+}
+
+// The player's own saved presets, behind their own popup: one list, a preset
+// covering every device it was saved with. One button applies it, a small x deletes
+// it (after a confirm), and Save current as... adds one.
+void DrawMyPresets() {
+  if (ImGui::Button("My presets...")) {
+    sSavedStale = true;
+    ImGui::OpenPopup("myPresets");
+  }
+  ImGui::SetItemTooltip("Your own saved layouts: keep the current bindings as a preset, apply or delete one.");
+  if (!ImGui::BeginPopup("myPresets")) return;
+  ImGui::TextDisabled("Applying one replaces your own bindings for the devices it covers.");
+  const std::vector<PortInputUserPresets::Entry> saved = Saved();
+  if (saved.empty()) ImGui::TextDisabled("None saved yet.");
+  for (size_t i = 0; i < saved.size(); ++i) {
+    ImGui::PushID(int(i));
+    if (ImGui::Button(saved[i].name.c_str())) {
+      ApplySaved(saved[i].name);
+      ImGui::CloseCurrentPopup();
+    }
+    std::string devices;
+    const auto add = [&](bool has, const char* what) {
+      if (!has) return;
+      if (!devices.empty()) devices += ", ";
+      devices += what;
+    };
+    add(saved[i].keyboard, "Keyboard & mouse");
+    add(saved[i].pad, "Controllers");
+    add(saved[i].touch, "Touch");
+    ImGui::SetItemTooltip("Your preset: %s. Replaces your own bindings for those devices.", devices.c_str());
+    ImGui::SameLine(0.f, 2.f);
+    if (ImGui::SmallButton("x")) {
+      sPendingDelete = saved[i].name;
+      ImGui::OpenPopup("deleteSaved");
+    }
+    ImGui::SetItemTooltip("Delete this saved preset.");
+    if (ImGui::BeginPopup("deleteSaved")) {
+      ImGui::Text("Delete the preset %s?", sPendingDelete.c_str());
+      if (ImGui::Button("Delete")) {
+        PortInputUserPresets::DeleteAll(sPendingDelete);
+        sSavedStale = true;
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+      ImGui::EndPopup();
+    }
+    ImGui::PopID();
+    if (ImGui::GetContentRegionAvail().x > ImGui::GetFontSize() * 10.f && i + 1 < saved.size()) ImGui::SameLine();
+  }
+  if (ImGui::Button("Save current as...")) {
+    sSaveName[0] = '\0';
+    ImGui::OpenPopup("saveCurrent");
+  }
+  ImGui::SetItemTooltip("Keep the current bindings of every device as a preset of your own.\n"
+                        "The controller part needs a controller connected.");
+  if (ImGui::BeginPopup("saveCurrent")) {
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.f);
+    if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+    ImGui::InputText("Name", sSaveName, sizeof(sSaveName));
+    const std::string name = PortInputUserPresets::CleanName(sSaveName);
+    bool exists = false;
+    for (const PortInputUserPresets::Entry& e : saved) {
+      exists = exists || PortInputUserPresets::Slug(e.name) == PortInputUserPresets::Slug(name);
+    }
+    ImGui::BeginDisabled(name.empty());
+    if (ImGui::Button(exists ? "Replace" : "Save")) {
+      PortInputUserPresets::SaveAll(name);
+      sSavedStale = true;
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
   }
   ImGui::Separator();
   if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
@@ -1375,6 +1976,23 @@ void DrawActiveController() {
 
 } // namespace
 
+void ApplyPreset(PortInput::Family family, std::string_view id) {
+  // The page may never have been drawn; start from the saved bindings.
+  if (sEditing == kEditNone && !sCapture.active) Reload();
+  // The presets set the all-controllers layer, so clear that one even
+  // while a kind or model is selected.
+  SView base;
+  base.family = family;
+  ClearOwn(base);
+  if (family == PortInput::Family::Pad) {
+    PortControls::ApplyPadPresetNamed(id);
+  } else {
+    PortControls::ApplyKeyPresetNamed(id);
+  }
+  Reload();
+  ApplyBallPreset(family, id);
+}
+
 std::string BindingsText(PortInput::Action action, const char* separator) {
   // Hints ask every frame; the profile is rebuilt at most twice a second.
   struct SCached {
@@ -1430,6 +2048,13 @@ void Draw() {
     sSeenVersion = version;
     sLoaded = true;
   }
+  // A warp action's name is its room's, read from the disc.
+  for (const PortInput::CustomActionDef& def : sWork.customActions) {
+    if (def.preset == "warp") {
+      PortCustomActions::LoadRooms();
+      break;
+    }
+  }
 
   ImGui::TextWrapped("Each action lists its inputs for every device. Press + to add a binding; use Record and Save "
                      "in the editor. Click an input to change it, x removes it. Greyed inputs are "
@@ -1467,26 +2092,40 @@ void Draw() {
   UpdateCapture();
 
   ImGui::SameLine();
+  DrawPresets(views);
+  ImGui::SameLine();
+  DrawMyPresets();
+  ImGui::SameLine();
   DrawReset(views);
   bool menuStandard = PortDebug::MenuStandardButtons();
   if (ImGui::Checkbox("Separate menu buttons", &menuStandard)) PortDebug::SetMenuStandardButtons(menuStandard);
-  ImGui::SetItemTooltip("On: menus and the map use the controller's \"Menus and map\" rows (by default its own "
-                        "buttons: A confirms, B backs out, the triggers page and zoom). Start and the map "
-                        "button keep their gameplay inputs. Keys and mouse buttons on those rows replace their "
-                        "gameplay action there. Bindings set for Menu or Map under Advanced still apply.\nOff: menus and the map follow your gameplay bindings, and the Menus and map "
-                        "rows do nothing.");
+  ImGui::SetItemTooltip(
+      "On: menus and the map use the controller's \"Menus and map\" rows (by default A\n"
+      "confirms, B backs out, the triggers page and zoom). Start and the map button keep\n"
+      "their gameplay inputs. Keys and mouse buttons on those rows replace their\n"
+      "gameplay action there.\nOff: menus and the map follow your gameplay bindings.");
   ImGui::SameLine();
   bool pointerMenus = PortPointer::Enabled();
   if (ImGui::Checkbox("Point and click menus", &pointerMenus)) PortDebug::SetPointerMenus(pointerMenus);
-  ImGui::SetItemTooltip("On: the mouse and touch work the game's menus and map. Hovering or tapping selects, "
-                        "a click (or a tap on the selected item) confirms, right click backs out, a click on a "
-                        "button hint presses it. Drags set sliders and turn the Samus doll and the map; the "
-                        "wheel or a pinch zooms them; a two-finger twist turns the map.\nOff: menus and the map read only buttons and keys.");
+  ImGui::SetItemTooltip(
+      "On: the mouse and touch work the game's menus and map. Hover or tap selects,\n"
+      "a click (or a tap on the selected item) confirms, right click backs out. Drags\n"
+      "set sliders and turn the Samus doll and the map; the wheel or a pinch zooms.\nOff: menus "
+      "and the map read only buttons and keys.");
+  ImGui::SameLine();
+  bool swapFingers = PortPointer::MapSwapFingers();
+  ImGui::BeginDisabled(!pointerMenus);
+  if (ImGui::Checkbox("Swap map finger gestures", &swapFingers)) PortDebug::SetMapSwapFingers(swapFingers);
+  ImGui::EndDisabled();
+  ImGui::SetItemTooltip("On: on the map one finger pans and two fingers rotate. Off: one finger rotates and two "
+                        "fingers pan. Twist and pinch are unchanged; the mouse is not affected.");
   ImGui::Separator();
 
   const bool editorOnTop = sEditing != kEditNone && !sEditRowShown;
   if (editorOnTop) DrawEditor(views);
   DrawTable(views, editorOnTop);
+  // Outside the tables, so the popups' IDs don't depend on the row that opened them.
+  DrawCustomActionPopups();
   ImGui::Separator();
   if (ImGui::TreeNode("Advanced##page")) {
     DrawProfileOptions(views[PortInput::Family::Pad]);

@@ -8,6 +8,12 @@
 #include "Kyoto/Particles/CParticleGlobals.hpp"
 #include "Kyoto/Particles/PortParticleMath.hpp"
 #include "Kyoto/Streams/CInputStream.hpp"
+#ifdef TARGET_PC
+#include "Kyoto/Particles/CElementGen.hpp"
+#include "Kyoto/Particles/CPortParticleParseScope.hpp"
+
+#include <algorithm>
+#endif
 
 #include "rstl/math.hpp"
 
@@ -119,7 +125,11 @@ bool CRERandom::GetValue(int frame, float& valOut) const {
 }
 
 CREInitialRandom::CREInitialRandom(CRealElement* min, CRealElement* max)
-: x4_min(min), x8_max(max) {}
+: x4_min(min), x8_max(max)
+#ifdef TARGET_PC
+, xPortLoadConstant(!CPortParticleParseScope::particleInitialRandom)
+#endif
+{}
 
 CREInitialRandom::~CREInitialRandom() {
   delete x4_min;
@@ -334,6 +344,13 @@ bool CREParticleAccessParameter8::GetValue(int, float& valOut) const {
   return false;
 }
 
+#ifdef TARGET_PC
+bool CREParticleAccessParameter9::GetValue(int, float& valOut) const {
+  valOut = CParticleGlobals::GetParticleAccessParameters()[8];
+  return false;
+}
+#endif
+
 bool CREParticleSizeOrLineLength::GetValue(int, float& valOut) const {
   valOut = CParticleGlobals::GetCurrentParticle()->x2c_lineLengthOrSize;
   return false;
@@ -377,8 +394,8 @@ bool CREDistanceFromCameraBlend::GetValue(int frame, float& valOut) const {
       }
     }
   }
-  // The view matrix is already camera-to-world (CGraphics::SetViewPointMatrix).
-  const CTransform4f& camera = CGraphics::GetViewMatrix();
+  // GetCameraTransform 0x27b304: the game camera, camera-to-world like the view matrix.
+  const CTransform4f& camera = CParticleGlobals::PortCameraTransform();
   const float d = CVector3f::Dot(pos - camera.GetTranslation(), camera.GetForward());
   valOut = DistanceBlend(d, a, b);
   return false;
@@ -387,6 +404,91 @@ bool CREDistanceFromCameraBlend::GetValue(int frame, float& valOut) const {
 float CREDistanceFromCameraBlend::DistanceBlend(float d, float a, float b) {
   // Remastered CalculateBlendValue 0x298f44 (see PortParticleMath.hpp).
   return PortParticleMath::DistanceBlend(d, a, b);
+}
+
+CREPortDivide::CREPortDivide(CRealElement* a, CRealElement* b) : x4_a(a), x8_b(b) {}
+
+CREPortDivide::~CREPortDivide() {
+  delete x4_a;
+  delete x8_b;
+}
+
+bool CREPortDivide::GetValue(int frame, float& valOut) const {
+  // Both operands start at 0 (a missing child leaves them so).
+  float a = 0.f, b = 0.f;
+  if (x4_a) {
+    x4_a->GetValue(frame, a);
+  }
+  if (x8_b) {
+    x8_b->GetValue(frame, b);
+  }
+  valOut = a / b;
+  return false;
+}
+
+CREPortTicksToSeconds::CREPortTicksToSeconds(CIntElement* a) : x4_a(a) {}
+
+CREPortTicksToSeconds::~CREPortTicksToSeconds() { delete x4_a; }
+
+bool CREPortTicksToSeconds::GetValue(int frame, float& valOut) const {
+  int n = 0;
+  if (x4_a) {
+    x4_a->GetValue(frame, n);
+  }
+  // skTickPerSecondInv is the double 0x3F91111111111111, 1/60 rounded once.
+  valOut = static_cast< float >(0.016666666666666666 * static_cast< double >(n));
+  return false;
+}
+
+CREPortSwooshNodeTime::CREPortSwooshNodeTime(CRealElement* a) : x4_a(a) {}
+
+CREPortSwooshNodeTime::~CREPortSwooshNodeTime() { delete x4_a; }
+
+bool CREPortSwooshNodeTime::GetValue(int frame, float& valOut) const {
+  const CParticleGlobals::SPortSwooshEval* swoosh = CParticleGlobals::xPortSwooshEval;
+  if (swoosh == nullptr || !swoosh->hasNode) {
+    return x4_a->GetValue(frame, valOut);
+  }
+  const int percentage = CParticleGlobals::mParticleLifetimePercentage;
+  const float real = CParticleGlobals::mParticleLifetimePercentageReal;
+  const float remainder = CParticleGlobals::mParticleLifetimePercentageRemainder;
+  CParticleGlobals::mParticleLifetimePercentage = swoosh->nodePercentage;
+  CParticleGlobals::mParticleLifetimePercentageReal =
+      float(swoosh->nodePercentage) + swoosh->nodeRemainder;
+  CParticleGlobals::mParticleLifetimePercentageRemainder = swoosh->nodeRemainder;
+  const bool ret = x4_a->GetValue(frame, valOut);
+  CParticleGlobals::mParticleLifetimePercentage = percentage;
+  CParticleGlobals::mParticleLifetimePercentageReal = real;
+  CParticleGlobals::mParticleLifetimePercentageRemainder = remainder;
+  return ret;
+}
+
+bool CREPortTotalCreatedParticleCount::GetValue(int frame, float& valOut) const {
+  const CParticleGlobals::SParticleSystem* system = CParticleGlobals::GetCurrentParticleSystem();
+  const CElementGen* generator =
+      system != nullptr && CParticleGlobals::xPortSwooshEval == nullptr ? system->x4_system : nullptr;
+  // Retail counts a particle before its emitter runs; Remastered's total is one less.
+  valOut = generator != nullptr ? float(std::max(generator->GetCumulativeParticleCount() - 1, 0)) : 0.f;
+  return false;
+}
+
+CREPortSlot2Time::CREPortSlot2Time(CRealElement* a) : x4_a(a) {}
+
+CREPortSlot2Time::~CREPortSlot2Time() { delete x4_a; }
+
+bool CREPortSlot2Time::GetValue(int frame, float& valOut) const {
+  const int percentage = CParticleGlobals::mParticleLifetimePercentage;
+  const float real = CParticleGlobals::mParticleLifetimePercentageReal;
+  const float remainder = CParticleGlobals::mParticleLifetimePercentageRemainder;
+  CParticleGlobals::mParticleLifetimePercentage = CParticleGlobals::xPortSlot2Percentage;
+  CParticleGlobals::mParticleLifetimePercentageReal =
+      float(CParticleGlobals::xPortSlot2Percentage) + CParticleGlobals::xPortSlot2Remainder;
+  CParticleGlobals::mParticleLifetimePercentageRemainder = CParticleGlobals::xPortSlot2Remainder;
+  const bool ret = x4_a->GetValue(frame, valOut);
+  CParticleGlobals::mParticleLifetimePercentage = percentage;
+  CParticleGlobals::mParticleLifetimePercentageReal = real;
+  CParticleGlobals::mParticleLifetimePercentageRemainder = remainder;
+  return ret;
 }
 #endif
 

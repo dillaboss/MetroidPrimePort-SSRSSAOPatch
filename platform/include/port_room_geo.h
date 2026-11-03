@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "port_room_color_modulate.h"
 
 class CActor;
 class CCubeModel;
@@ -20,7 +21,7 @@ class CVector3f;
 // them in place of the area's own world geometry.
 //
 // The file is little endian:
-//   'MPRG', u32 version (1 to 11), u32 instances
+//   'MPRG', u32 version (1 to 15), u32 instances
 //   instance: u32 CMDL id, f32 transform[12] (rows of model -> area)
 //     version 2 adds: u8 layer, u8 active, u16 links,
 //     version 3 (and 4) then: u32 platform, f32 platformStart[3],
@@ -66,12 +67,16 @@ class CVector3f;
 // looping clip that starts at the area's load.
 //
 // Version 6 may then end with the room's skies:
-//   'SKY ', u32 count, per sky: u32 index, and from version 7 f32 radiance r, g, b
+//   'SKY ', u32 count, per sky: u32 index, and from version 7 f32 radiance r, g, b, and from
+//   version 13 u32 flags (bit 0: the world's sky, below)
 // The radiance is Remastered's Skybox colour times its intensity, which takes the place of
 // the sky materials' diffuse colour (DIFC): the base map times it is the light the sky
 // gives, in Remastered's HDR units; 0 (version 6) for not known. A sky instance is not
 // drawn with the room: the world's sky is drawn as it, centred on the camera, turned and scaled by its transform (whose translation is left out). Its layer,
 // `active`, links and group show and hide it as they do any instance's.
+// A world's sky (version 13) is the world master room's Skybox, which Remastered draws in the
+// rooms that have none of their own (Phendrana's): it stands in for retail's world sky only
+// where retail draws that, and never makes the area count as having a sky of its own (HasSky).
 //
 // Version 9 may then end with the retail objects the instances stand in for:
 //   'HIDE', u32 count (1 or more), per object: u32 editor id (its low 26 bits, as
@@ -110,7 +115,10 @@ enum : uint32_t { kNoGroup = 0xffffffff };
 // kFollow (with state MaxReached): `sender` is a DamageableTrigger, and the instance is one
 // of the actors retail's trigger shows and fades with itself (SetLinkedObjectAlpha): drawn
 // at the trigger's puddle alpha while it is active, hidden once it goes inactive.
-enum LinkAction : uint8_t { kShow = 1, kHide = 2, kToggle = 3, kFollow = 4 };
+// Version 14: kActorTransform binds model-local `transform` to the complete transform
+// of sender (not a translation-only slave). State and delay are unused.
+// kGenerate: a Remastered GeneratorMP1's SetToZero (the importer's own; never written to a file).
+enum LinkAction : uint8_t { kShow = 1, kHide = 2, kToggle = 3, kFollow = 4, kActorTransform = 5, kGenerate = 6 };
 
 struct Link {
   uint32_t sender; // retail editor id, layer bits included
@@ -119,6 +127,8 @@ struct Link {
   // Seconds from the state to the action: the Remastered timers the link was traced through,
   // retail having none of them. Sent again before then, the wait starts over. Instances only.
   float delay = 0.f;
+  // Traced through Remastered relays or timers rather than straight from the sender (importer only).
+  bool relayed = false;
 };
 
 struct Instance {
@@ -146,6 +156,7 @@ struct Instance {
   std::vector<AnimClip> anim;
   bool animOnShow = false;
   bool sky = false; // the room's sky (version 6), drawn in place of the world's
+  bool worldSky = false; // version 13, with sky: the world's sky, drawn only where retail draws its own
   float skyRadiance[3] = {}; // version 7; 0: not known
   float lightmap[3] = {};    // version 10: offU, offV, scale into the room's lightmap; all 0: none
   // Version 11: a float driver of one kind parameter of its materials (WDRV).
@@ -170,6 +181,7 @@ enum NodeKind : uint8_t {
   kCounter = 2,
   // Remastered's Relay: kFire sends Fired (event 0).
   kRelay = 3,
+  kAlphaModulate = 4,
 };
 enum ScriptAction : uint8_t {
   kIncrement = 1,
@@ -183,6 +195,7 @@ enum ScriptAction : uint8_t {
   // `to` is a group: each animated instance of it starts its next clip now (on its last clip,
   // it restarts that one).
   kGroupNextClip = 9,
+  kGroupModulate = 10, // Play/Activate target binding; from an AlphaModulate node
 };
 
 struct ScriptNode {
@@ -192,6 +205,9 @@ struct ScriptNode {
   float centre[3] = {};
   float half[3] = {};
   float axes[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+  // Version 15 AlphaModulate uses the same fixed node payload: max = flags,
+  // centre.xy = alpha A/B, half.xy = duration A->B/B->A; remaining floats unused.
+  AlphaModulateConfig AlphaConfig() const { return {centre[0], centre[1], half[0], half[1], max}; }
 };
 
 // `from` is a node index, or for `retail` a retail editor id (layer bits included) whose
@@ -225,7 +241,7 @@ struct Script {
 bool ParseFileName(const std::string& fileName, uint32_t& id);
 bool Parse(const std::vector<uint8_t>& data, std::vector<Instance>& out, std::string& error,
            Script* script = nullptr);
-// The file for these instances (version 11), with the script section when there is a script
+// The file for these instances (version 13), with the script section when there is a script
 // or a group, the glow section when an instance glows, the animation section when one is
 // animated, the sky section when one is a sky and the hidden objects when there are any.
 std::vector<uint8_t> Write(const std::vector<Instance>& instances, const Script* script = nullptr);
@@ -253,9 +269,16 @@ std::vector<uint8_t> WriteLods(const std::vector<Lods>& models);
 
 // The areas in memory now. Loads the files of new ones and frees those of areas that left.
 void SetLoadedAreas(const uint32_t* mreas, size_t count);
+// The game started streaming the area in (CGameArea::StartStreamIn): reads and parses its
+// file on a worker, so that loading it once it is in only has to make the models. Any number
+// of calls per area; nothing changes until the area loads.
+void Prefetch(uint32_t mrea);
 // Draws the area's room geometry. True when it stands in for the area's own, which is
 // when the area has a file, the mode says so and every model of it has loaded.
 bool Draw(const CStateManager& mgr, const CGameArea& area, const CFrustumPlanes& frustum);
+// The thermal visor's hot world for an area Draw drew this frame (in the HDR scene): the
+// bit-19 meshes of what it drew, through the thermal override.
+void DrawThermalHot(const CStateManager& mgr, const CGameArea& area, const CFrustumPlanes& frustum);
 // Queues the blended surfaces of what Draw drew for the area this frame in the renderer's
 // sorted pass; the renderer hands each back to DrawSorted through the state manager's
 // drawable callback, as type kDrawableType.
@@ -360,6 +383,12 @@ uint32_t OffscreenCasterCount();
 // (an A/B check; not saved).
 void SetDepthPrepass(bool on);
 bool DepthPrepass();
+// Draws every room model (opaque and cut-out) once for depth only, then shaded
+// where the depth is equal, so hidden surfaces aren't shaded. Looks the same. On by default except
+// on Android, whose tiled GPUs already skip hidden opaque pixels and pay for the second vertex pass
+// (not saved).
+void SetOpaquePrepass(bool on);
+bool OpaquePrepass();
 // Scales the distances where an instance switches to a coarser level of detail (the
 // import's lods.bin): 1 is Remastered's own, 2 keeps the full model twice as far, 0 never
 // switches (MP_ROOM_GEO_LOD, the console's `roomgeo lod`). Merged copies keep the full one.

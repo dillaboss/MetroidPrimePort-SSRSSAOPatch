@@ -33,6 +33,12 @@
 #include "MetroidPrime/Player/CPlayerState.hpp"
 #include "rstl/math.hpp"
 
+#ifdef TARGET_PC
+#include "Kyoto/CResFactory.hpp"
+#include "Kyoto/Math/CQuaternion.hpp"
+#include "port_room_effects.h"
+#endif
+
 static const char* sBeaconLocator = "Beacon_LCTR";
 static const char* sRightGunLocator = "R_GUN_TOP_LCTR";
 static const char* sLeftGunLocator = "L_GUN_TOP_LCTR";
@@ -263,6 +269,16 @@ CDrone::CDrone(TUniqueId uid, const rstl::string& name, EFlavorType flavor, cons
   x460_knockBackController.SetLocomotionDuringElectrocution(true);
   MakeThermalColdAndHot();
   SetDrawShadow(x3fc_flavor != kFT_One);
+#ifdef TARGET_PC
+  // CDroneMP1GOC::Create (0xe943d8) builds the scanner effect (SLdr +0x8, d6a76aad).
+  if (const PortRoomEffects::ActorSlotEffect* const fx = PortRoomEffects::FindActorSlotEffect(
+          info.GetEditorId().value, PortRoomEffects::kActorSlotDroneScannerEffect)) {
+    if (gpResourceFactory->GetResourceTypeById(CAssetId(fx->part)) == 'PART') {
+      xPortScannerEffect =
+          rs_new CElementGen(gpSimplePool->GetObj(SObjectTag('PART', CAssetId(fx->part))));
+    }
+  }
+#endif
 }
 
 ENTITY_ACCEPT_IMPL(CDrone)
@@ -304,6 +320,20 @@ void CDrone::AcceptScriptMsg(EScriptObjectMessage msg, TUniqueId sender, CStateM
     x5cc_ = 0.f;
     x460_knockBackController.SetEnableFreeze(false);
     AddMaterial(kMT_AIJoint, mgr);
+#ifdef TARGET_PC
+    // CDroneMP1 makes no LaserLight: its scanner effect's own lights stand in for it
+    // (SetLightEnabled 0xe47cb8). A light the effect has goes up as an effect actor's does.
+    if (xPortScannerEffect.get()) {
+      if (xPortScannerEffect->SystemHasLight()) {
+        x578_lightId = mgr.AllocateUniqueId();
+        mgr.AddObject(rs_new CGameLight(x578_lightId, GetCurrentAreaId(), GetActive(),
+                                        rstl::string_l("ParticleLight_") + GetDebugName(),
+                                        GetTransform(), GetUniqueId(),
+                                        xPortScannerEffect->GetLight(), 0, 1, 0.f));
+      }
+      break;
+    }
+#endif
     x578_lightId = mgr.AllocateUniqueId();
     const CLight light(CLight::BuildPoint(CVector3f::Zero(), CColor::Red()));
     CGameLight* const laserLight = rs_new CGameLight(
@@ -467,7 +497,7 @@ void CDrone::FireProjectile(CStateManager& mgr, const CTransform4f& xf) {
 void CDrone::LaunchProjectile(const CTransform4f& xf, CStateManager& mgr) {
   static const CMaterialFilter filter = CMaterialFilter::MakeIncludeExclude(
       CMaterialList(kMT_Solid), CMaterialList(kMT_ProjectilePassthrough));
-  rstl::reserved_vector< TUniqueId, 1024 > nearList;
+  rstl::reserved_vector< TUniqueId, kMaxObjects > nearList;
   TUniqueId hitId = kInvalidUniqueId;
   mgr.BuildNearList(nearList, xf.GetTranslation(), xf.GetForward(), 100000.f, filter, this);
   const CRayCastResult result = mgr.RayWorldIntersection(
@@ -621,7 +651,7 @@ void CDrone::Think(float dt, CStateManager& mgr) {
     x66c_ -= dt;
   }
   if (IsAlive() && x835_25_) {
-    rstl::reserved_vector< TUniqueId, 1024 > nearList;
+    rstl::reserved_vector< TUniqueId, kMaxObjects > nearList;
     CAABox bounds = GetBoundingBox();
     bounds.AccumulateBounds(GetTranslation() + 20.f * CVector3f::Down());
     mgr.BuildNearList(nearList, GetBoundingBox(),
@@ -666,7 +696,7 @@ void CDrone::Patrol(CStateManager& mgr, EStateMsg msg, float dt) {
     x834_25_ = true;
     break;
   case kStateMsg_Update: {
-    rstl::reserved_vector< TUniqueId, 1024 > nearList;
+    rstl::reserved_vector< TUniqueId, kMaxObjects > nearList;
     BuildNearList(kMT_Character, kMT_Player, 5.f, nearList, mgr);
     if (!nearList.empty()) {
       const CActor* actor = static_cast< const CActor* >(mgr.GetObjectById(nearList[0]));
@@ -714,11 +744,30 @@ void CDrone::UpdateScanner(CStateManager& mgr, float dt) {
   const float x = 0.5f * CMath::FastCosR(x5d8_);
   const CVector3f scan(x, 1.f, 0.5f * CMath::FastSinR(2.05f * x5d8_));
   const CVector3f direction = GetTransform().Rotate(scan.AsNormalized());
+#ifdef TARGET_PC
+  // CDroneMP1::UpdateScanner (0xe498c0) casts no ray: the effect sits on the beacon, faces the
+  // scan direction, and updates.
+  if (xPortScannerEffect.get()) {
+    const CTransform4f beacon(GetLctrTransform(rstl::string_l(sBeaconLocator)));
+    xPortScannerEffect->SetGlobalTranslation(beacon.GetTranslation());
+    xPortScannerEffect->SetGlobalOrientation(
+        CQuaternion::LookAt(CUnitVector3f(CVector3f::Forward()), CUnitVector3f(direction),
+                            CRelAngle(M_2PIF))
+            .BuildTransform4f());
+    xPortScannerEffect->Update(dt);
+    if (x578_lightId != kInvalidUniqueId) {
+      if (CGameLight* light = TCastToPtr< CGameLight >(mgr.ObjectById(x578_lightId))) {
+        light->SetLight(xPortScannerEffect->GetLight());
+      }
+    }
+    return;
+  }
+#endif
   static const CMaterialFilter filter = CMaterialFilter::MakeIncludeExclude(
       CMaterialList(kMT_Solid), CMaterialList(kMT_ProjectilePassthrough));
   const CTransform4f beacon(GetLctrTransform(rstl::string_l(sBeaconLocator)));
   TUniqueId hitId = kInvalidUniqueId;
-  rstl::reserved_vector< TUniqueId, 1024 > nearList;
+  rstl::reserved_vector< TUniqueId, kMaxObjects > nearList;
   nearList.push_back(mgr.GetPlayer()->GetUniqueId());
   const CRayCastResult result = mgr.RayWorldIntersection(
       hitId, beacon.GetTranslation() + 0.2f * direction, direction, 10000.f, filter, nearList);
@@ -744,7 +793,7 @@ void CDrone::UpdateLaser(CStateManager& mgr, float dt) {
       CAABox bounds = CAABox::MakeMaxInvertedBox();
       bounds.AccumulateBounds(GetTranslation() + 1000.f * direction);
       bounds.AccumulateBounds(GetTranslation());
-      rstl::reserved_vector< TUniqueId, 1024 > nearList;
+      rstl::reserved_vector< TUniqueId, kMaxObjects > nearList;
       mgr.BuildNearList(nearList, bounds, filter, nullptr);
       const CRayCastResult result = mgr.RayWorldIntersection(
           hitId, beacon.GetTranslation() + 2.f * direction, direction, 10000.f, filter, nearList);
@@ -784,7 +833,7 @@ void CDrone::UpdateLaser(CStateManager& mgr, float dt) {
 
 static CRayCastResult FindBestCollision(const CStateManager& mgr, TUniqueId& hitId,
                                         const CVector3f& pos, const CVector3f& dir,
-                                        const rstl::reserved_vector< TUniqueId, 1024 >& nearList,
+                                        const rstl::reserved_vector< TUniqueId, kMaxObjects >& nearList,
                                         const CRayCastResult& initial) {
   CRayCastResult best = initial;
   float length = best.GetTime();
@@ -830,7 +879,7 @@ void CDrone::UpdateWaterRipples(CStateManager& mgr) {
   const CVector3f direction = -GetTransform().GetUp();
   CAABox bounds(GetBoundingBox());
   bounds.AccumulateBounds(GetBoundingBox().GetMinPoint() + -6.f * GetTransform().GetUp());
-  rstl::reserved_vector< TUniqueId, 1024 > nearList;
+  rstl::reserved_vector< TUniqueId, kMaxObjects > nearList;
   mgr.BuildNearList(nearList, bounds, nearFilter, nullptr);
   if (nearList.size() > 0) {
     TUniqueId hitId = kInvalidUniqueId;
@@ -880,7 +929,7 @@ bool CDrone::ShouldAttack(CStateManager& mgr, float) {
 }
 
 bool CDrone::HearShot(CStateManager& mgr, float) {
-  rstl::reserved_vector< TUniqueId, 1024 > nearList;
+  rstl::reserved_vector< TUniqueId, kMaxObjects > nearList;
   BuildNearList(kMT_Projectile, kMT_Player, 10.f, nearList, mgr);
   for (AUTO(it, nearList.begin()); it != nearList.end(); ++it) {
     if (const CWeapon* weapon = TCastToConstPtr< CWeapon >(mgr.GetObjectById(*it))) {
@@ -893,7 +942,7 @@ bool CDrone::HearShot(CStateManager& mgr, float) {
 }
 
 void CDrone::BuildNearList(EMaterialTypes includeMat, EMaterialTypes excludeMat, float radius,
-                           rstl::reserved_vector< TUniqueId, 1024 >& list, CStateManager& mgr) {
+                           rstl::reserved_vector< TUniqueId, kMaxObjects >& list, CStateManager& mgr) {
   const CVector3f pos = GetTranslation();
   const CVector3f extent(radius, radius, radius);
   const CAABox bounds(pos - extent, pos + extent);
@@ -1118,6 +1167,12 @@ void CDrone::Render(const CStateManager& mgr) const {
 
 void CDrone::AddToRenderer(const CFrustumPlanes& frustum, const CStateManager& mgr) const {
   CPatterned::AddToRenderer(frustum, mgr);
+#ifdef TARGET_PC
+  // CDroneMP1::AddToRenderer (0xe4b5b8): the scanner effect draws while scanning.
+  if (x834_25_ && xPortScannerEffect.get()) {
+    gpRender->AddParticleGen(*xPortScannerEffect);
+  }
+#endif
 }
 
 void CDrone::TargetPlayer(CStateManager& mgr, EStateMsg msg, float) {
@@ -1691,7 +1746,7 @@ void CDrone::Burn(float, float) {}
 
 void CDrone::AvoidOtherAIs(CStateManager& mgr) {
   if (BodyCtrl()->GetCurrentStateId() != pas::kAS_Step) {
-    rstl::reserved_vector< TUniqueId, 1024 > nearList;
+    rstl::reserved_vector< TUniqueId, kMaxObjects > nearList;
     BuildNearList(kMT_Character, kMT_Player, x61c_, nearList, mgr);
     if (nearList.size() > 0) {
       CVector3f nearestPos = CVector3f::Zero();

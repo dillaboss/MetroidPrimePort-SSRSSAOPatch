@@ -33,6 +33,7 @@
 #ifdef WEBGPU_DAWN
 #include "../dawn/TracyPlatform.hpp"
 #include <dawn/native/DawnNative.h>
+#include "../gfx/texture_sites.hpp"
 #endif
 
 namespace aurora::gx {
@@ -46,6 +47,8 @@ wgpu::Device g_device;
 wgpu::Queue g_queue;
 wgpu::Surface g_surface;
 wgpu::BackendType g_backendType;
+// Highest anisotropy the adapter gets, whatever the setting asks (set_quality, initialize).
+uint16_t g_anisotropyCap = 16;
 bool g_vulkanLibraryFailed = false;
 GraphicsConfig g_graphicsConfig;
 TextureWithSampler g_frameBuffer;
@@ -79,6 +82,7 @@ bool g_bcTexturesSupported = false;
 bool g_lightmapBinding = false;
 bool g_astcTexturesSupported = false;
 bool g_textureComponentSwizzleSupported = false;
+bool g_dualSourceBlendingSupported = false;
 static std::atomic_bool g_initialized = false;
 static std::atomic_bool g_vsyncEnabled = true;
 
@@ -330,6 +334,7 @@ TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool m
       .mipLevelCount = 1,
       .sampleCount = sampleCount,
   };
+  AURORA_NOTE_TEXTURE(&textureDescriptor);
   auto texture = g_device.CreateTexture(&textureDescriptor);
 
   constexpr wgpu::TextureViewDescriptor viewDescriptor{
@@ -368,7 +373,6 @@ uint32_t g_sceneHdrSamples = 0;
 // changes or release_scene_hdr_target() runs.
 wgpu::Extent3D g_sceneHdrFailedSize{};
 uint32_t g_sceneHdrFailedSamples = 0;
-bool g_sceneHdrNoCoreLogged = false;
 
 bool scene_hdr_handles_valid(const TextureWithSampler& target) noexcept {
   return target.texture && target.view && target.format == SceneHdrFormat;
@@ -436,7 +440,7 @@ bool create_scene_hdr_textures(uint32_t width, uint32_t height, std::string& err
 }
 } // namespace
 
-bool scene_hdr_supported() noexcept { return g_device && g_hasCoreFeatures; }
+bool scene_hdr_supported() noexcept { return static_cast<bool>(g_device); }
 
 bool ensure_scene_hdr_target() {
   const auto size = g_frameBuffer.size;
@@ -449,13 +453,6 @@ bool ensure_scene_hdr_target() {
   // Stale (other size or sample count) or partial: never reused.
   release_scene_hdr_textures();
   if (!g_device || size.width == 0 || size.height == 0) {
-    return false;
-  }
-  if (!g_hasCoreFeatures) {
-    if (!g_sceneHdrNoCoreLogged) {
-      g_sceneHdrNoCoreLogged = true;
-      Log.info("HDR scene target disabled: the device lacks CoreFeaturesAndLimits");
-    }
     return false;
   }
   if (g_sceneHdrFailedSamples == samples && g_sceneHdrFailedSize.width == size.width &&
@@ -471,6 +468,7 @@ bool ensure_scene_hdr_target() {
     return false;
   }
   g_sceneHdrSamples = samples;
+  Log.info("HDR scene target {}x{} ({} samples) allocated", size.width, size.height, samples);
   g_sceneHdrFailedSize = {};
   g_sceneHdrFailedSamples = 0;
   return true;
@@ -571,6 +569,7 @@ static TextureWithSampler create_depth_texture(uint32_t width, uint32_t height) 
       .mipLevelCount = 1,
       .sampleCount = g_graphicsConfig.msaaSamples,
   };
+  AURORA_NOTE_TEXTURE(&textureDescriptor);
   auto texture = g_device.CreateTexture(&textureDescriptor);
 
   const wgpu::TextureViewDescriptor viewDescriptor{
@@ -841,6 +840,11 @@ const TextureWithSampler& resample_present_source(const wgpu::CommandEncoder& en
   const auto& source = present_source();
   const uint32_t width = viewport_extent(viewport.width);
   const uint32_t height = viewport_extent(viewport.height);
+  // At the window's size both samplers return each texel as it is and nothing is sharpened,
+  // so the present blit reads the frame itself.
+  if (source.size.width == width && source.size.height == height) {
+    return source;
+  }
   if (!g_resampledFrameBuffer.view || g_resampledFrameBuffer.size.width != width ||
       g_resampledFrameBuffer.size.height != height || g_resampledFrameBuffer.format != source.format) {
     g_resampledFrameBuffer = create_render_texture(width, height, false);
@@ -1033,7 +1037,25 @@ static bool initialize_once(AuroraBackend auroraBackend, bool allowCpu) {
     // MP_GPU_POWER=low asks for the integrated GPU on a machine that also has a discrete one.
     const char* power = std::getenv("MP_GPU_POWER");
     const bool lowPower = power != nullptr && std::string_view{power} == "low";
+#ifdef WEBGPU_DAWN
+    // MP_GL_VERSION=3.3 runs desktop OpenGL as 3.3 core even on a newer driver, to try the
+    // 3.3 paths (GLSL 330, no compute) on hardware that has more.
+    const char* glVersion = std::getenv("MP_GL_VERSION");
+    const bool forceGL33 = backend == wgpu::BackendType::OpenGL && glVersion != nullptr &&
+                           std::string_view{glVersion} == "3.3";
+    static constexpr std::array adapterToggles{"gl_force_desktop_gl_33"};
+    const wgpu::DawnTogglesDescriptor adapterTogglesDescriptor{wgpu::DawnTogglesDescriptor::Init{
+        .enabledToggleCount = adapterToggles.size(),
+        .enabledToggles = adapterToggles.data(),
+    }};
+    if (forceGL33) {
+      Log.info("MP_GL_VERSION=3.3: forcing an OpenGL 3.3 core context");
+    }
+#endif
     const wgpu::RequestAdapterOptions options{
+#ifdef WEBGPU_DAWN
+        .nextInChain = forceGL33 ? &adapterTogglesDescriptor : nullptr,
+#endif
         .featureLevel = wgpu::FeatureLevel::Compatibility,
         .powerPreference = lowPower ? wgpu::PowerPreference::LowPower : wgpu::PowerPreference::HighPerformance,
         .backendType = backend,
@@ -1123,9 +1145,66 @@ static bool initialize_once(AuroraBackend auroraBackend, bool allowCpu) {
   {
     wgpu::Limits supportedLimits{};
     g_adapter.GetLimits(&supportedLimits);
+    // Texture vertex fetch (aurora::gfx::g_vertexFetchTexture): a GPU without vertex-stage storage
+    // buffers (OpenGL 3.3) reads the GX shaders' vertex and array data from R32Uint textures, which
+    // every stage can sample. AURORA_VERTEX_FETCH_TEXTURE=1 forces it; otherwise the adapter's own
+    // compatibility-mode limit decides. Fixed for the life of the device, so the generated WGSL and
+    // the bind group layout agree with it.
+    uint32_t adapterVertexStorageBuffers = WGPU_LIMIT_U32_UNDEFINED;
+    {
+      wgpu::Limits probeLimits{};
+      wgpu::CompatibilityModeLimits probeCompatibility{wgpu::CompatibilityModeLimits::Init{}};
+      probeLimits.nextInChain = &probeCompatibility;
+      g_adapter.GetLimits(&probeLimits);
+      adapterVertexStorageBuffers = probeCompatibility.maxStorageBuffersInVertexStage;
+    }
+    const char* forceFetchTexture = std::getenv("AURORA_VERTEX_FETCH_TEXTURE");
+    const bool forced = forceFetchTexture != nullptr && forceFetchTexture[0] == '1' && forceFetchTexture[1] == '\0';
+    const bool adapterHasNone = adapterVertexStorageBuffers != WGPU_LIMIT_U32_UNDEFINED &&
+                                adapterVertexStorageBuffers < 2;
+    gfx::g_vertexFetchTexture = forced || adapterHasNone;
+    if (gfx::g_vertexFetchTexture) {
+      Log.info("Vertex data from textures instead of vertex-stage storage buffers ({})",
+               forced ? "AURORA_VERTEX_FETCH_TEXTURE=1"
+                      : fmt::format("the adapter allows {} of them", adapterVertexStorageBuffers));
+    } else {
+      if (adapterVertexStorageBuffers == WGPU_LIMIT_U32_UNDEFINED) {
+        Log.info("Vertex data from storage buffers (the adapter does not report vertex-stage storage buffers)");
+      } else {
+        Log.info("Vertex data from storage buffers (the adapter allows {} vertex-stage storage buffers)",
+                 adapterVertexStorageBuffers);
+      }
+    }
+    // Compute (aurora::gfx::g_noCompute): OpenGL 3.3 has no compute shaders, so the volumetric fog's
+    // froxels and the depth peek run as render passes with the same per-pixel math instead
+    // (gfx/volfog.cpp, gfx/depth_peek.cpp). AURORA_NO_COMPUTE=1 forces them; otherwise the adapter's
+    // own limits decide, as a device without compute reports no workgroups or no invocations.
+    const char* forceNoCompute = std::getenv("AURORA_NO_COMPUTE");
+    const bool noComputeForced = forceNoCompute != nullptr && forceNoCompute[0] == '1' && forceNoCompute[1] == '\0';
+    const bool adapterNoCompute =
+        supportedLimits.maxComputeWorkgroupsPerDimension == 0 || supportedLimits.maxComputeInvocationsPerWorkgroup == 0;
+    gfx::g_noCompute = noComputeForced || adapterNoCompute;
+    if (gfx::g_noCompute) {
+      Log.info("No compute shaders ({}): the volumetric fog froxels and the depth peek use render passes",
+               noComputeForced ? "AURORA_NO_COMPUTE=1"
+                               : fmt::format("the adapter allows {} workgroups per dimension and {} invocations "
+                                             "per workgroup",
+                                             supportedLimits.maxComputeWorkgroupsPerDimension,
+                                             supportedLimits.maxComputeInvocationsPerWorkgroup));
+    }
+    // An OpenGL adapter without compute shaders is GL < 4.3 hardware (Intel gen4-7 such as HD Graphics
+    // 3000, issue #202): 16x anisotropic filtering costs those far more texture bandwidth than 4x does.
+    const bool openGL = g_backendType == wgpu::BackendType::OpenGL || g_backendType == wgpu::BackendType::OpenGLES;
+    g_anisotropyCap = openGL && adapterNoCompute ? 4 : 16;
+    if (g_anisotropyCap < 16) {
+      Log.info("Anisotropic filtering capped at {}x (OpenGL adapter without compute shaders)", g_anisotropyCap);
+    }
+    // Storage buffers hold the vertex data and feed the compute passes; with both on their fallbacks
+    // nothing binds one, so require none (OpenGL 3.3 has no shader storage buffers at all).
+    const bool needStorageBuffers = !gfx::g_vertexFetchTexture || !gfx::g_noCompute;
     wgpu::CompatibilityModeLimits compatibilityModeLimits{wgpu::CompatibilityModeLimits::Init{
-        .maxStorageBuffersInVertexStage = 2,
-        .maxStorageBuffersInFragmentStage = 2,
+        .maxStorageBuffersInVertexStage = gfx::g_vertexFetchTexture ? 0u : 2u,
+        .maxStorageBuffersInFragmentStage = gfx::g_vertexFetchTexture ? 0u : 2u,
     }};
     const wgpu::Limits requiredLimits{
         .nextInChain = &compatibilityModeLimits,
@@ -1141,8 +1220,8 @@ static bool initialize_once(AuroraBackend auroraBackend, bool allowCpu) {
         .maxSampledTexturesPerShaderStage = supportedLimits.maxSampledTexturesPerShaderStage >= 17
                                                 ? 17
                                                 : WGPU_LIMIT_U32_UNDEFINED,
-        .maxStorageBuffersPerShaderStage = 2,
-        .maxStorageBufferBindingSize = supportedLimits.maxStorageBufferBindingSize == 0
+        .maxStorageBuffersPerShaderStage = needStorageBuffers ? 2u : WGPU_LIMIT_U32_UNDEFINED,
+        .maxStorageBufferBindingSize = !needStorageBuffers || supportedLimits.maxStorageBufferBindingSize == 0
                                            ? WGPU_LIMIT_U64_UNDEFINED
                                            : supportedLimits.maxStorageBufferBindingSize,
         .minUniformBufferOffsetAlignment =
@@ -1223,19 +1302,34 @@ static bool initialize_once(AuroraBackend auroraBackend, bool allowCpu) {
     g_bcTexturesSupported = false;
     g_astcTexturesSupported = false;
     g_textureComponentSwizzleSupported = false;
+    g_dualSourceBlendingSupported = false;
     for (size_t i = 0; i < supportedFeatures.featureCount; ++i) {
       const auto feature = supportedFeatures.features[i];
       if (feature == wgpu::FeatureName::CoreFeaturesAndLimits || feature == wgpu::FeatureName::TextureCompressionBC ||
           feature == wgpu::FeatureName::TextureCompressionASTC ||
-          feature == wgpu::FeatureName::TextureComponentSwizzle) {
+          feature == wgpu::FeatureName::TextureComponentSwizzle || feature == wgpu::FeatureName::DualSourceBlending) {
         if (feature == wgpu::FeatureName::CoreFeaturesAndLimits) {
+          // MP_GPU_NO_CORE=1 leaves it out, so Dawn validates the device as a Compatibility one
+          // (to test those paths on a Vulkan desktop).
+          if (const char* noCore = std::getenv("MP_GPU_NO_CORE"); noCore != nullptr && noCore[0] == '1') {
+            Log.info("MP_GPU_NO_CORE=1: not requesting CoreFeaturesAndLimits");
+            continue;
+          }
           g_hasCoreFeatures = true;
         } else if (feature == wgpu::FeatureName::TextureCompressionBC) {
+          // AURORA_NO_BC=1 leaves it out, so CMPR is decoded to RGBA8 on the CPU (to tell a driver's
+          // broken compressed uploads apart from other texture faults).
+          if (const char* noBc = std::getenv("AURORA_NO_BC"); noBc != nullptr && noBc[0] == '1') {
+            Log.info("AURORA_NO_BC=1: not requesting TextureCompressionBC");
+            continue;
+          }
           g_bcTexturesSupported = true;
         } else if (feature == wgpu::FeatureName::TextureCompressionASTC) {
           g_astcTexturesSupported = true;
         } else if (feature == wgpu::FeatureName::TextureComponentSwizzle) {
           g_textureComponentSwizzleSupported = true;
+        } else if (feature == wgpu::FeatureName::DualSourceBlending) {
+          g_dualSourceBlendingSupported = true;
         }
         requiredFeatures.push_back(feature);
       }
@@ -1243,6 +1337,14 @@ static bool initialize_once(AuroraBackend auroraBackend, bool allowCpu) {
       if (feature == wgpu::FeatureName::TimestampQuery) {
         requiredFeatures.push_back(feature);
       }
+#ifdef WEBGPU_DAWN
+      // The game thread creates textures and buffers (room env volumes, lightmaps, spilled uploads)
+      // while the render worker submits. Without this Dawn takes no device lock: its Vulkan memory
+      // allocator and pending command buffer would be shared between the two threads unguarded.
+      if (feature == wgpu::FeatureName::ImplicitDeviceSynchronization) {
+        requiredFeatures.push_back(feature);
+      }
+#endif
     }
     std::string featureList;
     for (auto featureName : requiredFeatures) {
@@ -1285,28 +1387,47 @@ static bool initialize_once(AuroraBackend auroraBackend, bool allowCpu) {
         // Upstream aurora bded88e9: https://github.com/TwilitRealm/dusklight/issues/2563
         "use_spirv_reconvergence_mode",
     };
-    // Extra toggles for driver debugging: MP_DAWN_ENABLE / MP_DAWN_DISABLE, comma-separated.
-    static std::deque<std::string> envToggles;
-    envToggles.clear();
-    for (const auto& [name, list] : {std::pair{"MP_DAWN_ENABLE", &enableToggles},
-                                     std::pair{"MP_DAWN_DISABLE", &disableToggles}}) {
-      const char* value = std::getenv(name);
+    // Extra toggles, comma-separated: the application's driver workarounds (AuroraConfig), then
+    // MP_DAWN_ENABLE / MP_DAWN_DISABLE for driver debugging. A later source wins: a toggle is taken
+    // out of the other list, so turning off one of the defaults above (skip_validation) works.
+    // The application's d3d11_* toggles only go to a D3D11 device; the variables pass as given.
+    static std::deque<std::string> extraToggles;
+    extraToggles.clear();
+    const auto addToggles = [&](const char* source, const char* value, bool enable, bool fromConfig) {
+      auto& list = enable ? enableToggles : disableToggles;
+      auto& other = enable ? disableToggles : enableToggles;
       for (std::string_view rest = value != nullptr ? value : ""; !rest.empty();) {
         const size_t comma = rest.find(',');
         if (comma != 0) {
-          list->push_back(envToggles.emplace_back(rest.substr(0, comma)).c_str());
-          Log.info("{}: {}", name, envToggles.back());
+          const std::string_view name = rest.substr(0, comma);
+          if (fromConfig && name.starts_with("d3d11_") && g_backendType != wgpu::BackendType::D3D11) {
+            Log.info("{}: {} (ignored: not Direct3D 11)", source, name);
+          } else {
+            std::erase_if(other, [name](const char* t) { return name == t; });
+            if (std::none_of(list.begin(), list.end(), [name](const char* t) { return name == t; })) {
+              list.push_back(extraToggles.emplace_back(name).c_str());
+            }
+            Log.info("{}: {}", source, name);
+          }
         }
         rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
       }
-    }
-    // GL is only the fallback for drivers that draw wrong on Vulkan, so it runs without
-    // Dawn's blob cache: cached program binaries crashed Mesa in glProgramBinary.
+    };
+    addToggles("driver workaround on", g_config.dawnEnableToggles, true, true);
+    addToggles("driver workaround off", g_config.dawnDisableToggles, false, true);
+    addToggles("MP_DAWN_ENABLE", std::getenv("MP_DAWN_ENABLE"), true, false);
+    addToggles("MP_DAWN_DISABLE", std::getenv("MP_DAWN_DISABLE"), false, false);
+    // GL runs without Dawn's blob cache where Mesa drives it: cached program binaries crashed
+    // Mesa in glProgramBinary. Windows desktop GL (vendor drivers) keeps it, or every launch
+    // recompiles every pipeline (about 40 ms each there).
+#if _WIN32
+    const bool glWithoutCache = g_backendType == wgpu::BackendType::OpenGLES;
+#else
+    const bool glWithoutCache =
+        g_backendType == wgpu::BackendType::OpenGLES || g_backendType == wgpu::BackendType::OpenGL;
+#endif
     wgpu::DawnTogglesDescriptor togglesDescriptor(wgpu::DawnTogglesDescriptor::Init{
-        .nextInChain = g_backendType == wgpu::BackendType::OpenGLES ||
-                               g_backendType == wgpu::BackendType::OpenGL
-                           ? nullptr
-                           : &cacheDescriptor,
+        .nextInChain = glWithoutCache ? nullptr : &cacheDescriptor,
         .enabledToggleCount = enableToggles.size(),
         .enabledToggles = enableToggles.data(),
         .disabledToggleCount = disableToggles.size(),
@@ -1409,7 +1530,7 @@ static bool initialize_once(AuroraBackend auroraBackend, bool allowCpu) {
           },
       .depthFormat = wgpu::TextureFormat::Depth32Float,
       .msaaSamples = g_config.msaa,
-      .textureAnisotropy = g_config.maxTextureAnisotropy,
+      .textureAnisotropy = std::min(g_config.maxTextureAnisotropy, g_anisotropyCap),
   };
   create_copy_pipeline();
   create_resample_pipeline();
@@ -1574,14 +1695,16 @@ void resize_swapchain(uint32_t width, uint32_t height, uint32_t nativeWidth, uin
 void set_quality(uint32_t msaaSamples, uint16_t anisotropy) {
   msaaSamples = msaaSamples >= 4 ? 4 : 1; // WebGPU only guarantees 1x and 4x
   anisotropy = std::clamp<uint16_t>(anisotropy, 1, 16);
+  const uint16_t effectiveAnisotropy = std::min(anisotropy, g_anisotropyCap);
   const bool msaaChanged = msaaSamples != g_graphicsConfig.msaaSamples;
-  if (!msaaChanged && anisotropy == g_graphicsConfig.textureAnisotropy) {
+  if (!msaaChanged && effectiveAnisotropy == g_graphicsConfig.textureAnisotropy) {
+    g_config.maxTextureAnisotropy = anisotropy;
     return;
   }
   gfx::gpu_synchronize();
   g_config.msaa = msaaSamples;
   g_config.maxTextureAnisotropy = anisotropy;
-  g_graphicsConfig.textureAnisotropy = anisotropy;
+  g_graphicsConfig.textureAnisotropy = effectiveAnisotropy;
   // Cached bind groups hold samplers built for the old anisotropy and views of
   // the old framebuffers.
   gfx::clear_caches();

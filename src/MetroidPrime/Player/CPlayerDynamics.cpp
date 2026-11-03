@@ -1,5 +1,6 @@
 #include "MetroidPrime/Player/CPlayer.hpp"
 #include "port_debug.h"
+#include "port_motion_watch.h"
 #include "port_mouse.h"
 
 #include "MetroidPrime/Player/CGameState.hpp"
@@ -75,7 +76,41 @@ static bool RemasteredJump(const CPlayer& player, const CStateManager& mgr) {
 static bool sStickFrame = false;
 static float sStickRight = 0.f;
 static float sStickForward = 1.f;
+// The Dodge action (issue #236): retail's sideways dash, also without a lock-on
+// target. Not locked on, a press on the ground while strafing starts a jump (kDodgeHop); the
+// next tick starts the dash as a tapped jump does in ComputeDash, and it moves
+// in a straight line along the body's right axis at that moment, at the dash's
+// speeds, until it lands or times out (kDodgeDash).
+enum EDodgePhase { kDodgeNone, kDodgeHop, kDodgeDash };
+static EDodgePhase sDodgePhase = kDodgeNone;
+static float sDodgeStrafe = 0.f;
+static CVector3f sDodgeRight = CVector3f(1.f, 0.f, 0.f);
+static CVector3f sDodgeForward = CVector3f(0.f, 1.f, 0.f);
+// Locked on, a Dodge press does what a jump tapped while strafing does: it
+// starts the jump, and ComputeDash starts retail's dash on the same tick.
+static bool sDodgeOrbitDash = false;
 #endif
+
+// walk_speed (PortDebug::WalkSpeed): on foot, the top speed, the acceleration and
+// the friction are scaled together, so the force law closes the same fraction of
+// the gap each tick and the speed it settles at (and every clamp) is k times
+// retail's, reached in the same time. At 100 the factor is exactly 1.
+static float WalkScale() {
+#ifdef TARGET_PC
+  return static_cast< float >(PortDebug::WalkSpeed()) / 100.f;
+#else
+  return 1.f;
+#endif
+}
+static float WalkMaxSpeed(CPlayer::ESurfaceRestraints s) {
+  return gpTweakPlayer->GetPlayerTranslationMaxSpeed(s) * WalkScale();
+}
+static float WalkFriction(CPlayer::ESurfaceRestraints s) {
+  return gpTweakPlayer->GetPlayerTranslationFriction(s) * WalkScale();
+}
+static float WalkAcceleration(CPlayer::ESurfaceRestraints s) {
+  return gpTweakPlayer->GetMaxTranslationalAcceleration(s) * WalkScale();
+}
 
 static const CMaterialList BallTransitionInclude = CMaterialList(kMT_Solid);
 static const CMaterialList BallTransitionExclude =
@@ -114,7 +149,7 @@ CVector3f CPlayer::GetDampedClampedVelocityWR() const {
     // Like an orbit, a grapple jump's flight is only clamped.
     const bool grappleJump =
         x258_movementState != NPlayer::kMS_OnGround && x3d8_grappleJumpTimeout > 0.f;
-    const float maxSpeed = gpTweakPlayer->GetPlayerTranslationMaxSpeed(GetSurfaceRestraint());
+    const float maxSpeed = WalkMaxSpeed(GetSurfaceRestraint());
     if (grappleJump) {
       planarVelocity.SetY(CMath::Limit(planarVelocity.GetY(), maxSpeed));
     } else if (speed > 1e-14f) {
@@ -125,7 +160,7 @@ CVector3f CPlayer::GetDampedClampedVelocityWR() const {
         newSpeed = speed * CMath::PowF(CMath::Max(0.f, 1.f - 3.5f / GetMass()), tickScale);
       } else {
         newSpeed = CMath::Max(
-            0.f, speed - gpTweakPlayer->GetPlayerTranslationFriction(GetSurfaceRestraint()) *
+            0.f, speed - WalkFriction(GetSurfaceRestraint()) *
                              tickScale);
       }
       // Remastered clamps the planar speed as a whole (0xcee29c). A scan dash's
@@ -158,7 +193,7 @@ CVector3f CPlayer::GetDampedClampedVelocityWR() const {
     // The tweak friction is authored per 60 Hz tick. Scale it by the actual
     // simulation step or higher rates decelerate proportionally faster (which
     // is why walking, but not the friction-free jump, slowed down).
-    const float friction = gpTweakPlayer->GetPlayerTranslationFriction(GetSurfaceRestraint()) *
+    const float friction = WalkFriction(GetSurfaceRestraint()) *
                            (PortDebug::TickPeriod() * 60.f);
     if (localVelocity.GetY() > 0.f) {
       localVelocity.SetY(CMath::Max(0.f, localVelocity.GetY() - friction));
@@ -182,7 +217,7 @@ CVector3f CPlayer::GetDampedClampedVelocityWR() const {
   // Only forward speed is capped, as retail, under mouse aim too: sideways
   // momentum past walking speed (a scan dash whose lock broke mid-air) must
   // carry (issue #30). Free strafing stays within the cap through its force law.
-  const float maxSpeed = gpTweakPlayer->GetPlayerTranslationMaxSpeed(GetSurfaceRestraint());
+  const float maxSpeed = WalkMaxSpeed(GetSurfaceRestraint());
   localVelocity.SetY(CMath::Limit(localVelocity.GetY(), maxSpeed));
   if (x258_movementState == NPlayer::kMS_OnGround) {
     localVelocity.SetZ(0.f);
@@ -311,12 +346,23 @@ void CPlayer::ComputeDash(const CFinalInput& input, float dt, CStateManager& mgr
     return;
   }
   CVector3f useOrbitToPlayer = orbitToPlayer;
-  float strafeVelocity = dt * skStrafeDistances[GetSurfaceRestraint()];
+  // walk_speed scales the orbit strafe and forward speeds and the acceleration
+  // toward them; a sideways dash keeps retail's speeds and acceleration.
+  float strafeVelocity = dt * (skStrafeDistances[GetSurfaceRestraint()] * WalkScale());
   if (ControlMapper::GetDigitalInput(ControlMapper::kC_JumpOrBoost, input)) {
     x388_dashButtonHoldTime += dt;
   }
   if (!x37c_sidewaysDashing) {
+#ifdef TARGET_PC
+    const bool dodge = sDodgeOrbitDash && !x9c5_28_slidingOnWall && !x9c5_29_hitWall &&
+                       x304_orbitState == kOS_OrbitObject &&
+                       CMath::AbsF(strafeInput) >= CMath::AbsF(forwardInput) &&
+                       CMath::AbsF(strafeInput) > gpTweakPlayer->GetDashStrafeInputThreshold();
+    sDodgeOrbitDash = false;
+    if (dodge || SidewaysDashAllowed(strafeInput, forwardInput, input, mgr)) {
+#else
     if (SidewaysDashAllowed(strafeInput, forwardInput, input, mgr)) {
+#endif
       x37c_sidewaysDashing = true;
       x380_strafeInputAtDash = strafeInput;
       x38c_doneSidewaysDashing = true;
@@ -374,7 +420,8 @@ void CPlayer::ComputeDash(const CFinalInput& input, float dt, CStateManager& mgr
     x388_dashButtonHoldTime = 0.f;
   }
 
-  strafeVelocity = dt * (forwardInput * skOrbitForwardDistances[GetSurfaceRestraint()]);
+  strafeVelocity =
+      dt * (forwardInput * (skOrbitForwardDistances[GetSurfaceRestraint()] * WalkScale()));
   orbitPoint += strafeVelocity * -useOrbitToPlayer.AsNormalized();
   const CVector2f flatVelocity(GetVelocityWR().GetX(), GetVelocityWR().GetY());
   const float flatVelocityY = flatVelocity.GetY();
@@ -384,7 +431,8 @@ void CPlayer::ComputeDash(const CFinalInput& input, float dt, CStateManager& mgr
   velocityDelta.SetZ(0.f);
   const float deltaMagnitude = velocityDelta.Magnitude();
   if (deltaMagnitude > FLT_EPSILON) {
-    const float acceleration = dt * GetAcceleration();
+    const float acceleration =
+        dt * (GetAcceleration() * (x37c_sidewaysDashing ? 1.f : WalkScale()));
     const float accelerationBlend = CMath::Limit(deltaMagnitude / acceleration, 1.f);
     newVelocity =
         GetVelocityWR() + accelerationBlend * (acceleration * (velocityDelta / deltaMagnitude));
@@ -395,12 +443,80 @@ void CPlayer::ComputeDash(const CFinalInput& input, float dt, CStateManager& mgr
 }
 
 void CPlayer::ComputeMovement(const CFinalInput& input, CStateManager& mgr, float dt) {
+#ifdef TARGET_PC
+  // A Dodge press is held for a short window (PortDebug::TakeDodgeRequest), so it
+  // is only taken once the strafe input and the ground allow it, as
+  // SidewaysDashAllowed asks of a dash.
+  bool dodgePressed = false;
+  sDodgeOrbitDash = false;
+  const bool lockedOn = x304_orbitState == kOS_OrbitObject;
+  if (sDodgePhase == kDodgeNone && (x304_orbitState == kOS_NoOrbit || lockedOn) &&
+      x258_movementState == NPlayer::kMS_OnGround && !IsMorphBallTransitioning() &&
+      gpTweakPlayer->GetDashEnabled() && !x9c5_28_slidingOnWall && !x9c5_29_hitWall) {
+    const float strafe = ControlMapper::GetAnalogInput(ControlMapper::kC_StrafeRight, input) -
+                         ControlMapper::GetAnalogInput(ControlMapper::kC_StrafeLeft, input);
+    const float forward = ControlMapper::GetAnalogInput(ControlMapper::kC_Forward, input) -
+                          ControlMapper::GetAnalogInput(ControlMapper::kC_Backward, input);
+    CVector3f right = GetTransform().GetRight();
+    right.SetZ(0.f);
+    if (CMath::AbsF(strafe) >= CMath::AbsF(forward) &&
+        CMath::AbsF(strafe) > gpTweakPlayer->GetDashStrafeInputThreshold() &&
+        right.CanBeNormalized() && PortDebug::TakeDodgeRequest()) {
+      SetMoveState(NPlayer::kMS_Jump, mgr);
+      if (lockedOn) {
+        sDodgeOrbitDash = true;
+      } else {
+        sDodgePhase = kDodgeHop;
+        dodgePressed = true;
+      }
+      sDodgeStrafe = strafe;
+      sDodgeRight = right.AsNormalized();
+      sDodgeForward = CVector3f(-sDodgeRight.GetY(), sDodgeRight.GetX(), 0.f);
+    }
+  }
+#endif
   const float jumpInput = JumpInput(input, mgr);
   const bool mouseMovement = MouseControlsAllowed(mgr) && x304_orbitState == kOS_NoOrbit;
 #ifdef TARGET_PC
+  if (sDodgePhase != kDodgeNone && !dodgePressed) {
+    const bool stop = x258_movementState == NPlayer::kMS_OnGround ||
+                      x304_orbitState != kOS_NoOrbit || IsMorphBallTransitioning() ||
+                      GetPlayerIsSlidingOnWall() || x9c5_29_hitWall;
+    if (sDodgePhase == kDodgeHop) {
+      if (stop) {
+        sDodgePhase = kDodgeNone;
+      } else {
+        // ComputeDash's start, a tick into the jump as a tapped jump is.
+        sDodgePhase = kDodgeDash;
+        x37c_sidewaysDashing = true;
+        x380_strafeInputAtDash = sDodgeStrafe;
+        x38c_doneSidewaysDashing = true;
+        x384_dashTimer = 0.f;
+        CVector3f velocity = GetVelocityWR();
+        if (velocity.GetZ() > 0.f) {
+          velocity[kDZ] *= 0.1f;
+          SetVelocityWR(velocity);
+          x778_dashSfx = CSfxManager::SfxStart(SFXsam_b_jump_03, 127, 64, true);
+          DoSfxEffects(x778_dashSfx);
+          mgr.GetRumbleManager()->Rumble(mgr, kRFX_PlayerBump, 0.24375f, kRP_One);
+        }
+      }
+    } else {
+      x384_dashTimer += dt;
+      if (stop || !x37c_sidewaysDashing || x384_dashTimer >= x3a0_dashDuration) {
+        FinishSidewaysDash();
+        CSfxManager::RemoveEmitter(x778_dashSfx);
+        sDodgePhase = kDodgeNone;
+        // The rest of the airtime carries the dash's speed, as after an orbit.
+        if (x258_movementState != NPlayer::kMS_OnGround) {
+          sOrbitAirCarry = true;
+        }
+      }
+    }
+  }
   if (x258_movementState == NPlayer::kMS_OnGround) {
     sOrbitAirCarry = false;
-  } else if (x304_orbitState != kOS_NoOrbit) {
+  } else if (x304_orbitState != kOS_NoOrbit || sDodgePhase != kDodgeNone) {
     sOrbitAirCarry = true;
   }
   sPlanarMovement = RemasteredJump(*this, mgr) && !sOrbitAirCarry;
@@ -451,8 +567,9 @@ void CPlayer::ComputeMovement(const CFinalInput& input, CStateManager& mgr, floa
 #endif
 #ifdef TARGET_PC
   // A fast morph carries its velocity through without friction (gravity still
-  // applies through JumpInput). A fast unmorph is instant.
-  if (!IsMorphBallTransitioning() || !IsFastMorphTransition())
+  // applies through JumpInput). A fast unmorph is instant. A Dodge sets its own
+  // velocity, as an orbit dash does without the free-movement friction.
+  if (sDodgePhase != kDodgeDash && (!IsMorphBallTransitioning() || !IsFastMorphTransition()))
 #endif
   SetVelocityWR(GetDampedClampedVelocityWR());
   float turnSpeedMultiplier = gpTweakPlayer->GetTurnSpeedMultiplier();
@@ -510,11 +627,11 @@ void CPlayer::ComputeMovement(const CFinalInput& input, CStateManager& mgr, floa
 #endif
   float forwardForce;
   if (!close_enough(0.f, forwardInput)) {
-    const float maxSpeed = gpTweakPlayer->GetPlayerTranslationMaxSpeed(GetSurfaceRestraint());
-    const float friction = gpTweakPlayer->GetPlayerTranslationFriction(GetSurfaceRestraint());
+    const float maxSpeed = WalkMaxSpeed(GetSurfaceRestraint());
+    const float friction = WalkFriction(GetSurfaceRestraint());
     const float mass = GetMass();
     const float acceleration =
-        gpTweakPlayer->GetMaxTranslationalAcceleration(GetSurfaceRestraint());
+        WalkAcceleration(GetSurfaceRestraint());
     float frictionSpeed = friction * mass / (dt * acceleration);
     frictionSpeed *= maxSpeed;
 #ifdef TARGET_PC
@@ -535,7 +652,7 @@ void CPlayer::ComputeMovement(const CFinalInput& input, CStateManager& mgr, floa
         -1.f, (desiredSpeed - GetTransform().TransposeRotate(GetVelocityWR()).GetY()) / maxSpeed,
         1.f);
     forwardForce =
-        forwardFraction * gpTweakPlayer->GetMaxTranslationalAcceleration(GetSurfaceRestraint());
+        forwardFraction * WalkAcceleration(GetSurfaceRestraint());
 #ifdef TARGET_PC
     forwardForce *= law.gain;
 #endif
@@ -556,13 +673,13 @@ void CPlayer::ComputeMovement(const CFinalInput& input, CStateManager& mgr, floa
       const float directionX = strafeInput / magnitude;
       const float directionY = forwardInput / magnitude;
       const float acceleration =
-          gpTweakPlayer->GetMaxTranslationalAcceleration(GetSurfaceRestraint());
-      const float maxSpeed = gpTweakPlayer->GetPlayerTranslationMaxSpeed(GetSurfaceRestraint());
+          WalkAcceleration(GetSurfaceRestraint());
+      const float maxSpeed = WalkMaxSpeed(GetSurfaceRestraint());
       const CVector3f localVelocity = GetTransform().TransposeRotate(GetVelocityWR());
       const float along = directionX * localVelocity.GetX() + directionY * localVelocity.GetY();
       float planarForce = PortMouse::AxisForce(
           magnitude, along, maxSpeed,
-          gpTweakPlayer->GetPlayerTranslationFriction(GetSurfaceRestraint()), GetMass(), dt,
+          WalkFriction(GetSurfaceRestraint()), GetMass(), dt,
           acceleration, tickScale, sPlanarMovement || frictionApplied);
       // Retail has no sideways force, so moving the way a dash carries the
       // player must not brake its momentum back to walking speed (issue #30).
@@ -577,6 +694,45 @@ void CPlayer::ComputeMovement(const CFinalInput& input, CStateManager& mgr, floa
   if (x304_orbitState != kOS_NoOrbit && gkFreeLookPreventsOrbitMovement && x3dd_lookButtonHeld) {
     forwardForce = 0.f;
   }
+#ifdef TARGET_PC
+  if (sDodgePhase == kDodgeDash) {
+    // ComputeDash's speeds and acceleration along the captured axes: the walk
+    // strafe speed on its first tick, then the dash speed blended down to it.
+    const ESurfaceRestraints restraint = GetSurfaceRestraint();
+    float strafeSpeed = skStrafeDistances[restraint] * WalkScale() * sDodgeStrafe;
+    if (x384_dashTimer > 0.f) {
+      if (x39c_noStrafeDashBlend) {
+        const ESurfaceRestraints dashRestraint =
+            x2b0_outOfWaterTicks == 2 ? GetCurrentSurfaceRestraint() : kSR_Water;
+        strafeSpeed = x398_dashSpeedMultiplier * skDashStrafeDistances[dashRestraint];
+      } else {
+        const float blend = 1.f - CMath::Limit(x384_dashTimer / x3a4_strafeDashBlendDuration, 1.f);
+        strafeSpeed = x398_dashSpeedMultiplier *
+                      ((skDashStrafeDistances[restraint] - skStrafeDistances[restraint]) * blend +
+                       skStrafeDistances[restraint]);
+      }
+      if (x380_strafeInputAtDash < 0.f) {
+        strafeSpeed = -strafeSpeed;
+      }
+    }
+    const float forwardSpeed = forwardInput * (skOrbitForwardDistances[restraint] * WalkScale());
+    const CVector3f target = sDodgeRight * strafeSpeed + sDodgeForward * forwardSpeed;
+    CVector3f velocityDelta = target - CVector3f(GetVelocityWR().GetX(), GetVelocityWR().GetY(), 0.f);
+    velocityDelta.SetZ(0.f);
+    const float deltaMagnitude = velocityDelta.Magnitude();
+    if (deltaMagnitude > FLT_EPSILON && !GetPlayerIsSlidingOnWall()) {
+      const float acceleration = dt * GetAcceleration();
+      const float accelerationBlend = CMath::Limit(deltaMagnitude / acceleration, 1.f);
+      SetVelocityWR(GetVelocityWR() +
+                    accelerationBlend * (acceleration * (velocityDelta / deltaMagnitude)));
+    }
+    ApplyForceOR(CVector3f(0.f, 0.f, jumpInput), CAxisAngle::Identity());
+    if (turnInput != 0.f) {
+      ApplyForceOR(CVector3f::Zero(),
+                   CAxisAngle(CUnitVector3f(0.f, 0.f, 1.f, CUnitVector3f::kN_Yes), turnInput));
+    }
+  } else
+#endif
   if (x304_orbitState == kOS_NoOrbit || x3dd_lookButtonHeld) {
     const CVector3f force(strafeForce, forwardForce, jumpInput);
     ApplyForceOR(force, CAxisAngle::Identity());
@@ -618,7 +774,7 @@ void CPlayer::ComputeMovement(const CFinalInput& input, CStateManager& mgr, floa
           CVector3f::Zero() - CVector3f(GetVelocityWR().GetX(), GetVelocityWR().GetY(), 0.f);
       const float magnitude = reverseVelocity.Magnitude();
       if (magnitude > FLT_EPSILON) {
-        const float acceleration = 0.2f * (dt * GetAcceleration());
+        const float acceleration = 0.2f * (dt * (GetAcceleration() * WalkScale()));
         const float damping = CMath::Limit(magnitude / acceleration, 1.f);
         const CVector3f newVelocity =
             GetVelocityWR() + damping * (acceleration * (reverseVelocity / magnitude));
@@ -1133,15 +1289,32 @@ float CPlayer::GetBallMaxVelocity() const {
   return gpTweakBall->GetBallTranslationMaxSpeed(GetSurfaceRestraint());
 }
 
+#ifdef TARGET_PC
+// The top speed the retail force law settles at depends on the tick: f*m*vmax/(A*dt)
+// grows as dt shrinks, and from about 100 Hz on it goes negative, so the footsteps
+// (which divide the speed by it) went silent and the camera bob stopped (issue #248).
+// Off 60 Hz the movement keeps the 60 Hz equilibrium (PortMouse::ForceLawAtRate) and
+// the friction is scaled to real time, so at any rate both top speeds are the 60 Hz ones.
+static float TopSpeedTick(float dt) {
+  return PortDebug::TickPeriod() * 60.f != 1.f ? 1.f / 60.f : dt;
+}
+#endif
+
 float CPlayer::GetActualFirstPersonMaxVelocity(float dt) const {
-  const float friction = gpTweakPlayer->GetPlayerTranslationFriction(GetSurfaceRestraint());
+#ifdef TARGET_PC
+  dt = TopSpeedTick(dt);
+#endif
+  const float friction = WalkFriction(GetSurfaceRestraint());
   const float frictionForce = friction * GetMass();
-  const float maxSpeed = gpTweakPlayer->GetPlayerTranslationMaxSpeed(GetSurfaceRestraint());
-  const float acceleration = gpTweakPlayer->GetMaxTranslationalAcceleration(GetSurfaceRestraint());
+  const float maxSpeed = WalkMaxSpeed(GetSurfaceRestraint());
+  const float acceleration = WalkAcceleration(GetSurfaceRestraint());
   return -(frictionForce * maxSpeed / (acceleration * dt) - maxSpeed - friction);
 }
 
 float CPlayer::GetActualBallMaxVelocity(float dt) const {
+#ifdef TARGET_PC
+  dt = TopSpeedTick(dt);
+#endif
   const float friction = gpTweakBall->GetBallTranslationFriction(GetSurfaceRestraint());
   const float frictionForce = friction * GetMass();
   const float maxSpeed = gpTweakBall->GetBallTranslationMaxSpeed(GetSurfaceRestraint());
@@ -1245,6 +1418,9 @@ void CPlayer::BombJump(const CVector3f& position, CStateManager& mgr) {
 
 void CPlayer::Teleport(const CTransform4f& transform, CStateManager& mgr,
                        const bool resetBallCamera) {
+#ifdef TARGET_PC
+  PortMotionWatch::NoteWarp();
+#endif
   CVector3f direction = transform.GetForward();
   direction.SetZ(0.f);
   CPhysicsActor::Stop();
@@ -1540,7 +1716,7 @@ float CPlayer::UpdateCameraBob(float dt, CStateManager& mgr) {
     const float rightSpeed = CVector3f::Dot(velocity, GetTransform().GetRight());
     const float forwardSpeed = CVector3f::Dot(velocity, GetTransform().GetForward());
     const float maxSpeed = GetActualFirstPersonMaxVelocity(dt);
-    const float strafeSpeed = skStrafeDistances[GetSurfaceRestraint()];
+    const float strafeSpeed = skStrafeDistances[GetSurfaceRestraint()] * WalkScale();
     const float maxMagnitude = CMath::SqrtF(strafeSpeed * strafeSpeed + maxSpeed * maxSpeed);
     magnitude = CMath::SqrtF(rightSpeed * rightSpeed + forwardSpeed * forwardSpeed) / maxMagnitude;
     magnitude *= CPlayerCameraBob::GetOrbitBobScale();

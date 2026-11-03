@@ -62,6 +62,16 @@ bool IsNormalizable(Vec3);
 // IsNormalizable contract. Normalization preserves the source NEON operation
 // order and reciprocal-square-root estimate/refinement, not sqrt/division.
 Vec3 Normalize(Vec3);
+// CMath::SqrtF 0x65f70: v * rsqrt(max(v, 1e-35)) with the ARM reciprocal-square-root
+// estimate and TWO refinement steps, and 0 for non-positive (and NaN) input, since the
+// source's guard is `fcmp` + `b.le` and AArch64 takes an unordered compare. Shared by
+// 0x699b0's discriminant root and 0xbf6f10's sphere tests; not host sqrt.
+float SqrtF(float);
+// NormalizeWithMagnitude 0x6b100: the same pairs sum and two-refinement reciprocal as
+// Normalize, writing the unit vector back IN PLACE, and returning the magnitude from
+// that SAME final reciprocal (`squared * r2`, the source's `fmul v1,v2`) - never a
+// recomputed sqrt. Callers follow the source IsNormalizable contract, as for Normalize.
+float NormalizeWithMagnitude(Vec3&);
 Vec3 Unit(Vec3);
 Vec3 Corner(const AABB&, unsigned);
 float ClipLineSegment(Plane, Vec3 start, Vec3 end);

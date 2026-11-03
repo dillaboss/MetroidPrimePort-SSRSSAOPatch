@@ -17,6 +17,8 @@
 #include <math.h>
 #ifdef TARGET_PC
 #include <map>
+#include "port_apclient.h"
+#include "port_debug.h"
 
 // Scans the save does not track (a randomized pickup's made-up SCAN): kept
 // until the next new game or load, like an unsaved retail scan, but never
@@ -273,6 +275,12 @@ void CPlayerState::DecrPickUp(CPlayerState::EItemType type, int amount) {
     return;
   }
 
+#ifdef TARGET_PC
+  // Firing is the only caller for missiles and power bombs: the cheat keeps the count.
+  if (PortInfiniteAmmo(type)) {
+    return;
+  }
+#endif
   switch (type) {
   case kIT_Missiles:
   case kIT_PowerBombs:
@@ -325,6 +333,12 @@ const bool CPlayerState::HasPowerUp(const CPlayerState::EItemType type) const {
   if (type < 0 || kIT_Max - 1 < type) {
     return false;
   }
+#ifdef TARGET_PC
+  // An AP seed with progressive beams charges only the beams that have their
+  // Charge Beam upgrade.
+  if (type == kIT_ChargeBeam && x24_powerups[uint(type)].x4_capacity > 0)
+    return PortAp::ChargeBeamRule(GetCurrentBeam());
+#endif
   return x24_powerups[uint(type)].x4_capacity > 0;
 }
 
@@ -411,6 +425,25 @@ void CPlayerState::PortRestoreAmmo(EItemType type, int amount, int capacity) {
   CPowerUp& pup = x24_powerups[uint(type)];
   pup.x4_capacity = capacity;
   pup.x0_amount = rstl::min_val(amount, capacity);
+}
+
+bool CPlayerState::PortInfiniteAmmo(EItemType type) {
+  switch (type) {
+  case kIT_Missiles:
+    return PortDebug::InfiniteAmmo(PortDebug::kInfAmmoMissile);
+  case kIT_PowerBombs:
+    return PortDebug::InfiniteAmmo(PortDebug::kInfAmmoPowerBomb);
+  default:
+    return false;
+  }
+}
+
+int CPlayerState::PortUsableAmount(EItemType type) const {
+  const int amount = GetItemAmount(type);
+  if (!PortInfiniteAmmo(type)) {
+    return amount;
+  }
+  return rstl::max_val(amount, rstl::max_val(GetItemCapacity(type), 1));
 }
 #endif
 

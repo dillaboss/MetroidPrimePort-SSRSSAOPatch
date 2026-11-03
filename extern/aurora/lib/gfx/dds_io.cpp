@@ -106,6 +106,8 @@ std::optional<uint32_t> resolve_mip_count(const DDSHeader& header) noexcept {
 
 std::optional<wgpu::TextureFormat> resolve_dx10_format(uint32_t dxgiFormat) noexcept {
   switch (dxgiFormat) {
+  case 10:
+    return wgpu::TextureFormat::RGBA16Float;
   case 28:
     return wgpu::TextureFormat::RGBA8Unorm;
   case 29:
@@ -122,6 +124,10 @@ std::optional<wgpu::TextureFormat> resolve_dx10_format(uint32_t dxgiFormat) noex
     return wgpu::TextureFormat::BC3RGBAUnormSrgb;
   case 83:
     return wgpu::TextureFormat::BC5RGUnorm;
+  case 95:
+    return wgpu::TextureFormat::BC6HRGBUfloat;
+  case 96:
+    return wgpu::TextureFormat::BC6HRGBFloat;
   case 98:
     return wgpu::TextureFormat::BC7RGBAUnorm;
   case 99:
@@ -270,6 +276,13 @@ std::optional<ParsedDDS> parse_dds_header(ArrayRef<uint8_t> bytes) noexcept {
   };
 }
 
+// Returns the first mip that fits within maxDimension, which becomes the base level of the returned mip tail.
+//
+// maxDimension is a soft limit for compressed formats: the tail is uploaded as a standalone texture, so its base
+// level must cover whole texel blocks. When the first mip that fits is not block-aligned, the nearest aligned
+// earlier (larger) mip is selected instead, even though that exceeds maxDimension. When no mip at or before the
+// first one that fits is aligned there is no valid base, so std::nullopt is returned and callers fall back to a
+// full load. Uncompressed formats are always block-aligned, so their behaviour is unchanged.
 std::optional<uint32_t> mip_tail_start(const ParsedDDS& dds, uint32_t maxDimension) noexcept {
   if (maxDimension == 0) {
     return std::nullopt;
@@ -277,9 +290,19 @@ std::optional<uint32_t> mip_tail_start(const ParsedDDS& dds, uint32_t maxDimensi
   for (uint32_t mip = 0; mip < dds.mips; ++mip) {
     const uint32_t width = std::max(dds.width >> mip, 1u);
     const uint32_t height = std::max(dds.height >> mip, 1u);
-    if (width <= maxDimension && height <= maxDimension) {
-      return mip;
+    if (width > maxDimension || height > maxDimension) {
+      continue;
     }
+    // Walk back towards larger mips for the nearest block-aligned base.
+    for (uint32_t candidate = mip + 1; candidate > 0; --candidate) {
+      const uint32_t level = candidate - 1;
+      const uint32_t levelWidth = std::max(dds.width >> level, 1u);
+      const uint32_t levelHeight = std::max(dds.height >> level, 1u);
+      if (is_block_aligned(dds.format, levelWidth, levelHeight)) {
+        return level;
+      }
+    }
+    return std::nullopt;
   }
   return std::nullopt;
 }

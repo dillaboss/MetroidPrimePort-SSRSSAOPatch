@@ -10,6 +10,15 @@
 // strings. Comments (#) and blank lines are ignored; anything else the parser
 // doesn't know is an error with its line number.
 //
+//   [[custom_action]]                # the player's own actions, before the profiles
+//   id = 1                           # stable; bindings name it custom:<id>
+//   name = "Look back"               # shown to the player
+//   renamed = true                   # the player set the name: keep it
+//   preset = "setting"               # what it does (a catalogue key)
+//   arg = "invert_y"                 # the preset's option
+//   mode = "toggle"                  # toggle, on, off, or "" for no mode
+//   command = ""                     # "command" preset: the console line
+//
 //   [[profile]]
 //   name = "Default"
 //   match = ""                     # "", "guid:<32 hex>" or "type:<SDL gamepad type>"
@@ -18,7 +27,7 @@
 //   unbind = ["pad_z@pad"]         # action@family: drop the base's bindings
 //
 //   [[profile.bind]]
-//   action = "beam_wave"           # an ActionInfo key
+//   action = "beam_wave"           # an ActionInfo key, or "custom:<id>"
 //   inputs = ["pad:leftshoulder", "pad:dpright"]
 //   any_order = false
 //   trigger = "press"              # press, tap, hold, double_tap, toggle
@@ -85,6 +94,19 @@ struct Unbind {
   bool operator==(const Unbind&) const = default;
 };
 
+// One of the player's own actions: an Action value kCustomBase + id, and what it
+// does. The catalogue of presets lives with the overlay that runs them.
+struct CustomActionDef {
+  uint16_t id = 0;          // stable; bindings name it custom:<id>
+  std::string name;         // shown to the player
+  bool renamed = false;     // the player set the name; keep it when the options change
+  std::string preset;       // catalogue key, e.g. "setting", "phazon_beam", "warp", "command"
+  std::string arg;          // the preset's option (setting key, item, "MLVL:MREA", slot, ...)
+  std::string mode;         // "toggle", "on", "off" or "" (presets that have no mode)
+  std::string command;      // "command" preset: the console line
+  bool operator==(const CustomActionDef&) const = default;
+};
+
 struct UserProfile {
   std::string name;
   std::string match; // "", "guid:<hex>", "type:<name>"
@@ -96,9 +118,16 @@ struct UserProfile {
 };
 
 struct UserBindings {
+  std::vector<CustomActionDef> customActions;
   std::vector<UserProfile> profiles;
   bool operator==(const UserBindings&) const = default;
 };
+
+// The id a new custom action gets: the highest in use plus one, at least 1.
+uint16_t NextCustomId(const UserBindings& bindings);
+// Deletes a custom action and everything that names it: its definition, and every
+// binding and unbind of it in every profile.
+void RemoveCustomAction(UserBindings& bindings, uint16_t id);
 
 // Key names: name(scancode) returns "" for none; parse(name) returns -1 for an
 // unknown name. Without them (tests), keys are written and read as numbers.
@@ -151,5 +180,128 @@ void RemoveUserBinding(UserProfile& user, size_t index);
 void Revert(UserProfile& user, Action action, Family family);
 // Every override and unbind in one family (a reset to the built-in controls).
 void ClearFamily(UserProfile& user, Family family);
+// Whether ClearFamily removes this binding (a used row whose trigger is in the family).
+bool IsFamilyRow(const Binding& b, Family family);
+
+// The same physical input: mouse buttons match across their code runs (aim, key
+// slot, menu, held), and the press threshold is ignored.
+bool SamePhysicalInput(const Input& a, const Input& b);
+// Makes the inputs of the `isRow` bindings do only those in `ctx`: every other
+// binding on the same physical inputs (the same chord, for a chord) gets `ctx`
+// blocked, which keeps its rank and what it does elsewhere. everywhereOnly: only
+// bindings for every context are blocked, so ones scoped under Advanced still apply.
+void BlockRowInputs(Profile& profile, bool (*isRow)(const Binding&), uint16_t ctx, bool everywhereOnly);
+
+// The Morph Ball rows (issue #167): each presses a GameCube button, only in Morph
+// Ball. Bound in a family, a row replaces that button in the ball for the family;
+// unbound, the button's own inputs do it. Touch has them bound by default on the
+// overlay's Morph Ball page (kTouchBallControls); its layout editor buttons can take
+// them too.
+struct BallRow {
+  Action row;
+  Action game;
+  const char* hint;  // the Remap page's note beside the row
+  const char* touch; // the overlay's label for a control doing the row
+};
+inline constexpr BallRow kBallRows[] = {
+    {Action::BallBomb, Action::PadA, "A when unset", "Bomb"},
+    {Action::BallPowerBomb, Action::PadY, "Y when unset", "P.Bomb"},
+    {Action::BallBoost, Action::PadB, "B when unset", "Boost"},
+    {Action::BallSpider, Action::PadR, "R when unset", "Spider"},
+    {Action::BallUnmorph, Action::PadX, "X when unset", "Unmorph"},
+};
+// The touch overlay's Morph Ball page buttons and their default rows (touch codes
+// kTouchBallBase.., TouchControlsView's C_BALL + i). They press no GameCube button
+// of their own (TouchControlBound).
+struct TouchBallControl {
+  int control;
+  Action row;
+};
+inline constexpr TouchBallControl kTouchBallControls[] = {
+    {40, Action::BallBomb},   {41, Action::BallBoost},   {42, Action::BallPowerBomb},
+    {43, Action::BallSpider}, {44, Action::BallUnmorph},
+};
+// The row of `a`, or nullptr; the row that presses `game`, or nullptr.
+const BallRow* FindBallRow(Action a);
+const BallRow* BallRowForGame(Action game);
+// Before a poll: scopes the Morph Ball rows to Morph Ball (a row with layers to
+// Morph Ball while one is held) and blocks Morph Ball for the other bindings on
+// their keyboard, mouse and controller inputs (a row with layers blocks nothing: it
+// outranks them while one is held), and blocks Morph Ball for its game button's
+// bindings in each keyboard or controller family that binds the row (not with
+// layers). A row that isn't bound changes nothing.
+void ApplyBallButtons(Profile& profile);
+
+// The touch overlay's stock buttons and signals (TouchControlsView's C_* ids,
+// kTouchTurbo, kTouchMapTap, kTouchMenuBack):
+// fixed GameCube actions in all three layouts (default, GameCube, twin stick), not
+// remappable; the layout editor shows, hides and adds buttons instead. A control
+// with a binding sends only its code (TouchControlBound), so these bypass the
+// overlay's virtual pad, which the pad presets remap (Remastered's left touch B
+// with nothing to do and put the map on START). The sticks, D-pad, Visor, Beam,
+// map, eye, Turbo and the twin Beam button keep their own paths (and stay
+// remappable, as do the Morph Ball page's rows and added buttons).
+struct TouchStockControl {
+  int control;
+  Action action;
+  uint16_t contexts = kCtxAll;
+};
+inline constexpr TouchStockControl kTouchStockControls[] = {
+    {3, Action::PadA},       // A
+    {4, Action::PadB},       // B
+    {5, Action::PadX},       // X
+    {6, Action::PadY},       // Y
+    {7, Action::PadL},       // L Lock
+    {7, Action::LAnalog},    //
+    {8, Action::PadR},       // R Look
+    {8, Action::RAnalog},    //
+    {9, Action::PadZ},       // Z Map
+    {12, Action::PadStart},  // START
+    {17, Action::PadB},      // twin Jump
+    {18, Action::PadA},      // twin Fire
+    {19, Action::PadX},      // twin Morph
+    {21, Action::PadL},      // LT Lock
+    {21, Action::LAnalog},   //
+    {22, Action::PadB},      // LB Jump
+    {23, Action::PadA},      // RT Fire
+    {24, Action::PadY},      // RB Missile
+    {25, Action::PadZ},      // twin Map
+    {26, Action::PadR},      // twin R
+    {26, Action::RAnalog},   //
+    {34, Action::PadZ},      // a minimap tap: one poll of Z
+    {35, Action::PadB, kCtxMenu | kCtxMap}, // the menus' back arrow
+};
+constexpr int kTouchTurboCode = 33; // A, pulsed at the turbo rate
+// True for a touch input on a stock code.
+bool StockTouchInput(const Input& in);
+// `user` less its bindings that use a stock touch code: those can't be remapped.
+UserProfile WithoutStockTouch(const UserProfile& user);
+// Appends kTouchStockControls' bindings and Turbo's; after the user's overlay,
+// so neither its unbinds nor a replace can drop them.
+void BindStockTouch(Profile& profile, uint16_t turboHz);
+
+// The touch overlay's own buttons (issue #92): the layout editor adds up to
+// kTouchButtonSlots, each with one action, on touch codes kTouchButtonBase + slot. They live in the touch layout string
+// (TouchControlsView owns it), not in controls.toml, as entries
+//   k<slot>:dx,dy,scale,opacity,hidden,<action key>[,page]
+// among the stock controls' `id:dx,dy,scale[,opacity[,hidden]]` ones, ';'
+// separated (page: the overlay's, 0 gameplay when left out, 1 Morph Ball, 2 both).
+// Entries with a bad slot, a field count other than 6 or 7 or an action a button
+// can't take are skipped; a repeated slot keeps its last valid entry.
+constexpr int kTouchButtonSlots = 64;
+constexpr int kTouchButtonBase = 64;
+struct TouchButton {
+  int slot = 0;
+  Action action = Action::None;
+  bool operator==(const TouchButton&) const = default;
+};
+// Digital actions that do something from a touch button: not None, the analog
+// and look ones, the layer holds (only controls.toml's layered bindings use
+// them) or the Menu rows (inert while touch is active). A Morph Ball row works only
+// in the ball, as everywhere (ApplyBallButtons).
+bool TouchButtonAction(Action a);
+std::vector<TouchButton> ParseTouchButtons(std::string_view layout); // by slot
+// Appends a Press binding of each button's action on its touch code.
+void BindTouchButtons(Profile& profile, std::string_view layout);
 
 } // namespace PortInput

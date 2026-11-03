@@ -151,6 +151,31 @@ private:
   rstl::optional_object< TLockedToken< CModel > > x1c_normalModel;
   rstl::optional_object< TLockedToken< CModel > > x2c_xrayModel;
   rstl::optional_object< TLockedToken< CModel > > x3c_infraModel;
+#ifdef TARGET_PC
+public:
+  // PORT: the transform a Remastered retail model draws through for this object, between its
+  // scaled transform and the model (port_retail_placement.h). Looked up per model by the
+  // object's area and editor id; a model without one draws as retail places it.
+  void PortPlace(uint mrea, uint editorId);
+  // xf * scale, then the static model `which` picks' correction when it has one.
+  CTransform4f PortScaledXf(EWhichModel which, const CTransform4f& xf) const;
+  // PORT: Remastered's frozen model (CActorParametersMP1 +0x80, property 0x0364A97A, bound by
+  // SetFrozenModel 0xc4f980): the character's ice model when a mod replaced it with a
+  // Remastered (PBR) one, else null. Remastered draws it posed, without the ice overlay's
+  // vertex morph, in place of the body (RenderModelData 0xc4c4cc).
+  const CSkinnedModel* PortFrozenModel() const;
+  // While set, Render draws PortFrozenModel, when there is one, in place of the normal, X-ray
+  // and thermal (cold) bodies: 0xc4c4cc swaps model 4 for which 0 and 2, and CPatternedMP1's
+  // Render 0xd2d94c draws its X-ray pass with model 4 too. CPatterned sets it for a frozen,
+  // not burning enemy.
+  static bool sPortDrawFrozen;
+
+private:
+  int PortSlot(EWhichModel which) const;
+  CAABox PortLocalBounds() const;
+  float xPortCorrection[3][12];
+  uchar xPortCorrected = 0;  // bit n: slot n (normal, xray, infra) has a correction
+#endif
 };
 CHECK_SIZEOF(CModelData, 0x4c)
 

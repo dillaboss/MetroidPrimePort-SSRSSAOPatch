@@ -1,6 +1,7 @@
 // Dev tool for the Remastered particle reader (port_remastered_effect).
 //
 //   tool dump <file.GENP>            print the parsed effect
+//   tool kssm <file.GENP>            print its spawn tables as the converter reads them
 //   tool mtin <file.GENP>...         one line per generator with a material
 //                                    instance: its MATI and PMTR values
 //   tool scan <romfs> [outdir]       parse every GENP in every pak under <romfs>
@@ -164,8 +165,54 @@ int Dump(const std::string& path) {
   return 0;
 }
 
+// Every KSSM in the effect as ParseSpawnTable reads it.
+void SpawnTables(const PortRemastered::EffectNode& node, const uint8_t* data, size_t size) {
+  using namespace PortRemastered;
+  for (const EffectProperty& property : node.properties) {
+    if (property.fourcc != EffectFourCC("KSSM")) {
+      continue;
+    }
+    EffectSpawnTable table;
+    if (!ParseSpawnTable(data, size, property, table)) {
+      std::cout << EffectGuidString(node.id) << " KSSM does not parse\n";
+      continue;
+    }
+    std::cout << EffectGuidString(node.id) << " KSSM end " << table.header[2] << " events " << table.events
+              << " tables " << table.tables.size() << "\n";
+    for (const EffectValue& component : table.components) {
+      std::cout << "  component " << DumpEffectValue(component, data) << "\n";
+    }
+    for (const EffectSpawnTable::Table& each : table.tables) {
+      std::cout << "  start " << each.word << " period " << EffectFourCCString(each.selector.fourcc) << "\n";
+      for (const EffectSpawnTable::Frame& frame : each.frames) {
+        for (const EffectSpawnTable::Spawn& spawn : frame.spawns) {
+          std::cout << "    frame " << frame.frame << " " << EffectFourCCString(spawn.form) << " "
+                    << EffectGuidString(spawn.id) << " component " << int32_t(spawn.component) << " instances "
+                    << EffectFourCCString(spawn.instances.fourcc) << "\n";
+        }
+      }
+    }
+  }
+  for (const EffectNode& child : node.children) {
+    SpawnTables(child, data, size);
+  }
+}
+
+int Kssm(const std::string& path) {
+  std::ifstream file(path, std::ios::binary);
+  const std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  PortRemastered::EffectNode effect;
+  std::string error;
+  if (!PortRemastered::ParseEffect(data.data(), data.size(), effect, error)) {
+    std::cerr << path << ": " << error << "\n";
+    return 1;
+  }
+  SpawnTables(effect, data.data(), data.size());
+  return 0;
+}
+
 // One line per generator with a material instance: file, form, the MTIN's
-// MATI (pak order), whether it has a TEXR, PBDM, then PMTR's items as
+// MATI (pak order; else "mtrl:" and the GPSM header's base material), whether it has a TEXR, PBDM, then PMTR's items as
 // group/slot=value (a constant vec4 as its four reals, else the element's
 // FourCC) and SMTR's item count. For joining with `re.sh mtrls`.
 void MaterialLines(const std::string& file, const PortRemastered::EffectNode& node, const uint8_t* data,
@@ -217,6 +264,10 @@ void MaterialLines(const std::string& file, const PortRemastered::EffectNode& no
         pmtr += (pmtr.empty() ? "" : " ") + text.str();
       }
     }
+  }
+  // No MTIN: the GPSM header's base material (ctor 0x28bfc4), marked "mtrl:".
+  if (mati.empty() && node.form == EffectFourCC("GPSM") && node.baseMaterial != EffectGuid{}) {
+    mati = "mtrl:" + EffectGuidString(node.baseMaterial);
   }
   if (!mati.empty()) {
     std::cout << file << "\t" << EffectFourCCString(node.form) << "\t" << mati << "\t" << (texr ? "TEXR" : "-") << "\t"
@@ -437,7 +488,7 @@ std::vector<uint8_t> ReadFile(const std::filesystem::path& path) {
   return std::vector<uint8_t>((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 }
 
-int Convert(const std::string& romfs, const std::string& retailDir, const std::string& outDir) {
+int Convert(const std::string& romfs, const std::string& retailDir, const std::string& outDir, bool census = false) {
   using namespace PortRemastered;
   std::vector<std::filesystem::path> paks;
   for (const auto& entry : std::filesystem::recursive_directory_iterator(romfs)) {
@@ -479,6 +530,77 @@ int Convert(const std::string& romfs, const std::string& retailDir, const std::s
     }
   }
 
+  if (census) {
+    size_t parsed = 0, failed = 0, generators = 0, enabled = 0, disabled = 0;
+    size_t primitiveEnabled = 0, primitiveDisabled = 0;
+    std::map<int, size_t> primitives;
+    std::ofstream rows(std::filesystem::path(outDir) / "primitive-census.tsv");
+    rows << "asset\tnode\tname\tprimitive\told_sprite_suppressed\tnew_sprite_suppressed\told_draws_nothing\tnew_draws_nothing\tbase_material\tcustom_material\n";
+    for (const auto& [id, data] : effects) {
+      EffectNode root;
+      std::string error;
+      if (!ParseEffect(data.data(), data.size(), root, error)) {
+        ++failed;
+        std::cerr << IdToString(id) << ": " << error << '\n';
+        continue;
+      }
+      ++parsed;
+      std::function<void(const EffectNode&, std::string)> visit = [&](const EffectNode& node, std::string path) {
+        if (node.form == EffectFourCC("GPSM")) {
+          const auto has = [&](const char (&tag)[5]) {
+            return std::any_of(node.properties.begin(), node.properties.end(), [&](const EffectProperty& p) {
+              return p.fourcc == EffectFourCC(tag);
+            });
+          };
+          bool nil = false;
+          for (const auto& p : node.properties) {
+            if (p.fourcc != EffectFourCC("MTIN")) continue;
+            for (const auto& v : p.value) {
+              if (v.kind != EffectValue::Kind::Guid) continue;
+              const auto mat = materials.find(PakId(v.guid));
+              if (mat != materials.end()) {
+                const auto& bytes = mat->second;
+                const uint8_t tag[] = {'B', 'C', 'L', 'R'};
+                const auto at = std::search(bytes.begin(), bytes.end(), std::begin(tag), std::end(tag));
+                nil = at != bytes.end() && bytes.end() - at >= 20 &&
+                      std::all_of(at + 4, at + 20, [](uint8_t b) { return b == 0; });
+              }
+              break;
+            }
+          }
+          const bool oldNothing = !has("TEXR") && (!has("MTIN") || nil) && !has("PMDL");
+          const bool oldSprite = oldNothing || (!has("TEXR") && !has("MTIN") && has("PMDL"));
+          const bool custom = std::any_of(node.properties.begin(), node.properties.end(), [](const auto& p) {
+            return p.fourcc == EffectFourCC("MTIN") && std::any_of(p.value.begin(), p.value.end(), [](const auto& v) {
+              return v.kind == EffectValue::Kind::Guid && v.guid != EffectGuid{};
+            });
+          });
+          const bool newNothing = node.primitiveType == 0 || node.primitiveType == 4 || node.primitiveType == 5 ||
+                                  (node.primitiveType == 3 && !has("PMDL")) ||
+                                  ((node.primitiveType == 1 || node.primitiveType == 2) &&
+                                   node.baseMaterial == EffectGuid{} && !custom);
+          const bool newSprite = newNothing || node.primitiveType == 3;
+          ++generators;
+          ++primitives[node.primitiveType];
+          enabled += oldSprite && !newSprite;
+          disabled += !oldSprite && newSprite;
+          primitiveEnabled += oldNothing && !newNothing;
+          primitiveDisabled += !oldNothing && newNothing;
+          rows << IdToString(id) << '\t' << path << '\t' << names[id] << '\t' << node.primitiveType
+               << '\t' << oldSprite << '\t' << newSprite << '\t' << oldNothing << '\t' << newNothing
+               << '\t' << EffectGuidString(node.baseMaterial) << '\t' << custom << '\n';
+        }
+        for (size_t i = 0; i < node.children.size(); ++i) visit(node.children[i], path + "/" + std::to_string(i));
+      };
+      visit(root, "root");
+    }
+    std::cout << "paks=" << paks.size() << " unique_GENP=" << effects.size() << " parsed=" << parsed
+              << " failed=" << failed << " GPSM=" << generators << '\n'
+              << "sprite_suppressed_to_drawn=" << enabled << " sprite_drawn_to_suppressed=" << disabled << '\n'
+              << "primitive_suppressed_to_drawn=" << primitiveEnabled << " primitive_drawn_to_suppressed=" << primitiveDisabled << '\n';
+    for (const auto& [primitive, count] : primitives) std::cout << "primitive " << primitive << ": " << count << '\n';
+    return failed ? 1 : 0;
+  }
   EffectConvertIO io;
   // The first TXTR a material instance names, when it is one carried over from retail.
   io.materialTexture = [&](const EffectGuid& material) -> uint32_t {
@@ -866,6 +988,20 @@ int Import(const std::string& romfs, const std::string& retailDir, const std::st
     rgba = std::move(image.rgba);
     return true;
   };
+  // As the game's import: the VFX copies (linear or sRGB, a BC5's red and green) follow the format.
+  io.textureSrgb = [&](const EffectGuid& id) {
+    std::vector<uint8_t> raw;
+    std::string ignored;
+    TxtrImage info;
+    return read(id, raw, ignored) && ReadTxtrInfo(raw.data(), raw.size(), info, ignored) && info.srgb;
+  };
+  io.textureRg = [&](const EffectGuid& id) {
+    std::vector<uint8_t> raw;
+    std::string ignored;
+    TxtrImage info;
+    return read(id, raw, ignored) && ReadTxtrInfo(raw.data(), raw.size(), info, ignored) &&
+           (info.format == kTxtrFormatBc5Unorm || info.format == kTxtrFormatBc5Snorm);
+  };
   io.layers = [&](const EffectGuid& id, int& width, int& height, int& layers, std::vector<uint8_t>& rgba,
                   std::string& error) {
     std::vector<uint8_t> raw;
@@ -888,6 +1024,13 @@ int Import(const std::string& romfs, const std::string& retailDir, const std::st
   // Models as the game's import converts them: standalone, one converter for all.
   std::set<uint32_t> claimed;
   std::unique_ptr<Converter> converter;
+  // Match the production import: Converter fills the embedded VMSH alongside the CMDL.
+  // Keep it by the assigned model id for the subsequent effect conversion callback.
+  std::map<uint32_t, std::vector<uint8_t>> modelMeshes;
+  io.modelMesh = [&](uint32_t model) {
+    const auto found = modelMeshes.find(model);
+    return found != modelMeshes.end() ? found->second : std::vector<uint8_t>();
+  };
   io.model = [&](const EffectGuid& id, uint32_t retailId, std::string& error) {
     if (!converter) {
       ConvertIO cio;
@@ -904,6 +1047,7 @@ int Import(const std::string& romfs, const std::string& retailDir, const std::st
     options.standalone = true;
     options.skip.clear();
     options.nativeMax = 1024;
+    options.vmsh = &modelMeshes[retailId];
     std::vector<uint8_t> raw;
     Model model;
     if (!read(id, raw, error) || !ParseModel(raw.data(), raw.size(), model, error) ||
@@ -1001,6 +1145,18 @@ int VmatSummary(const std::string& genpPath, const std::string& matiDir) {
     }
     return FlipbookAtlas{hash, 1, 1, 1};
   };
+  // The top mip's size from <dir>/<uuid>.TXTR, as the importer's.
+  io.textureSize = [&](const EffectGuid& texture, uint32_t& width, uint32_t& height) {
+    const std::vector<uint8_t> raw = ReadFile(std::filesystem::path(matiDir) / (IdToString(PakId(texture)) + ".TXTR"));
+    TxtrImage info;
+    std::string ignored;
+    if (raw.empty() || !ReadTxtrInfo(raw.data(), raw.size(), info, ignored)) {
+      return false;
+    }
+    width = info.width;
+    height = info.height;
+    return true;
+  };
   auto be32 = [](const uint8_t* p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; };
   auto real = [&](const uint8_t* p) {
     const uint32_t bits = be32(p);
@@ -1023,7 +1179,12 @@ int VmatSummary(const std::string& genpPath, const std::string& matiDir) {
   for (const ConvertedPart& part : ConvertEffect(effect, data.data(), io)) {
     ++index;
     std::vector<RetailPartProperty> properties;
-    std::cout << "generator " << index << (part.root ? " (root)" : "") << " " << EffectFourCCString(part.type) << "\n";
+    std::cout << "generator " << index << (part.root ? " (root)" : "") << " " << EffectFourCCString(part.type);
+    if (index <= nodes.size()) {
+      std::cout << " primitive " << nodes[index - 1]->primitiveType << " header MTRL "
+                << (nodes[index - 1]->baseMaterial == EffectGuid{} ? "nil" : "set");
+    }
+    std::cout << "\n";
     if (!SplitRetailEffect(part.type, part.part.data(), part.part.size(), properties, error)) {
       std::cout << "  does not read: " << error << "\n";
       continue;
@@ -1035,6 +1196,7 @@ int VmatSummary(const std::string& genpPath, const std::string& matiDir) {
       if (name == "VMAT") {
         has = true;
         b += 8;  // CNST, length
+        const uint32_t version = be32(b);
         std::cout << "  VMAT v" << be32(b) << " features 0x" << std::hex << be32(b + 4) << std::dec << " blend "
                   << be32(b + 8) << "\n";
         const uint32_t textures = be32(b + 12);
@@ -1062,6 +1224,9 @@ int VmatSummary(const std::string& genpPath, const std::string& matiDir) {
           b += 12;
         }
         std::cout << "\n    modulate " << real(b) << " depthSoften " << real(b + 4) << " spriteCenter " << be32(b + 8) << "\n";
+        if (version == 3) {
+          std::cout << "    opacityGain " << real(b + 12) << " opacityBias " << real(b + 16) << "\n";
+        }
       } else if (name == "VPMT" || name == "VSMT") {
         std::cout << "  " << name << " " << be32(b + 4) << " entries\n";
         if (name == "VPMT" && index <= nodes.size()) {
@@ -1077,7 +1242,8 @@ int VmatSummary(const std::string& genpPath, const std::string& matiDir) {
         std::cout << "  VTMT " << be32(b + 4) << " UV sets\n";
       } else if (name == "VORN" || name == "XFMD" || name == "PIRN") {
         std::cout << "  " << name << " " << be32(b + 4) << "\n";
-      } else if (name == "SSZE" || name == "ITEN") {
+      } else if (name == "SSZE" || name == "ITEN" || name == "VTRS" || name == "VATX" || name == "VAT2" ||
+                 name == "VATF" || name == "VTP2") {
         std::cout << "  " << name << " " << property.value.size() << " bytes\n";
       }
     }
@@ -1282,7 +1448,7 @@ int Mat(const std::string& romfs, const std::string& which, int index) {
           for (char c : name) n += char(std::tolower(uint8_t(c)));
           if (n.find(wanted) != std::string::npos && assets[a].type == FourCCOf("CMDL")) match = true;
         }
-        if (match && assets[a].type == FourCCOf("CMDL")) {
+        if (match && (assets[a].type == FourCCOf("CMDL") || assets[a].type == FourCCOf("SMDL"))) {
           labels[assets[a].id] = idText;
         }
       }
@@ -1352,11 +1518,17 @@ int Mat(const std::string& romfs, const std::string& which, int index) {
 
 int main(int argc, char** argv) {
   const std::string mode = argc > 1 ? argv[1] : "";
+  if (mode == "census" && argc == 4) {
+    return Convert(argv[2], "-", argv[3], true);
+  }
   if (mode == "vmat" && argc == 4) {
     return VmatSummary(argv[2], argv[3]);
   }
   if (mode == "dump" && argc == 3) {
     return Dump(argv[2]);
+  }
+  if (mode == "kssm" && argc == 3) {
+    return Kssm(argv[2]);
   }
   if (mode == "mtin" && argc >= 3) {
     return Materials(argc - 2, argv + 2);

@@ -16,6 +16,7 @@
 
 #include <dolphin/ai.h>
 #include "port_env.h"
+#include "port_log.h"
 
 namespace {
 constexpr uint32_t kSampleRate = 32000;
@@ -34,6 +35,9 @@ SDL_AudioStream* sStream = nullptr;
 uint64_t sNextFrameNs = 0;
 bool sStarted = false;
 bool sOutputEnabled = true;
+// The port's music boost (`music_boost`, F1 > Game > Audio): this stream carries the streamed
+// music (and the movie audio), which the MusyX voices do not cover.
+float sMusicBoost = 1.f;
 bool sAudioInitialized = false;
 bool sPlaying = true;
 alignas(32) uint8_t sSilence[0x280] = {};
@@ -61,7 +65,7 @@ void EnsureStream() {
   if (!sAudioInitialized) {
     sAudioInitialized = SDL_InitSubSystem(SDL_INIT_AUDIO);
     if (!sAudioInitialized) {
-      std::fprintf(stderr, "AI audio initialization failed: %s\n", SDL_GetError());
+      PortLog::Write("AI audio initialization failed: %s\n", SDL_GetError());
       sOutputEnabled = false;
       return;
     }
@@ -69,10 +73,14 @@ void EnsureStream() {
   SDL_AudioSpec spec{SDL_AUDIO_S16, 2, kSampleRate};
   sStream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
   if (sStream == nullptr) {
-    std::fprintf(stderr, "AI audio device unavailable: %s\n", SDL_GetError());
+    PortLog::Write("AI audio device unavailable: %s\n", SDL_GetError());
     sOutputEnabled = false;
-  } else if (sPlaying) {
-    SDL_ResumeAudioStreamDevice(sStream);
+  } else {
+    // A boost set before the stream existed lands here.
+    SDL_SetAudioStreamGain(sStream, sMusicBoost);
+    if (sPlaying) {
+      SDL_ResumeAudioStreamDevice(sStream);
+    }
   }
 }
 
@@ -203,6 +211,15 @@ extern "C" void AIPortSetOutputEnabled(int enabled) {
 }
 
 extern "C" int AIPortOutputEnabled(void) { return sOutputEnabled && sStream != nullptr; }
+
+// The port's volume boost for what this stream plays; 1.0 is none. Applied at once when the
+// stream is open, kept for one that opens later.
+extern "C" void AIPortSetOutputGain(float gain) {
+  sMusicBoost = gain > 0.f ? gain : 1.f;
+  if (sStream != nullptr) {
+    SDL_SetAudioStreamGain(sStream, sMusicBoost);
+  }
+}
 
 extern "C" void AIPortShutdown(void) {
   sCallback = nullptr;

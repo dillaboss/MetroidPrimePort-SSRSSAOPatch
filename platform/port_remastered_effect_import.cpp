@@ -1,4 +1,6 @@
 #include "port_env.h"
+#include "port_strings.h"
+#include "port_hash.h"
 #include "port_remastered_effect_import.h"
 
 #include "port_remastered_effect_convert.h"
@@ -27,6 +29,7 @@ constexpr uint32_t kSwsh = EffectFourCC("SWSH");
 constexpr uint32_t kSwhc = EffectFourCC("SWHC");
 constexpr uint32_t kTxtr = EffectFourCC("TXTR");
 constexpr uint32_t kCmdl = EffectFourCC("CMDL");
+constexpr uint32_t kVecf = EffectFourCC("VECF");
 constexpr uint32_t kExternalSwooshSalt = 0x53535748u;
 constexpr size_t kMaxExternalSwooshes = 16;
 
@@ -49,18 +52,10 @@ EffectGuid Swap(const EffectGuid& id) {
 }
 
 uint32_t Hash(const EffectGuid& id, uint32_t salt) {
-  uint32_t hash = 0x811C9DC5u ^ salt;  // FNV-1a
-  for (uint8_t byte : id) {
-    hash = (hash ^ byte) * 0x01000193u;
-  }
-  return hash;
+  return port::Fnv1a32(id.data(), id.size(), port::kFnv32Basis ^ salt);
 }
 
-std::string Hex(uint32_t id) {
-  char text[16];
-  std::snprintf(text, sizeof(text), "%08X", id);
-  return text;
-}
+using port::Hex8;
 
 int RoundUp4(int side) { return std::max(8, (side + 3) / 4 * 4); }
 
@@ -641,6 +636,10 @@ constexpr MatchedEffect kMatchedEffects[] = {
     {"fbfee463-1dec-4d67-bc51-c528a125043d", 0xD7FFF8D6},  // 020B6226 LCTR_MAGMOUTH
     {"fc6a3e0d-eb0d-4b81-99a9-e208ec1b80e4", 0x599B4D00},  // 76C35773 Collar
     {"fe324176-fcbe-480b-8437-fd19c3369f9e", 0x88460B49},  // 76C35773 root
+    // The visor's rain drops: the splash is drawn by the visor's own CHUDBillboardEffect, whose GENP
+    // no room or CHPR reaches (kb topic/unpaired-retail-particles.md). VFX_VisorRain (0ec41df0) is
+    // its shader, so the pair draws Remastered's drops.
+    {"45ba782d-5656-40dd-a115-9f20cac3955e", 0xBC978532},  // PART_EnvRainSplash, visor rain drops (RenderLooseDataMP1.LDTA)
     {"#script-slot", 0},  // method of the entries below
     // By script slot: Remastered keeps retail's property order, so a ROOM
     // object and the retail object it stands for name their assets in the same
@@ -812,6 +811,7 @@ constexpr MatchedEffect kMatchedEffects[] = {
     {"cdf30852-2632-4596-9dd1-e85e2908daea", 0x4A5F51FD},  // 65177C3A Fire1/Fire2
     {"4d818e87-ce9b-4581-aeba-e8155b813082", 0xD3BD37FC},  // 65177C3A Fire2/Fire3
     {"74d36fa3-690a-456e-9469-09b97fcc554a", 0x1233E83C},  // 65177C3A Fire3
+    {"db8e16a5-c5bb-4c7c-adfc-112df3d890f4", 0x43CD9074},  // F9F4B18F SpeedSwoosh (a SWHC)
     {"00aadc3b-c393-4e1b-b379-2b114bc1bbe8", 0x9884632F},  // 6B45F06D Eyes
     {"cc86c15d-0f2a-4807-a727-eda4723f3a9c", 0x273375E3},  // 8169653A TwoEyes
     {"#by-hand", 0},  // method of the entries below
@@ -839,16 +839,61 @@ constexpr MatchedEffect kMatchedEffects[] = {
     // keeps the disc's.
     {"c3a53327-731d-4870-8f1e-fdc755bccf13", 0x2D16014C},  // 07BEED38 breastPlate_LCTR
     {"d701c231-cf56-4451-b177-107724371c42", 0xFD17C2C9},  // 07BEED38 breastPlate_LCTR
+    // WallCrawlerSwarm: WallCrawlerSwarmMP1's one effect property (2a0f3c8f)
+    // is LoadWallCrawlerSwarm's part1 (ScriptLoader.cpp), the first of its
+    // four PART slots; every placement, retail and Remastered, agrees. The
+    // script-slot rule misses it because the object's other uuid properties
+    // are not effects. part2 (18B11B28, intro) has no Remastered effect.
+    {"de057194-ef63-4abf-9ed7-b6ddad9486fb", 0x0A621238},  // 00a_Crater_connect part1
+    {"f17e87e4-91ca-4893-b601-1cf5822b8e36", 0x7DFF579C},  // 00F_intro_begin part1 (7 rooms)
+    // MetroidBeta: SLdrMetroidBetaMP1::Load reads its five effect ids
+    // (4a60c1ab, 55e32683, d74656b0, 29ed4133, e4168360) into consecutive
+    // slots, in CMetroidBetaData's order xf4..x104 (CMetroidBeta.cpp); the two
+    // paired by script slot (xfc, x104) confirm it. All 10 placements agree:
+    // xf4_electricParticleId (PART) is 3ec1f3bd and xf8_electricSwooshEffectId
+    // (SWHC) is the swoosh 8e1a4b01. Exo's CMetroidPrimeData xa1c_particle2 is
+    // the same PART, so Exo takes 3ec1f3bd too.
+    {"3ec1f3bd-e45d-4fac-99ed-488537af39c3", 0x9AEBBD85},  // MetroidBeta electricParticle
+    {"8e1a4b01-b461-4968-951e-6aab5fbbd6e3", 0x18E0EADC},  // MetroidBeta electricSwoosh
+    // Electric (ELC2) slots by SLdr slot order between paired assets; every
+    // placement agrees. Elite and Omega Pirate share CElitePirateData's
+    // x118 shockwave weapon (CElitePirate.cpp).
+    {"d4ee1e33-8108-467b-92c8-86d500dcf210", 0x5C29A5C5},  // Elite/Omega shockwave
+    {"c4409b28-4503-45ba-b63f-f05ac2d80ced", 0x38C0B9C6},  // PhazonHealingNodule (9 of 9)
+    {"b204de64-5633-4f81-8b98-06cabda8ef04", 0x1EB570E1},  // IceSheegoth x1ac (5 of 5)
+    {"c9c4d688-74fc-4464-aab7-fec950f28147", 0x6A6957FB},  // MetroidPrimeStage2 (1 of 1)
+    // Ridley x3f0 (CRidleyDataMP1 copies SLdr x3c0 ahead of x3f4's float and
+    // x3f8's sfx); its x370 ELC2 is a field Remastered appended after x3fc.
+    {"b7166799-c8b0-4af3-8252-94d911e59691", 0x29EA0B24},
+    // Puffer: all 71 retail placements put C9D453A3 in both the CPatternedInfo
+    // particle slot and LoadPuffer's cloudEffect; all 69 Remastered ones put
+    // 813f0267 in the PatternedInfo slot and 78aa5da7 in the cloud slot. The
+    // cloud has no PART of its own, so it goes under a synthetic id that
+    // LoadPuffer substitutes (ScriptLoader.cpp).
+    {"813f0267-799d-41c2-b1aa-a50a25691614", 0xC9D453A3},  // Puffer patterned particle
+    {"78aa5da7-0062-4fce-8de1-3b7ee4894b3a", PortRemastered::SyntheticEffectId("puffercloud")},
+    {"#loose-chpr", 0},  // method of the entries below
+    // No ROOM, CHPR-set or script reference reaches these, or the counts are not
+    // 1:1 (kb topic/unpaired-retail-particles.md). The missile pickup: CHPR a9b8e446 has one
+    // GENP for retail's two PARTs, so C6D1DD10 (Skeleton_Root) takes it; 8438F539
+    // (Missile_Launcher_SDK) stays retail. The energy tank pickup: CHPR f37bcbc7
+    // has two GENPs, e460a1ad (sparks + light) and cd809719 (the same light only),
+    // for one PART.
+    {"c0aefd83-1327-4ae6-a4bc-9b2593393244", 0xC6D1DD10},  // A9B8E446 missile pickup
+    {"e460a1ad-6142-413d-b04c-7adb655b0410", 0xECD68B2F},  // F37BCBC7 energy tank pickup
+    {"#shared-genp", 0},  // method of the entries below
+    // The lava spit: one GENP for both retail PARTs, the big spit and the small one, so
+    // neither PART says which of the two it is. The rooms step gives a retail Effect object
+    // that draws one of them the Remastered actor's particle variables, which set its size
+    // (port_remastered_room_effects.cpp).
+    {"47b4f5e0-5a5d-4a9b-a1fb-62486ec76c5a", 0x2ECE9B8C},  // bigspittle
+    {"47b4f5e0-5a5d-4a9b-a1fb-62486ec76c5a", 0x68907841},  // spittle
+    {"#visual-inferred", 0},  // method of the entries below
+    // FlickerBat root burst (EVNT 31BF4B18, frames 6-60): inferred from the blue circular
+    // effect, a model shell replacing retail's radial sprite. Checked on the bat in the port;
+    // no Remastered runtime reference or CHPR mapping establishes this pairing.
+    {"3b29b0b3-0c3d-42b6-9159-f4863f6c3ed9", 0x0B9E48EB},  // 1E14B003 FlickerBat root
 };
-
-// Retail PARTs whose Remastered effect is a stub because Remastered draws them
-// elsewhere: the stub replaces them rather than the disc's being kept. Retail's
-// Artifact Temple laser hit spawns the same five PARTs as Ridley's 2D16014C
-// (which carries them now, as c3a53327), so retail draws them twice.
-// Remastered shows no particle flash on a plasma shot: PlasmaMuzzle and
-// PlasmaAuxMuzzle are stubs and no other code draws one (kb
-// topic/nil-texture-placeholder).
-const std::set<uint32_t> kStubReplaces = {0x53861B29, 0x8D7BBFB2, 0xB0F9DBE6};
 
 // A retail PART an effect replaces, and the rule that paired them.
 struct Pairing {
@@ -903,19 +948,62 @@ public:
   bool WriteTexture(uint32_t id, const Image& image, MapKind kind = MapKind::Colour) {
     const int edge = std::max(image.width, image.height);
     if (edge <= kStubSide) {
-      return m_io.write(Hex(id) + ".TXTR", EncodeTxtrRgba8(image));
+      return m_io.write(Hex8(id) + ".TXTR", EncodeTxtrRgba8(image));
     }
     const Image stub = Resize(image, std::max(8, RoundUp4(image.width * kStubSide / edge)),
                               std::max(8, RoundUp4(image.height * kStubSide / edge)), kind);
-    return m_io.write(Hex(id) + ".dds", EncodeDds(image, ColourDdsFormat(), false, kind)) &&
-           m_io.write(Hex(id) + ".TXTR", EncodeTxtrRgba8(stub));
+    return m_io.write(Hex8(id) + ".dds", EncodeDds(image, ColourDdsFormat(), false, kind)) &&
+           m_io.write(Hex8(id) + ".TXTR", EncodeTxtrRgba8(stub));
+  }
+
+  // Writes a VFX material's copy (VfxCopy). An sRGB texture over kStubSide keeps its sRGB
+  // bytes in an sRGB .dds, so the GPU decodes it before filtering as Remastered's does: as
+  // linear bytes its darks fall to a few levels, which BC7 flattens into 4x4 tiles that the
+  // ramp and erosion thresholds show (the bomb's explosion, the beam charges). The TXTR
+  // stub, and a texture small enough to have no .dds, hold the linear bytes.
+  bool WriteVfxTexture(uint32_t id, Image image, bool linear, bool rg) {
+    if (rg || !linear || std::max(image.width, image.height) <= kStubSide) {
+      ToVfx(image.rgba, linear, rg);
+      return WriteTexture(id, image, MapKind::Data);
+    }
+    const int edge = std::max(image.width, image.height);
+    Image stub = Resize(image, std::max(8, RoundUp4(image.width * kStubSide / edge)),
+                        std::max(8, RoundUp4(image.height * kStubSide / edge)), MapKind::Colour);
+    ToVfx(stub.rgba, true, false);
+    return m_io.write(Hex8(id) + ".dds", EncodeDds(image, ColourDdsFormat(), false, MapKind::Colour, true)) &&
+           m_io.write(Hex8(id) + ".TXTR", EncodeTxtrRgba8(stub));
+  }
+
+  // Whether a VFX material's copy of the texture differs from the legacy one: sRGB bytes decode
+  // to linear, and a BC5's grey plus alpha go back to (R, G, 0, 1), the channels a GPU gives
+  // the shader (VFX_DualModColorRamp_Unlit's ramps and the indirect maps read .x and .y).
+  bool VfxCopy(const EffectGuid& id, bool& linear, bool& rg) const {
+    linear = m_io.textureSrgb && m_io.textureSrgb(id);
+    rg = m_io.textureRg && m_io.textureRg(id);
+    return linear || rg;
+  }
+
+  static void ToVfx(std::vector<uint8_t>& rgba, bool linear, bool rg) {
+    for (size_t i = 0; i + 3 < rgba.size(); i += 4) {
+      if (rg) {
+        rgba[i + 1] = rgba[i + 3];
+        rgba[i + 2] = 0;
+        rgba[i + 3] = 0xFF;
+      } else if (linear) {
+        for (size_t c = 0; c < 3; ++c) {
+          rgba[i + c] = SrgbToLinearByte(rgba[i + c]);
+        }
+      }
+    }
   }
 
   // `vfx`: the texture is sampled by a VFX material, whose shader reads it raw. Remastered's
   // sRGB textures reach its shaders decoded, so those are written as linear values (under an
-  // id of their own, the legacy path wants the sRGB bytes) and filtered as data.
+  // id of their own, the legacy path wants the sRGB bytes) and filtered as data; a BC5 gets
+  // its red and green back (VfxCopy).
   uint32_t Texture(const EffectGuid& id, bool vfx = false) {
-    vfx = vfx && m_io.textureSrgb && m_io.textureSrgb(id);
+    bool linear = false, rg = false;
+    vfx = vfx && VfxCopy(id, linear, rg);
     auto& cache = vfx ? m_vfxTextures : m_textures;
     const auto known = cache.find(id);
     if (known != cache.end()) {
@@ -938,15 +1026,8 @@ public:
       if (width != image.width || height != image.height) {
         image = Resize(image, width, height);
       }
-      if (vfx) {
-        for (size_t i = 0; i + 3 < image.rgba.size(); i += 4) {
-          for (size_t c = 0; c < 3; ++c) {
-            image.rgba[i + c] = SrgbToLinearByte(image.rgba[i + c]);
-          }
-        }
-      }
       out = m_io.freshId(Hash(id, vfx ? kTxtr ^ 0x5F1Du : kTxtr));
-      if (WriteTexture(out, image, vfx ? MapKind::Data : MapKind::Colour)) {
+      if (vfx ? WriteVfxTexture(out, std::move(image), linear, rg) : WriteTexture(out, image, MapKind::Colour)) {
         ++m_result.textures;
       } else {
         out = 0;
@@ -961,7 +1042,8 @@ public:
   // over kMaxAtlasSide. Id 0 when it cannot be.
   // `vfx`: as for Texture(), a linear-light copy (under an id of its own) for a VFX material.
   FlipbookAtlas Flipbook(const EffectGuid& id, bool vfx = false) {
-    vfx = vfx && m_io.textureSrgb && m_io.textureSrgb(id);
+    bool linear = false, rg = false;
+    vfx = vfx && VfxCopy(id, linear, rg);
     auto& cache = vfx ? m_vfxFlipbooks : m_flipbooks;
     const auto known = cache.find(id);
     if (known != cache.end()) {
@@ -1007,15 +1089,8 @@ public:
                       frame.rgba.data() + size_t(y) * frameW * 4, size_t(frameW) * 4);
         }
       }
-      if (vfx) {
-        for (size_t i = 0; i + 3 < atlas.rgba.size(); i += 4) {
-          for (size_t c = 0; c < 3; ++c) {
-            atlas.rgba[i + c] = SrgbToLinearByte(atlas.rgba[i + c]);
-          }
-        }
-      }
       const uint32_t fresh = m_io.freshId(Hash(id, kTxtr ^ (vfx ? 0xF11Cu : 0xF11Bu)));
-      if (WriteTexture(fresh, atlas, vfx ? MapKind::Data : MapKind::Colour)) {
+      if (vfx ? WriteVfxTexture(fresh, std::move(atlas), linear, rg) : WriteTexture(fresh, atlas, MapKind::Colour)) {
         ++m_result.textures;
         ++m_result.flipbooks;
         out = FlipbookAtlas{fresh, cols, rows, layers};
@@ -1047,6 +1122,61 @@ public:
     return out;
   }
 
+  // A Remastered vector field (VECF, the curl noise's lookup grid) as a port VECF file under a
+  // fresh id, written once; 0 when it cannot be read. Remastered's file is little-endian:
+  // 'RFRM', u64 size, 8 zero bytes, 'VECF', u32 version (4), u32 (5), s32 x3 dims, f32 x3 min,
+  // f32 x3 max, u32 count, then count float3 cells. The port file is big-endian: 'VECF', u32 1,
+  // the dims, min, max, count and the cells, in the same order.
+  uint32_t VectorField(const EffectGuid& stored) {
+    const auto known = m_vectorFields.find(stored);
+    if (known != m_vectorFields.end()) {
+      return known->second;
+    }
+    uint32_t out = 0;
+    std::vector<uint8_t> data;
+    std::string error;
+    constexpr size_t kHeader = 0x48;
+    if (!m_io.read(kVecf, Swap(stored), data, error)) {
+      Log("effect vector field " + EffectGuidString(Swap(stored)) + ": " + (error.empty() ? "unreadable" : error));
+    } else if (data.size() < kHeader || std::memcmp(data.data(), "RFRM", 4) != 0 ||
+               std::memcmp(data.data() + 0x14, "VECF", 4) != 0) {
+      Log("effect vector field " + EffectGuidString(Swap(stored)) + ": not a VECF file");
+    } else {
+      const uint8_t* d = data.data();
+      const int64_t x = int32_t(port::ReadLE32(d + 0x20));
+      const int64_t y = int32_t(port::ReadLE32(d + 0x24));
+      const int64_t z = int32_t(port::ReadLE32(d + 0x28));
+      const uint32_t count = port::ReadLE32(d + 0x44);
+      if (x < 1 || y < 1 || z < 1 || x > 1024 || y > 1024 || z > 1024 || uint64_t(x * y * z) != count ||
+          kHeader + size_t(count) * 12 > data.size()) {
+        Log("effect vector field " + EffectGuidString(Swap(stored)) + ": bad dimensions");
+      } else {
+        std::vector<uint8_t> file;
+        file.reserve(52 + size_t(count) * 12);
+        const auto put = [&file](uint32_t v) {
+          file.push_back(uint8_t(v >> 24));
+          file.push_back(uint8_t(v >> 16));
+          file.push_back(uint8_t(v >> 8));
+          file.push_back(uint8_t(v));
+        };
+        put(kVecf);
+        put(1);
+        for (size_t at = 0x20; at < kHeader; at += 4) {
+          put(port::ReadLE32(d + at));
+        }
+        for (size_t at = kHeader; at < kHeader + size_t(count) * 12; at += 4) {
+          put(port::ReadLE32(d + at));
+        }
+        out = m_io.freshId(Hash(Swap(stored), kVecf));
+        if (!m_io.write(Hex8(out) + ".VECF", file)) {
+          out = 0;
+        }
+      }
+    }
+    m_vectorFields.emplace(stored, out);
+    return out;
+  }
+
   // The retail id for an id as an effect stores it: the disc's own when it
   // was carried over from retail, else a converted texture's or model's.
   uint32_t Stored(const EffectGuid& stored, uint32_t type) {
@@ -1060,6 +1190,12 @@ public:
     }
     if (type == kCmdl && m_io.typeOf(id) == kCmdl) {
       return Model(id);
+    }
+    // A Remastered-only GENP the import writes under its own id (a room's or port actor's,
+    // e.g. an ELSM/ELC2's GPSM/EPSM, ElectricGenps).
+    if (type == kPart && m_io.typeOf(id) == kGenp &&
+        std::find(m_io.roomOnly.begin(), m_io.roomOnly.end(), id) != m_io.roomOnly.end()) {
+      return RoomEffectId(id);
     }
     return 0;
   }
@@ -1111,12 +1247,14 @@ public:
       }
       return m_black != 0 ? FlipbookAtlas{m_black, 1, 1, 1} : FlipbookAtlas{};
     }
-    const std::optional<uint32_t> retail = EffectRetailId(stored);
-    if (retail && m_io.retailId(*retail)) {
-      return FlipbookAtlas{*retail, 1, 1, 1};
-    }
+    // Remastered's own file under a carried-over id comes first: it is an sRGB texture its
+    // shaders sample decoded, where the disc's GC texture holds the encoded bytes.
     const EffectGuid id = Swap(stored);
     if (m_io.typeOf(id) != kTxtr) {
+      const std::optional<uint32_t> retail = EffectRetailId(stored);
+      if (retail && m_io.retailId(*retail)) {
+        return FlipbookAtlas{*retail, 1, 1, 1};
+      }
       return {};
     }
     int width = 0, height = 0, layers = 0;
@@ -1154,9 +1292,18 @@ public:
     std::vector<ConvertedPart> parts;
   };
 
+  bool RoomOnly(const EffectGuid& id) const {
+    return std::find(m_io.roomOnly.begin(), m_io.roomOnly.end(), id) != m_io.roomOnly.end();
+  }
+
   void Children(const EffectNode& node, uint32_t root, std::map<EffectGuid, Child>& out) {
     for (const EffectNode& child : node.children) {
-      out.emplace(child.id, Child{m_io.freshId(Hash(child.id, root)), EffectRetailType(child.form)});
+      const uint32_t type = EffectRetailType(child.form);
+      // An embedded child that is also a GENP the import writes standalone is that one asset, as a
+      // GUID is on the Switch (the Babygoth flame's collision child, 97564fc0, which CFlameThrower
+      // finds among its generator's children by description): both resolve to its room id.
+      const bool standalone = type == kPart && m_io.typeOf(Swap(child.id)) == kGenp && RoomOnly(Swap(child.id));
+      out.emplace(child.id, Child{standalone ? RoomEffectId(Swap(child.id)) : m_io.freshId(Hash(child.id, root)), type});
       Children(child, root, out);
     }
   }
@@ -1164,7 +1311,11 @@ public:
   EffectConvertIO ConvertIO(const std::map<EffectGuid, Child>& children,
                             const std::map<EffectGuid, ExternalSwoosh>& externalSwooshes) {
     EffectConvertIO io;
+    io.spreadDefault = true;
     io.assetId = [&](const EffectGuid& stored, uint32_t type) -> uint32_t {
+      if (type == kVecf) {
+        return VectorField(stored);
+      }
       const auto child = children.find(stored);
       if (child != children.end() && child->second.type == type) {
         return child->second.id;
@@ -1184,8 +1335,25 @@ public:
     io.flipbook = [&](const EffectGuid& stored) { return Flipbook(Swap(stored)); };
     io.materialData = [&](const EffectGuid& material) { return MaterialData(material); };
     io.vfxTexture = [&](const EffectGuid& stored) { return VfxTexture(stored); };
+    // The top mip's size, as GetFullTextureWidth/Height.
+    io.textureSize = [&](const EffectGuid& stored, uint32_t& width, uint32_t& height) {
+      int w = 0, h = 0;
+      std::vector<uint8_t> rgba;
+      std::string error;
+      if (!m_io.texture || !m_io.texture(Swap(stored), w, h, rgba, error) || w <= 0 || h <= 0) {
+        return false;
+      }
+      width = uint32_t(w);
+      height = uint32_t(h);
+      return true;
+    };
     if (m_io.modelMesh) {
       io.modelMesh = [&](uint32_t model) { return m_io.modelMesh(model); };
+    }
+    if (m_io.modelAnimatesUv) {
+      io.modelAnimatesUv = [&](const EffectGuid& stored, bool& animatesUv) {
+        return m_io.modelAnimatesUv(Swap(stored), animatesUv);
+      };
     }
     return io;
   }
@@ -1234,7 +1402,7 @@ public:
         return false;
       }
       const EffectNode* node = part.root ? &out.effect : FindNode(out.effect, part.id);
-      if (node != nullptr && !part.placeholder && LostLook(*node, check)) {
+      if (node != nullptr && !part.drawsNothing && LostLook(*node, check)) {
         error = "SSWH converted " + EffectFourCCString(part.type) + " lost its texture or model";
         return false;
       }
@@ -1245,7 +1413,8 @@ public:
   bool ExternalSwooshes(const EffectNode& parent, const EffectGuid& parentId, uint32_t retail,
                         const std::map<EffectGuid, Child>& children,
                         std::map<EffectGuid, ExternalSwoosh>& out, std::string& error) {
-    if (parent.form != kElsm) {
+    // ELC2 names its swoosh the same way (CreateELC2 0xb70854, GetSwooshGeneratorDesc).
+    if (parent.form != kElsm && parent.form != EffectFourCC("ELC2")) {
       return true;
     }
     std::set<EffectGuid> resolving;
@@ -1357,7 +1526,7 @@ public:
         const auto child = swoosh.children.find(part.id);
         if (child == swoosh.children.end() || child->second.type != part.type ||
             !SplitRetailEffect(part.type, part.part.data(), part.part.size(), check, error) ||
-            !m_io.write(Hex(child->second.id) + "." + EffectFourCCString(part.type), part.part)) {
+            !m_io.write(Hex8(child->second.id) + "." + EffectFourCCString(part.type), part.part)) {
           error = "SSWH embedded child " + EffectGuidString(part.id) + " was not written";
           return false;
         }
@@ -1369,8 +1538,8 @@ public:
         AddKind(row, part.type);
       }
       if (swoosh.parts.empty() ||
-          !m_io.write(Hex(swoosh.id) + ".SWHC", swoosh.parts[0].part)) {
-        error = "SSWH SWHC " + Hex(swoosh.id) + " could not be written";
+          !m_io.write(Hex8(swoosh.id) + ".SWHC", swoosh.parts[0].part)) {
+        error = "SSWH SWHC " + Hex8(swoosh.id) + " could not be written";
         return false;
       }
       ++m_result.parts;
@@ -1423,7 +1592,7 @@ public:
     const bool swoosh = stored == kSwsh;
     const bool electric = stored == EffectFourCC("ELSM") || stored == EffectFourCC("ELC2");
     const uint32_t rootType = swoosh ? EffectFourCC("SWHC") : electric ? EffectFourCC("ELSC") : kPart;
-    const std::string name = Hex(retail) + "." + EffectFourCCString(rootType);
+    const std::string name = Hex8(retail) + "." + EffectFourCCString(rootType);
     std::vector<uint8_t> data;
     std::string error;
     EffectNode effect;
@@ -1432,6 +1601,11 @@ public:
       Log(name + ": " + error);
       Report(row, "failed", "parse: " + error);
       return;
+    }
+    // A standalone GENP another embeds as a child (Children()) is written once per embedding too:
+    // its GUID makes the root carry the same PGID, so every copy is the same file.
+    if (synthetic && !swoosh && !electric && RoomOnly(id)) {
+      effect.id = Swap(id);
     }
     std::map<EffectGuid, Child> children;
     Children(effect, retail, children);
@@ -1484,7 +1658,7 @@ public:
     // effect with an invisible one: keep the disc's, before anything is written.
     for (const ConvertedPart& part : parts) {
       const EffectNode* node = part.root ? &effect : FindNode(effect, part.id);
-      if (node != nullptr && !part.placeholder &&
+      if (node != nullptr && !part.drawsNothing &&
           SplitRetailEffect(part.root ? rootType : kPart, part.part.data(), part.part.size(), check, error) &&
           LostLook(*node, check)) {
         ++m_result.failed;
@@ -1494,24 +1668,35 @@ public:
         return;
       }
     }
-    // An effect drawn only by placeholder materials would replace the disc's with
-    // an invisible one: keep the disc's unless Remastered draws nothing there too.
-    if (kStubReplaces.count(retail) == 0 && std::any_of(parts.begin(), parts.end(), [](const ConvertedPart& part) { return part.placeholder; }) &&
-        std::all_of(parts.begin(), parts.end(), [](const ConvertedPart& part) { return part.drawsNothing; })) {
-      ++m_result.failed;
-      Log(name + ": only placeholder materials draw, the disc's is kept");
-      Report(row, "failed", "draws nothing: its materials are placeholders");
+    // A generator that draws nothing and only starts one swoosh stands for a retail SWHC (the
+    // CHPR's SpeedSwoosh): the swoosh itself replaces it, a PART under a SWHC's id would not.
+    if (rootType == kPart && m_io.retailHas && m_io.retailHas(kSwhc, retail)) {
+      error.clear();
+      if (parts.size() != 2 || !parts[0].drawsNothing || parts[1].type != kSwhc ||
+          !SplitRetailEffect(kSwhc, parts[1].part.data(), parts[1].part.size(), check, error) ||
+          !m_io.write(Hex8(retail) + ".SWHC", parts[1].part)) {
+        ++m_result.failed;
+        Log(name + ": a SWHC's stand-in is not a generator around one swoosh");
+        Report(row, "failed", "a retail SWHC's stand-in is not a generator around one swoosh");
+        return;
+      }
+      ++m_result.parts;
+      ++m_result.written;
+      m_result.dropped += parts[1].droppedRetail;
+      Report(row, "imported");
       return;
     }
     // Children first, so the root never names a child that was not written.
     for (size_t i = 1; i < parts.size(); ++i) {
       const auto child = children.find(parts[i].id);
+      error.clear();
       if (child == children.end() || child->second.type != parts[i].type ||
           !SplitRetailEffect(parts[i].type, parts[i].part.data(), parts[i].part.size(), check, error) ||
-          !m_io.write(Hex(child->second.id) + "." + EffectFourCCString(parts[i].type), parts[i].part)) {
+          !m_io.write(Hex8(child->second.id) + "." + EffectFourCCString(parts[i].type), parts[i].part)) {
         // The root would name a missing child: leave the disc's PART in place.
         ++m_result.failed;
-        Log(name + ": child " + EffectGuidString(parts[i].id) + " not written");
+        Log(name + ": child " + EffectGuidString(parts[i].id) + " not written" +
+            (error.empty() ? std::string() : ": " + error));
         Report(row, "failed", "child " + EffectGuidString(parts[i].id) + " not written");
         return;
       }
@@ -1548,7 +1733,12 @@ public:
 
   EffectImportResult Run() {
     for (const EffectGuid& id : m_io.effects) {
-      const std::vector<Pairing> pairings = RetailEffects(id, m_io.pairings);
+      std::vector<Pairing> pairings = RetailEffects(id, m_io.pairings);
+      if (pairings.empty() && m_io.typeOf &&
+          (m_io.typeOf(id) == EffectFourCC("GENP") || m_io.typeOf(id) == EffectFourCC("ELC2")) &&
+          std::find(m_io.roomOnly.begin(), m_io.roomOnly.end(), id) != m_io.roomOnly.end()) {
+        pairings.push_back({RoomEffectId(id), "room"});
+      }
       if (pairings.empty() && m_io.report) {
         EffectReportRow row;
         row.genp = EffectGuidString(Swap(id));
@@ -1570,6 +1760,7 @@ private:
   std::map<EffectGuid, FlipbookAtlas> m_vfxFlipbooks; // linear-light copies for VFX materials
   uint32_t m_black = 0;                                // VfxTexture()'s black texture, once written
   std::map<EffectGuid, uint32_t> m_models;
+  std::map<EffectGuid, uint32_t> m_vectorFields;  // port VECF ids, 0 for one that failed
   EffectImportResult m_result;
 };
 
@@ -1578,5 +1769,56 @@ private:
 bool WantsRemasteredEffects() { return port::EnvFlag("MP_REMASTERED_EFFECTS", true); }
 
 EffectImportResult ImportEffects(const EffectImportIO& io) { return Importer(io).Run(); }
+
+std::vector<EffectGuid> ElectricGenps(const EffectImportIO& io) {
+  std::vector<EffectGuid> out;
+  if (!io.typeOf || !io.read) {
+    return out;
+  }
+  for (const EffectGuid& id : io.effects) {
+    const uint32_t type = io.typeOf(id);
+    if (type != kElsm && type != EffectFourCC("ELC2")) {
+      continue;
+    }
+    std::vector<uint8_t> data;
+    std::string error;
+    EffectNode effect;
+    if (!io.read(type, id, data, error) || !ParseEffect(data.data(), data.size(), effect, error)) {
+      continue;  // Effect() reports it
+    }
+    for (const EffectProperty& property : effect.properties) {
+      EffectGuid stored{};
+      if ((property.fourcc != EffectFourCC("GPSM") && property.fourcc != EffectFourCC("EPSM")) ||
+          !AssetGuid(property.value, stored) || stored == EffectGuid{} || FindNode(effect, stored) != nullptr ||
+          io.typeOf(Swap(stored)) != kGenp) {
+        continue;
+      }
+      if (std::find(out.begin(), out.end(), Swap(stored)) == out.end()) {
+        out.push_back(Swap(stored));
+      }
+    }
+  }
+  return out;
+}
+
+uint32_t RoomEffectId(const EffectGuid& id) { return SyntheticEffectId(EffectGuidString(Swap(id)).c_str()); }
+
+bool EffectIdIs(const EffectGuid& id, const char* text) { return EffectGuidString(Swap(id)) == text; }
+
+std::vector<uint32_t> MatchedRetailEffects(const EffectGuid& id) {
+  const std::string text = EffectGuidString(Swap(id));
+  std::vector<uint32_t> out;
+  for (const MatchedEffect& matched : kMatchedEffects) {
+    // Room placement/variables belong to every converted GENP, not just the
+    // shared-genp section. In particular, the flamejet is a room-placement
+    // pairing and Landing Site also uses script-slot pairings. The caller
+    // verifies that the effects stage actually wrote each replacement PART.
+    if (matched.id[0] != '#' && text == matched.id &&
+        std::find(out.begin(), out.end(), matched.retail) == out.end()) {
+      out.push_back(matched.retail);
+    }
+  }
+  return out;
+}
 
 }  // namespace PortRemastered

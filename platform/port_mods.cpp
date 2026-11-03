@@ -3,19 +3,28 @@
 // result with Aurora's DVD overlays.
 
 #include "port_mods.h"
+#include "port_retail_placement.h"
+#include "port_env.h"
 #include "port_strings.h"
 #include "port_paths.h"
+#include "port_ball_looks.h"
+#include "port_suit_colours.h"
+#include "port_remastered_storage.h"
 
 #include "port_debug.h"
+#include "port_disc.h"
 #include "port_hd_font.h"
 #include "port_hud_bars.h"
 #include "port_log.h"
 #include "port_remastered_import.h"
+#include "port_dread_samus_mod.h"
 #include "port_room_env.h"
 #include "port_room_geo.h"
+#include "port_room_effects.h"
 #include "port_room_liquid.h"
 
 #include <aurora/dvd.h>
+#include <aurora/gfx.h>
 #include <dolphin/gx.h>
 #include <aurora/texture.hpp>
 #include <dolphin/dvd.h>
@@ -59,10 +68,29 @@ std::vector<std::string> sRoomLods;
 std::string sFont;
 std::unordered_map<uint32_t, std::string> sRoomGeos;
 std::unordered_map<uint32_t, std::string> sRoomLiquids;
+std::unordered_map<uint32_t, std::string> sRoomEffects;
+std::map<std::pair<uint32_t, uint32_t>, std::string> sResourceProviders;
+std::unordered_map<uint32_t, std::string> sRoomEffectsProviders;
+uint64_t sResourceGeneration = 0;
 // <FRME id>.hudbars files, by frame.
 std::unordered_map<uint32_t, std::string> sHudBars;
+// The CMDLs the dread-samus mod serves (PortDreadSamus::Replaces).
+std::set<uint32_t> sDreadBodies;
+std::set<uint32_t> sDreadBalls;
+std::set<uint32_t> sDreadLowBalls;
+std::set<uint32_t> sDreadCannons;  // first-person cannon variants (PortDreadSamus::FirstPersonCannon)
+// The Dread-proportioned CINFs it serves (PortDreadSamus::Skeleton).
+std::set<uint32_t> sDreadSkeletons;
 // thermal.lut: the thermal visor's heat gradient (port_thermal.h).
 std::string sThermalLut;
+// envfx.bin: Remastered's EnvironmentFX textures (port_envfx_assets.h).
+std::string sEnvFx;
+// shell.bin: Remastered's silhouette-shell textures (port_shell_assets.h).
+std::string sShell;
+// icy.bin: Remastered's frozen-enemy material (port_icy_assets.h).
+std::string sIcy;
+// retailplacements.bin: the transforms objects draw Remastered's per-object retail models through (port_retail_placement.h).
+std::string sRetailPlacements;
 // effectids.map: the retail effect ids a mod gives a second user its own effect for. Loaded on first use.
 std::string sEffectIdMapPath;
 std::mutex sEffectIdsMutex;
@@ -221,6 +249,61 @@ bool IsDocument(const std::string& name) {
          EndsWith(lower, ".png") || EndsWith(lower, ".jpg") || EndsWith(lower, ".ini") || lower == "license";
 }
 
+// The kImportParts entry a file of a Remastered import belongs to, by its folder and then its
+// type; nullptr for one that always loads (textures, material cubes, the gallery).
+const char* ImportPartOf(const fs::path& relative) {
+  const std::string name = PathString(relative.filename());
+  uint32_t type = 0;
+  uint32_t id = 0;
+  // By type first, as the scan's geometry check: room geometry in any folder.
+  if (PortRoomGeo::ParseFileName(name, id) || PortRoomLiquid::ParseFileName(name, id)) {
+    return "geometry";
+  }
+  if (relative.has_parent_path()) {
+    const std::string folder = Lower(PathString(*relative.begin()));
+    if (folder == "roomgeo") {
+      return "geometry";
+    }
+    if (folder == "roomenv") {
+      // A room's lighting goes with its geometry: Remastered's lights are made for its rooms.
+      return PortRoomEffects::ParseFileName(name, id) ? "effects" : "geometry";
+    }
+    if (folder == PortRemastered::kHudFolder) {
+      return "hud";
+    }
+    if (folder == PortRemastered::kTextFolder) {
+      return "text";
+    }
+    if (folder == "font" || folder == "map") {
+      return folder == "font" ? "font" : "map";
+    }
+    return folder == "video" ? "movies" : nullptr;
+  }
+  if (name == "effectids.map") {
+    return "effects";
+  }
+  if (name == PortRetailPlacement::kFileName) {
+    return "models";
+  }
+  if (!ParseLooseName(name, type, id)) {
+    return nullptr;
+  }
+  switch (type) {
+  case 0x54585452: // 'TXTR'
+    return nullptr;
+  case 0x50415254: // 'PART'
+  case 0x454C5343: // 'ELSC'
+  case 0x53574843: // 'SWHC'
+  case 0x57505343: // 'WPSC'
+  case 0x43525343: // 'CRSC'
+  case 0x44505343: // 'DPSC'
+  case 0x56454346: // 'VECF'
+    return "effects";
+  default:
+    return "models";
+  }
+}
+
 struct Replacement {
   std::string hostPath;
   uint64_t size = 0;
@@ -229,9 +312,37 @@ struct Replacement {
 
 } // namespace
 
+namespace {
+
+// The mod folders a scan loads: the mods folder's own folders, plus the built-in Remastered import
+// when it is installed outside it (port_remastered_storage.h). The import takes part in the same
+// name order as the others - a later name still wins - and a shared mod of the same name never
+// shadows it; a legacy shared import keeps standing in until a private one is installed.
+std::vector<PortRemasteredStorage::ModFolder> ScanModFolders(const std::string& sharedFolder) {
+  return PortRemasteredStorage::ScanFolders(sharedFolder, PortRemastered::InstalledModFolder());
+}
+
+bool HasRoomGeometryNow(const std::vector<PortRemasteredStorage::ModFolder>& mods) {
+  for (const PortRemasteredStorage::ModFolder& mod : mods) {
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(PathFromString(mod.path), fs::directory_options::skip_permission_denied,
+                                             ec),
+         end;
+         !ec && it != end; it.increment(ec)) {
+      uint32_t id = 0;
+      if (PortRoomGeo::ParseFileName(PathString(it->path().filename()), id)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+} // namespace
+
 std::string Folder() {
   std::string dir;
-  if (const char* env = std::getenv("MP_MODS"); env != nullptr && env[0] != '\0') {
+  if (const char* env = port::EnvString("MP_MODS"); env != nullptr && env[0] != '\0') {
     dir = env;
   } else {
     dir = PortPaths::UserFolder();
@@ -246,15 +357,32 @@ std::string Folder() {
 }
 
 bool HasRoomGeometry() {
-  const std::string dir = Folder();
-  if (dir.empty()) {
+  // The same folders the scan loads, the built-in import included: the frame buffers and the arena
+  // are sized from this before there is a renderer (main.cpp).
+  return HasRoomGeometryNow(ScanModFolders(Folder()));
+}
+
+bool HasEnabledRoomGeometry() {
+  if (!PortDebug::ModsEnabled()) {
     return false;
   }
-  std::error_code ec;
-  for (fs::recursive_directory_iterator it(PathFromString(dir), fs::directory_options::skip_permission_denied, ec), end;
-       !ec && it != end; it.increment(ec)) {
-    uint32_t id = 0;
-    if (PortRoomGeo::ParseFileName(PathString(it->path().filename()), id)) {
+  const std::vector<std::string> disabled = SplitDisabled(PortDebug::ModsDisabled());
+  std::vector<PortRemasteredStorage::ModFolder> mods = ScanModFolders(Folder());
+  std::erase_if(mods, [&](const PortRemasteredStorage::ModFolder& mod) {
+    const std::string name = PathString(PathFromString(mod.path).filename());
+    return std::find(disabled.begin(), disabled.end(), name) != disabled.end();
+  });
+  return HasRoomGeometryNow(mods);
+}
+
+bool AnyModEnabled() {
+  if (!PortDebug::ModsEnabled()) {
+    return false;
+  }
+  const std::vector<std::string> disabled = SplitDisabled(PortDebug::ModsDisabled());
+  for (const PortRemasteredStorage::ModFolder& mod : ScanModFolders(Folder())) {
+    const std::string name = PathString(PathFromString(mod.path).filename());
+    if (std::find(disabled.begin(), disabled.end(), name) == disabled.end()) {
       return true;
     }
   }
@@ -273,9 +401,12 @@ void SetSuspended(bool suspended) { sSuspended = suspended; }
 
 bool Suspended() { return sSuspended; }
 
-// Every .pak on the disc, as (entryNum, path).
+// Every .pak on the disc, as (entryNum, path). On Trilogy the root is MP1/; the disc's
+// other top-level folders stay reachable beside it, but they are the menu's and the
+// other games' (MP3-format paks, and MP2 ids that would clash with Prime's), not ours.
 std::vector<std::pair<int32_t, std::string>> DiscPaks() {
   std::vector<std::pair<int32_t, std::string>> paks;
+  const bool trilogy = PortDisc::IsTrilogy(PortDisc::Current());
   std::vector<std::string> dirs{"/"};
   while (!dirs.empty()) {
     const std::string dirPath = dirs.back();
@@ -291,6 +422,10 @@ std::vector<std::pair<int32_t, std::string>> DiscPaks() {
       }
       const std::string path = dirPath + entry.name;
       if (entry.isDir) {
+        if (trilogy && dirPath == "/" &&
+            (Lower(entry.name) == "fe" || Lower(entry.name) == "mp2" || Lower(entry.name) == "mp3")) {
+          continue;
+        }
         dirs.push_back(path + "/");
       } else if (EndsWith(Lower(path), ".pak")) {
         paks.emplace_back(int32_t(entry.entryNum), path);
@@ -307,6 +442,32 @@ int ExtraPakCount() { return sExtraPaks; }
 std::string ExtraPakName(int index) { return "PortMods" + std::to_string(index + 1); }
 
 bool HasNativeTexture(uint32_t id) { return sNativeTextures.count(id) != 0; }
+
+}  // namespace PortMods
+
+bool PortDreadSamus::Replaces(uint32_t bodyCmdl) { return bodyCmdl != 0 && PortMods::sDreadBodies.count(bodyCmdl) != 0; }
+bool PortDreadSamus::ReplacesBall(int suit, bool spider) {
+  return PortMods::sDreadBalls.count(BallModel(suit, spider)) != 0;
+}
+bool PortDreadSamus::ReplacesLowBall(int suit, bool spider) {
+  return PortMods::sDreadLowBalls.count(BallModel(suit, spider)) != 0;
+}
+namespace {
+bool sDreadCannonShown = true;
+}
+void PortDreadSamus::SetFirstPersonCannonShown(bool shown) { sDreadCannonShown = shown; }
+bool PortDreadSamus::FirstPersonCannonShown() { return sDreadCannonShown; }
+bool PortDreadSamus::ReplacesFirstPersonCannon(int suit) {
+  const uint32_t id = FirstPersonCannon(suit);
+  return sDreadCannonShown && id != 0 && PortMods::sDreadCannons.count(id) != 0;
+}
+
+uint32_t PortDreadSamus::Skeleton(uint32_t bodyCmdl) {
+  const uint32_t cinf = DreadCinf(bodyCmdl);
+  return cinf != 0 && Replaces(bodyCmdl) && PortMods::sDreadSkeletons.count(cinf) != 0 ? cinf : 0;
+}
+
+namespace PortMods {
 
 bool BindTexture(const void* owner, uint32_t id) {
   UnbindTexture(owner);
@@ -363,6 +524,13 @@ std::string HudBarsPath(uint32_t frame) {
 
 std::string ThermalLutPath() { return sThermalLut; }
 
+std::string EnvFxPath() { return sEnvFx; }
+
+std::string ShellPath() { return sShell; }
+std::string IcyPath() { return sIcy; }
+
+std::string RetailPlacementPath() { return sRetailPlacements; }
+
 uint32_t RemapEffectId(uint32_t owner, uint32_t field, uint32_t id) {
   std::lock_guard<std::mutex> lock(sEffectIdsMutex);
   if (!sEffectIdsLoaded) {
@@ -386,6 +554,25 @@ std::string RoomGeoPath(uint32_t mrea) {
 }
 
 bool RoomGeometryLoaded() { return !sRoomGeos.empty(); }
+
+bool RoomEnvLoaded() { return !sRoomEnvs.empty(); }
+
+std::string RoomEffectsPath(uint32_t mrea) {
+  const auto found = sRoomEffects.find(mrea);
+  return found != sRoomEffects.end() ? found->second : std::string();
+}
+
+std::string ResourceProvider(uint32_t type, uint32_t id) {
+  const auto found = sResourceProviders.find({type, id});
+  return found != sResourceProviders.end() ? found->second : std::string();
+}
+
+std::string RoomEffectsProvider(uint32_t mrea) {
+  const auto found = sRoomEffectsProviders.find(mrea);
+  return found != sRoomEffectsProviders.end() ? found->second : std::string();
+}
+
+uint64_t ResourceGeneration() { return sResourceGeneration; }
 
 std::string RoomLiquidPath(uint32_t mrea) {
   const auto found = sRoomLiquids.find(mrea);
@@ -420,6 +607,9 @@ void FinishReload() {
 }
 
 void Initialize() {
+  ++sResourceGeneration;
+  sResourceProviders.clear();
+  sRoomEffectsProviders.clear();
   sStatus = {};
   sNativeTextures.clear();
   sRoomEnvs.clear();
@@ -430,8 +620,18 @@ void Initialize() {
   sFont.clear();
   sRoomGeos.clear();
   sRoomLiquids.clear();
+  sRoomEffects.clear();
   sHudBars.clear();
   sThermalLut.clear();
+  sEnvFx.clear();
+  sShell.clear();
+  sIcy.clear();
+  sRetailPlacements.clear();
+  sDreadBodies.clear();
+  sDreadBalls.clear();
+  sDreadCannons.clear();
+  sDreadLowBalls.clear();
+  sDreadSkeletons.clear();
   {
     std::lock_guard<std::mutex> lock(sEffectIdsMutex);
     sEffectIdMapPath.clear();
@@ -440,25 +640,30 @@ void Initialize() {
   }
   sStatus.folder = Folder();
   sStatus.active = PortDebug::ModsEnabled() && !sSuspended;
-  if (sStatus.folder.empty()) {
+  // The built-in Remastered import can live outside the mods folder (Android,
+  // port_remastered_storage.h): it loads as a mod either way.
+  const std::vector<PortRemasteredStorage::ModFolder> scan = ScanModFolders(sStatus.folder);
+  if (sStatus.folder.empty() && scan.empty()) {
+    // No user folder: the generated layer has nowhere to keep its cache either.
+    PortBallLooks::SetState(false, 0);
+    PortSuitColours::SetServed({});
     return;
   }
   const std::vector<std::string> disabled = SplitDisabled(PortDebug::ModsDisabled());
 
   std::error_code ec;
   std::vector<fs::path> modDirs;
-  for (fs::directory_iterator it(PathFromString(sStatus.folder), ec), end; !ec && it != end; it.increment(ec)) {
-    const std::string name = PathString(it->path().filename());
-    if (!name.empty() && name[0] != '.' && it->is_directory(ec)) {
-      modDirs.push_back(it->path());
-    }
+  modDirs.reserve(scan.size());
+  for (const PortRemasteredStorage::ModFolder& mod : scan) {
+    modDirs.push_back(PathFromString(mod.path));
   }
-  std::sort(modDirs.begin(), modDirs.end());
 
   // Keyed by disc entry and by (type, id); a later mod overwrites an earlier.
   std::map<int32_t, Replacement> replaced;
+  std::map<std::string, std::pair<std::string, Replacement>> addedMovies; // by lower-case disc path
   std::map<std::pair<uint32_t, uint32_t>, LooseResource> loose;
   std::map<std::pair<uint32_t, uint32_t>, size_t> looseMod;
+  std::string dreadDir;  // the Dread Samus import's folder, when it is on
   for (const fs::path& modDir : modDirs) {
     ModInfo& info = sStatus.mods.emplace_back();
     info.name = PathString(modDir.filename());
@@ -470,8 +675,15 @@ void Initialize() {
       const bool stamped = stamp.is_open();
       info.import = stamped || info.name == PortRemastered::kImportModName;
       if (info.import) {
-        const std::string text((std::istreambuf_iterator<char>(stamp)), std::istreambuf_iterator<char>());
+        const std::string text = port::ReadAllText(stamp);
         info.importStale = ImportStampStale(text, PortRemastered::kImportVersion);
+      }
+      if (info.name == PortDreadSamus::kModName) {
+        std::ifstream dreadStamp(modDir / PortDreadSamus::kStampName);
+        if (ImportStampStale(dreadStamp.is_open() ? port::ReadAllText(dreadStamp) : std::string(),
+                             PortDreadSamus::kVersion)) {
+          Message(info.name + " was imported by an older version; import the Dread Samus models again");
+        }
       }
       if (info.importStale && sStatus.staleImport.empty()) {
         sStatus.staleImport = info.name;
@@ -481,7 +693,37 @@ void Initialize() {
     if (!info.enabled) {
       continue;
     }
+    if (info.name == PortDreadSamus::kModName) {
+      dreadDir = PathString(modDir);
+    }
     const size_t modIndex = sStatus.mods.size() - 1;
+    // An import's text tables are copies of the disc it was made from (kTextDiscName): on
+    // another disc, or with no record of it (an older import), the disc's own tables stay.
+    // Its HUD frames likewise (kHudDiscName): one built from another disc's frame names assets
+    // this disc lacks, and the game aborts loading it.
+    bool textFits = true;
+    bool hudFits = true;
+    int textLeftOut = 0;
+    int hudLeftOut = 0;
+    if (info.import) {
+      const auto madeOn = [&](const char* folder, const char* stamp) {
+        std::ifstream discStamp(modDir / folder / stamp);
+        return discStamp.is_open() && port::ReadAllText(discStamp) == PortDisc::Name(PortDisc::Current());
+      };
+      textFits = madeOn(PortRemastered::kTextFolder, PortRemastered::kTextDiscName);
+      hudFits = madeOn(PortRemastered::kHudFolder, PortRemastered::kHudDiscName);
+      info.hidden = PortDebug::RemasteredHidden();
+    }
+    // The parts the import leaves out, before the geometry check below: with its room geometry
+    // left out, an import loads without the reserved buffers.
+    const auto hiddenPart = [&](const fs::path& path) {
+      if (info.hidden.empty()) {
+        return false;
+      }
+      const char* part = ImportPartOf(path.lexically_relative(modDir));
+      return part != nullptr && ImportPartHidden(info.hidden, part);
+    };
+    int partsLeftOut = 0;
     std::vector<fs::path> files;
     for (fs::recursive_directory_iterator it(modDir, fs::directory_options::skip_permission_denied, ec), end;
          !ec && it != end; it.increment(ec)) {
@@ -498,8 +740,34 @@ void Initialize() {
         continue;
       }
       if (it->is_regular_file(ec)) {
+        if (hiddenPart(it->path())) {
+          ++partsLeftOut;
+          continue;
+        }
         files.push_back(it->path());
       }
+    }
+    if (partsLeftOut > 0) {
+      Message(info.name + ": " + std::to_string(partsLeftOut) + " files left out (" + info.hidden + ")");
+    }
+    // Geometry buffers are reserved at process startup (main.cpp) unless MP_FRAME_BUFFERS
+    // pins them at 1. Defer the WHOLE mod then, before even textures/sidecars can register:
+    // a partially active Remastered import is not a usable fallback. Keep mods_disabled as
+    // saved so the next process loads it. Reuse the file list (no second walk).
+    const bool roomGeometry = std::any_of(files.begin(), files.end(), [](const fs::path& file) {
+      uint32_t id = 0;
+      return PortRoomGeo::ParseFileName(PathString(file.filename()), id);
+    });
+    if (roomGeometry && !PortRoomGeo::BuffersReady()) {
+      info.enabled = false;
+      info.pendingRestart = true;
+      Message(info.name + ": Restart the application to apply (room geometry buffers were not reserved at startup)");
+      continue;
+    }
+    if (roomGeometry) {
+      // A phone started without room geometry runs at the unscaled frame buffers; the
+      // reserved ones are taken before the next frame, ahead of the room that draws it.
+      aurora_reserve_frame_buffers();
     }
     std::sort(files.begin(), files.end());
     std::unordered_map<uint32_t, std::string> native;
@@ -550,7 +818,26 @@ void Initialize() {
         sThermalLut = PathString(file);
         continue;
       }
+      if (name == "envfx.bin") {
+        sEnvFx = PathString(file);
+        continue;
+      }
+      if (name == "shell.bin") {
+        sShell = PathString(file);
+        continue;
+      }
+      if (name == "icy.bin") {
+        sIcy = PathString(file);
+        continue;
+      }
+      if (name == PortRetailPlacement::kFileName) {
+        sRetailPlacements = PathString(file);
+        continue;
+      }
       if (PortHudBars::ParseFileName(name, id)) {
+        if (!hudFits) {
+          continue;  // the bars of a frame left out below
+        }
         sHudBars[id] = PathString(file);
         continue;
       }
@@ -562,7 +849,16 @@ void Initialize() {
         sRoomLiquids[id] = PathString(file);
         continue;
       }
+      if (PortRoomEffects::ParseFileName(name, id)) {
+        sRoomEffects[id] = PathString(file);
+        sRoomEffectsProviders[id] = PathString(modDir);
+        continue;
+      }
       if (ParseLooseName(name, type, id)) {
+        if (PortRemasteredStorage::RejectObsoleteBarrierModel(scan[modIndex].builtin, type, id)) {
+          Message(info.name + ": " + relative + " is an obsolete barrier model; using the disc fallback");
+          continue;
+        }
         if (size == 0) {
           Message(info.name + ": " + relative + " is empty; ignored");
           continue;
@@ -571,7 +867,18 @@ void Initialize() {
           Message(info.name + ": " + relative + " is too big; ignored");
           continue;
         }
+        if (!textFits && type == 0x53545247 && // 'STRG'
+            PathString(file.parent_path().filename()) == PortRemastered::kTextFolder) {
+          ++textLeftOut;
+          continue;
+        }
+        if (!hudFits && type == 0x46524D45 && // 'FRME'
+            PathString(file.parent_path().filename()) == PortRemastered::kHudFolder) {
+          ++hudLeftOut;
+          continue;
+        }
         loose[{type, id}] = {type, id, PathString(file), size, info.name};
+        sResourceProviders[{type, id}] = PathString(modDir);
         looseMod[{type, id}] = modIndex;
         if (type == 0x54585452) { // 'TXTR': an earlier mod's image was made for another texture
           sNativeTextures.erase(id);
@@ -581,6 +888,14 @@ void Initialize() {
       const int32_t entry = DVDConvertPathToEntrynum(("/" + relative).c_str());
       DVDDir dir;
       if (entry < 0 || entry >= aurora_dvd_base_entry_count() || DVDFastOpenDir(entry, &dir)) {
+        // A movie the disc lacks is added: the game opens movies by name, and
+        // Trilogy's MP1 has none of the GameCube ones (the front end falls back
+        // to its own only when the GameCube name is missing).
+        if (EndsWith(Lower(name), ".thp") && (entry < 0 || entry >= aurora_dvd_base_entry_count()) && size > 0 &&
+            size <= kMaxFileSize) {
+          addedMovies[Lower("/" + relative)] = {"/" + relative, {PathString(file), size, modIndex}};
+          continue;
+        }
         if (!IsDocument(name)) {
           Message(info.name + ": " + relative + " is not a disc file; ignored");
         }
@@ -592,9 +907,116 @@ void Initialize() {
       }
       replaced[entry] = {PathString(file), size, modIndex};
     }
+    if (textLeftOut != 0) {
+      Message(info.name + ": its text was imported from another disc; this disc's text is used (" +
+              std::to_string(textLeftOut) + " table(s) left out; import Remastered again with this disc for its text)");
+    }
+    if (hudLeftOut != 0) {
+      Message(info.name + ": its HUD was imported from another disc; this disc's HUD is used (" +
+              std::to_string(hudLeftOut) + " frame(s) left out; import Remastered again with this disc for its HUD)");
+    }
     info.textures = int(native.size());
     for (auto& [id, path] : native) {
       sNativeTextures[id] = std::move(path);
+      sResourceProviders[{0x54585452, id}] = PathString(modDir);
+    }
+  }
+
+  // The generated ball looks (port_ball_looks.h): with mods on or off, under
+  // every mod. A mod with a look of its own of a ball (the Remastered import)
+  // keeps all of it; the other looks are still made.
+  {
+    const bool wanted = PortDebug::GeneratedBallLooks() && !sSuspended;
+    unsigned active = 0;
+    if (wanted) {
+      for (const PortBallLooks::Look look : PortBallLooks::kLooks) {
+        const std::vector<std::pair<uint32_t, uint32_t>> keys = PortBallLooks::ModelKeys(look);
+        const bool replaced =
+            std::any_of(keys.begin(), keys.end(), [&](const auto& key) { return loose.count(key) != 0; });
+        if (replaced) {
+          PortLog::Write("mods: a mod has its own %s; the generated one is left out\n", PortBallLooks::Name(look));
+          continue;
+        }
+        for (PortMods::LooseResource& resource : PortBallLooks::Collect(look)) {
+          loose.emplace(std::pair{resource.type, resource.id}, std::move(resource));
+          active |= 1u << unsigned(look);
+        }
+      }
+    }
+    PortBallLooks::SetState(wanted, active);
+  }
+
+  // The picked suit colours (port_suit_colours.h): after the ball looks, whose
+  // generated textures they recolour too, and under every mod's own.
+  {
+    std::array<std::string, PortSuitColours::kSuitCount> served{};
+    if (!sSuspended && !PortDebug::OriginalExperience()) {
+      for (int suit = 0; suit < PortSuitColours::kSuitCount; ++suit) {
+        // One snapshot: the UI may change the picks meanwhile. Recorded even
+        // when nothing could be made, so Apply does not stay pending.
+        const PortSuitColours::Picks picks = PortSuitColours::SuitPicks(suit);
+        served[suit] = PortSuitColours::PicksKey(suit, picks);
+        if (suit >= PortSuitColours::kDreadFirst) {
+          if (dreadDir.empty()) {
+            continue;
+          }
+          // Only the import's own images: a later mod's stays.
+          const auto source = [&](uint32_t id) {
+            const auto found = sNativeTextures.find(id);
+            return found != sNativeTextures.end() &&
+                           PathString(PathFromString(found->second).parent_path()) == dreadDir
+                       ? found->second
+                       : std::string();
+          };
+          for (auto& [id, path] : PortSuitColours::CollectDread(suit, picks, dreadDir, source)) {
+            sNativeTextures[id] = std::move(path);
+          }
+          continue;
+        }
+        std::vector<LooseResource> made = PortSuitColours::Collect(suit, picks, loose, &HasNativeTexture);
+        for (LooseResource& resource : made) {
+          loose[{resource.type, resource.id}] = std::move(resource);
+        }
+      }
+    }
+    PortSuitColours::SetServed(served);
+  }
+
+  // The bodies the Dread Samus import serves, for the game to leave out Prime's cannon on them.
+  {
+    std::string ids;
+    for (const auto& t : PortDreadSamus::kBallTargets) {
+      const auto ownership = PortDreadSamus::ResolveBallOwnership(t.suit, t.spider, [&](uint32_t type, uint32_t id) {
+        const auto it = loose.find({type, id});
+        return it != loose.end() && it->second.mod == PortDreadSamus::kModName;
+      });
+      const uint32_t model = PortDreadSamus::BallModel(t.suit, t.spider);
+      if (ownership.main) sDreadBalls.insert(model);
+      if (ownership.low) sDreadLowBalls.insert(model);
+    }
+    for (int suit = 0; suit < 4; ++suit) {
+      const auto it = loose.find({0x434D444Cu, PortDreadSamus::FirstPersonCannon(suit)});  // 'CMDL'
+      if (it != loose.end() && it->second.mod == PortDreadSamus::kModName) {
+        sDreadCannons.insert(it->first.second);
+      }
+    }
+    for (const auto& [key, resource] : loose) {
+      if (key.first == 0x434D444C && resource.mod == PortDreadSamus::kModName) { // 'CMDL'
+        if (!PortDreadSamus::IsBody(key.second)) continue;
+        sDreadBodies.insert(key.second);
+        char text[12];
+        std::snprintf(text, sizeof(text), " %08X", key.second);
+        ids += text;
+      }
+    }
+    for (const auto& [key, resource] : loose) {
+      if (key.first == 0x43494E46 && resource.mod == PortDreadSamus::kModName) { // 'CINF'
+        sDreadSkeletons.insert(key.second);
+      }
+    }
+    if (!sDreadBodies.empty()) {
+      PortLog::Write("mods: %s serves %zu Samus body model(s):%s\n", PortDreadSamus::kModName, sDreadBodies.size(),
+                     ids.c_str());
     }
   }
 
@@ -694,8 +1116,9 @@ void Initialize() {
       extra.push_back(std::move(file));
     }
     for (const auto& [key, resource] : loose) {
-      if (used.count(key) != 0) {
-        ++sStatus.mods[looseMod[key]].resources;
+      const auto mod = looseMod.find(key);
+      if (used.count(key) != 0 && mod != looseMod.end()) {
+        ++sStatus.mods[mod->second].resources;
       }
     }
   }
@@ -725,6 +1148,20 @@ void Initialize() {
     if (whole.length > 0) {
       file->segments.push_back(whole);
     }
+    sFiles.push_back(std::move(file));
+  }
+  for (const auto& [key, movie] : addedMovies) {
+    const Replacement& replacement = movie.second;
+    ++sStatus.mods[replacement.mod].files;
+    auto file = std::make_shared<VirtualFile>();
+    file->discPath = movie.first;
+    file->size = replacement.size;
+    Segment whole;
+    whole.kind = Segment::kHost;
+    whole.length = replacement.size;
+    whole.hostPath = replacement.hostPath;
+    whole.hostSize = replacement.size;
+    file->segments.push_back(whole);
     sFiles.push_back(std::move(file));
   }
   for (auto& [entry, file] : patched) {

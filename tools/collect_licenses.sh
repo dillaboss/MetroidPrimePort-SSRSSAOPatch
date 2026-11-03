@@ -9,7 +9,10 @@
 #
 # Each fetched package's first licence file is filed as <dep>.txt (e.g.
 # sdl-src.txt); further ones (zstd's COPYING, a dual licence) as
-# <dep>-<file>. Run it after the build: the fetched sources exist only then.
+# <dep>-<file>, and notices further down a package's tree under
+# <dep>/<their path>. Run it after the build: the fetched sources exist only
+# then. Every release package uses it (the AppImage and tarball, the Windows
+# zip and the macOS app), so they all carry the same set.
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
@@ -57,6 +60,22 @@ for src in "$BUILD"/_deps/*-src; do
     done
 done
 shopt -u nullglob nocaseglob
+
+# Notices deeper inside a fetched package cover code it bundles (SDL's hidapi
+# and yuv2rgb, Tracy's libbacktrace, ...). They keep their path, under
+# <dep>/, since their names repeat; a package's own build/ trees (copies made
+# while building it) are skipped. find rather than globstar: macOS ships bash 3.2.
+for src in "$BUILD"/_deps/*-src; do
+    [[ -d "$src" ]] || continue
+    dep=$(basename "$src")
+    (cd "$src" && find . -mindepth 2 -type f -not -path '*/build/*' \
+        \( -iname 'LICENSE*' -o -iname 'COPYING*' -o -iname 'NOTICE*' \) -print) |
+        while IFS= read -r notice; do
+            notice=${notice#./}
+            mkdir -p "$DEST/$dep/$(dirname "$notice")"
+            copy "$src/$notice" "$dep/$notice"
+        done
+done
 
 if [[ $found = 0 ]]; then
     echo "warning: no fetched package notices under $BUILD/_deps" >&2

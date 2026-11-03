@@ -4,6 +4,8 @@
 #include <aurora/aurora.h>
 
 #include "port_debug.h"
+#include <algorithm>
+#include <cmath>
 
 #include <atomic>
 #ifdef __ANDROID__
@@ -52,6 +54,7 @@ Java_org_metroidprime_port_MetroidPrimeActivity_nativeFramePresented(JNIEnv*, jc
 #include "Kyoto/Graphics/CGraphicsSys.hpp"
 #include "Kyoto/Graphics/CTexture.hpp"
 #include "Kyoto/Math/CRelAngle.hpp"
+#include "Kyoto/Particles/PortParticleMath.hpp"
 
 #include "GameVersions.h"
 #include "dolphin/types.h"
@@ -546,10 +549,21 @@ void CGraphics::LoadLight(ERglLight light, const CLight& info) {
     CVector3f hdrPos = info.GetPosition() + info.GetPortHdrOffset();
     MTXMultVec(mCameraMtx, reinterpret_cast< VecPtr >(&hdrPos), reinterpret_cast< VecPtr >(&hdrPos));
     const f32 viewPos[3] = {hdrPos.GetX(), hdrPos.GetY(), hdrPos.GetZ()};
+    f32 toLight[3];
+    if (info.HasPortHdrCone()) {
+      // SCachedLight::Initialize 0x16b5c8 +0x20: the way to the light, minus the turned axis.
+      CVector3f axis = info.GetPortHdrConeAxis();
+      MTXMultVecSR(mCameraMtx, reinterpret_cast< VecPtr >(&axis), reinterpret_cast< VecPtr >(&axis));
+      toLight[0] = -axis.GetX();
+      toLight[1] = -axis.GetY();
+      toLight[2] = -axis.GetZ();
+    }
     GXSetPBRLightHdr(lightId, info.GetPortHdrColor(), viewPos, info.GetPortHdrR0(),
-                     info.GetPortHdrR1(), info.GetPortHdrFalloff());
+                     info.GetPortHdrR1(), info.GetPortHdrFalloff(), info.GetPortHdrWiden(),
+                     info.HasPortHdrCone() ? toLight : nullptr, info.GetPortHdrConeScale(),
+                     info.GetPortHdrConeBias());
   } else {
-    GXSetPBRLightHdr(lightId, nullptr, nullptr, 0.f, 0.f, 0);
+    GXSetPBRLightHdr(lightId, nullptr, nullptr, 0.f, 0.f, 0, 0.f, nullptr, 0.f, 0.f);
   }
 #endif
 }
@@ -774,10 +788,24 @@ void CGraphics::SetScissor(int left, int bottom, int width, int height) {
   GXSetScissor(left, mRenderModeObj.efbHeight - (bottom + height), width, height);
 }
 
+
+#ifdef TARGET_PC
+namespace {
+CColor sPortAmbientColor(0.f, 0.f, 0.f, 1.f);
+} // namespace
+#endif
+
 void CGraphics::SetAmbientColor(const CColor& color) {
+#ifdef TARGET_PC
+  sPortAmbientColor = color;
+#endif
   CGX::SetChanAmbColor(CGX::Channel0, color.GetGXColor());
   CGX::SetChanAmbColor(CGX::Channel1, color.GetGXColor());
 }
+
+#ifdef TARGET_PC
+CColor CGraphics::GetAmbientColor() { return sPortAmbientColor; }
+#endif
 
 void CGraphics::SetCopyClear(const CColor& color, float depth) {
   mClearColor = color;
@@ -789,6 +817,8 @@ void CGraphics::SetClearColor(const CColor& color) {
   mClearColor = color;
   GXSetCopyClear(mClearColor.GetGXColor(), mClearDepthValue);
 }
+
+void CGraphics::PortResendCopyClear() { GXSetCopyClear(mClearColor.GetGXColor(), mClearDepthValue); }
 
 void CGraphics::ClearBackAndDepthBuffers() {
   GXInvalidateTexAll();
@@ -1442,9 +1472,20 @@ void CGraphics::LoadDolphinSpareTexture(int width, int height, GXCITexFmt fmt, G
   }
 }
 
-void CGraphics::TickRenderTimings(uint ticks) {
-  mRenderTimings = (mRenderTimings + ticks) % (900 * 60);
-  mSecondsMod900 = static_cast< float >(mRenderTimings) / 60.f;
+// Port: the clock counts 1/60 s frames as on GC, but advances by the time the
+// ticks covered, so it stays real-time at any sim rate or adaptive step. The
+// fraction of a frame is carried and shown, so it doesn't step at 60 Hz.
+namespace {
+double sRenderTimingCarry = 0.0;
+} // namespace
+
+void CGraphics::TickRenderTimings(uint ticks, float tickSeconds) {
+  sRenderTimingCarry += static_cast< double >(ticks) * static_cast< double >(tickSeconds) * 60.0;
+  const double whole = std::floor(sRenderTimingCarry + 1e-6);
+  sRenderTimingCarry = std::max(0.0, sRenderTimingCarry - whole);
+  mRenderTimings = (mRenderTimings + static_cast< uint >(whole)) % (900 * 60);
+  mSecondsMod900 =
+      static_cast< float >((static_cast< double >(mRenderTimings) + sRenderTimingCarry) / 60.0);
 }
 
 // Remastered's CScene::SimulateScene adds floor(dt * 600 + 0.5) ticks (1/600 s) and wraps the
@@ -1456,7 +1497,12 @@ double sRenderTimePresentLag = 0.0;
 } // namespace
 
 void CGraphics::TickSimTime(float dt) {
-  const uint add = static_cast< uint >(static_cast< double >(dt) * 600.0 + 0.5);
+  // Port: carry the rounding, so steps that aren't whole 1/600 s (adaptive or
+  // other sim rates) don't drift. At 60 Hz this adds 10 per tick, as Remastered.
+  static double sSimTickCarry = 0.0;
+  sSimTickCarry += static_cast< double >(dt) * 600.0;
+  const uint add = static_cast< uint >(std::max(0.0, std::floor(sSimTickCarry + 0.5)));
+  sSimTickCarry -= add;
   mSimTicks = (mSimTicks + add) % 9072000u;
   sLastSimTickAdd = add;
 }
@@ -1514,6 +1560,29 @@ void CGraphics::FlushProjection() {
     GXSetProjection(mtx, GX_ORTHOGRAPHIC);
   }
 }
+
+#ifdef TARGET_PC
+void CGraphics::PortSetProjectionDepthBias(float bias, float depth, float rangeSpan) {
+  if (bias == 0.f) {
+    FlushProjection();
+    return;
+  }
+  Mtx44 mtx;
+  if (mProj.IsPerspective()) {
+    MTXFrustum(mtx, mProj.GetTop(), mProj.GetBottom(), mProj.GetLeft(), mProj.GetRight(),
+               mProj.GetNear(), mProj.GetFar());
+    mtx[2][2] = PortParticleMath::DepthBiasedProjM22(mtx[2][2], mtx[2][3], mtx[3][2], mtx[3][3], depth, bias,
+                                                     rangeSpan);
+    GXSetProjection(mtx, GX_PERSPECTIVE);
+  } else {
+    MTXOrtho(mtx, mProj.GetTop(), mProj.GetBottom(), mProj.GetLeft(), mProj.GetRight(),
+             mProj.GetNear(), mProj.GetFar());
+    mtx[2][2] = PortParticleMath::DepthBiasedProjM22(mtx[2][2], mtx[2][3], mtx[3][2], mtx[3][3], depth, bias,
+                                                     rangeSpan);
+    GXSetProjection(mtx, GX_ORTHOGRAPHIC);
+  }
+}
+#endif
 
 const CGraphics::CProjectionState& CGraphics::GetProjectionState() { return mProj; }
 

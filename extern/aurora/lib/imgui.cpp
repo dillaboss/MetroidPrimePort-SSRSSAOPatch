@@ -23,6 +23,7 @@
 #include "backends/imgui_impl_sdlrenderer3.h"
 #include "backends/imgui_impl_wgpu.h"
 #include "tracy/Tracy.hpp"
+#include "gfx/texture_sites.hpp"
 
 namespace aurora::imgui {
 namespace {
@@ -55,13 +56,13 @@ wgpu::Buffer create_texture_upload_buffer(uint32_t width, uint32_t height, const
     dst += copyBytesPerRow;
     data += rowBytes;
   }
-  buffer.Unmap();
   return buffer;
 }
 
 void enqueue_texture_upload(wgpu::Buffer buffer, wgpu::TexelCopyTextureInfo dst, wgpu::TexelCopyBufferLayout layout,
                             wgpu::Extent3D size) {
   gfx::render_worker::enqueue_work([buffer = std::move(buffer), dst = std::move(dst), layout, size] {
+    buffer.Unmap();
     const wgpu::CommandEncoderDescriptor encoderDesc{
         .label = "imgui texture upload encoder",
     };
@@ -288,6 +289,7 @@ ImTextureID add_texture(uint32_t width, uint32_t height, const uint8_t* data) no
       .mipLevelCount = WGPU_MIP_LEVEL_COUNT_UNDEFINED,
       .arrayLayerCount = WGPU_ARRAY_LAYER_COUNT_UNDEFINED,
   };
+  AURORA_NOTE_TEXTURE(&textureDescriptor);
   auto texture = webgpu::g_device.CreateTexture(&textureDescriptor);
   auto textureView = texture.CreateView(&textureViewDescriptor);
   {

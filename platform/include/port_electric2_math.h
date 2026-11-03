@@ -76,10 +76,28 @@ inline void Electric2RibbonSidePoints(const V3& center, const V3& width, float l
   theta180 = center - width * leftRad;
 }
 
-// ELC2's vertex AddVar is multiplied by inverse exposure before the VFX shader applies
-// the room exposure. A missing/nonpositive exposure means no exposed-room factor is active.
-inline float ExposureCompensatedIntensity(float intensity, float exposure) {
-  return std::isfinite(exposure) && exposure > 0.f ? intensity / exposure : intensity;
+// The half-widths one node is drawn with (UpdateBolt 0xb77638, once per node): node+0x28 = LRAD;
+// if LRAD is present and LLRD is set it is copied to node+0x2c; then RRAD, if present, overwrites
+// node+0x2c; both are scaled by node+0x1c = RADS. A missing element keeps the node's default
+// (RADS 1, LRAD 0.1, RRAD 0.1). Null pointers here mean the element is absent.
+struct BoltRadii {
+  float left = 0.f;
+  float right = 0.f;
+};
+
+inline BoltRadii ComputeBoltRadii(float rads, const float* lrad, const float* rrad, bool llrd) {
+  float left = 0.1f;
+  float right = 0.1f;
+  if (lrad != nullptr) {
+    left = *lrad;
+    if (llrd) {
+      right = left;
+    }
+  }
+  if (rrad != nullptr) {
+    right = *rrad;
+  }
+  return BoltRadii{rads * left, rads * right};
 }
 
 // CRandom16 as the ELC2 object uses it: seed = seed * 0x41c64e6d + 0x3039, Float() reads the

@@ -29,6 +29,14 @@
 
 #include "math.h"
 
+#ifdef TARGET_PC
+#include "port_third_person.h"
+
+// Third person: where its camera stood from the eye as the morph began; the ToBall camera
+// leaves from there.
+static CVector3f sPortToBallOffset = CVector3f::Zero();
+#endif
+
 static CMaterialList kLineOfSightIncludeList = CMaterialList(kMT_Solid);
 static CMaterialList kLineOfSightExcludeList =
     CMaterialList(kMT_ProjectilePassthrough, kMT_Player, kMT_Character, kMT_CameraPassthrough);
@@ -1762,6 +1770,11 @@ void CBallCamera::UpdateUsingTransitions(float dt, CStateManager& mgr) {
         FindDesiredPosition(distance, elevation, mgr.GetPlayer()->GetMovementDirection(), mgr,
                             nearDoor) -
         eyePos;
+#ifdef TARGET_PC
+    // Third person: from its camera (SetState) rather than the eye.
+    toDesired -= sPortToBallOffset;
+    eyePos += sPortToBallOffset;
+#endif
     CVector3f finalPos = eyePos + toDesired * player->GetMorphBallTransitionFactor();
 
     if (CPhysicsActor* act = TCastToPtr< CPhysicsActor >(mgr.ObjectById(x46c_collisionActorId))) {
@@ -2385,6 +2398,15 @@ void CBallCamera::SetState(EBallCameraState state, CStateManager& mgr) {
   switch (state) {
   case kBCS_ToBall: {
     CTransform4f xf = mgr.CameraManager()->GetFirstPersonCamera()->GetTransform();
+#ifdef TARGET_PC
+    // Third person: from where its camera is, not the eye it left.
+    CVector3f tpPos;
+    sPortToBallOffset = CVector3f::Zero();
+    if (PortThirdPerson::MorphCameraPosition(mgr, xf, tpPos)) {
+      sPortToBallOffset = tpPos - mgr.GetPlayer()->GetEyePosition();
+      xf.SetTranslation(tpPos);
+    }
+#endif
     SetTransform(xf);
     TeleportCamera(xf.GetTranslation(), mgr);
     InterpolateFOV(mgr.CameraManager()->GetFirstPersonCamera()->GetFov(),
@@ -2677,7 +2699,7 @@ void CBallCamera::OverrideCameraInfo(CStateManager& mgr) {
 
 bool CBallCamera::CheckFailsafeFromMorphBallState(CStateManager& mgr) {
   TUniqueId intersectId = kInvalidUniqueId;
-  rstl::reserved_vector< TUniqueId, 1024 > nearList;
+  rstl::reserved_vector< TUniqueId, kMaxObjects > nearList;
   rstl::reserved_vector< CRayCastResult, 6 > frontResults;
   rstl::reserved_vector< CRayCastResult, 6 > backResults;
 

@@ -19,6 +19,7 @@ class CCollisionActorManager;
 class CTexture;
 
 class COmegaPirate : public CElitePirate {
+  friend struct PortEntitySchema; // save-state field schema (platform/include/port_entity_schema.h)
 public:
   COmegaPirate(TUniqueId uid, const rstl::string& name, const CEntityInfo& info,
                const CTransform4f& xf, const CModelData& mData, const CPatternedInfo& pInfo,
@@ -38,6 +39,10 @@ public:
   void Attack(CStateManager& mgr, EStateMsg msg, float dt) override;
   void JumpBack(CStateManager& mgr, EStateMsg msg, float dt) override;
   void DoubleSnap(CStateManager& mgr, EStateMsg msg, float dt) override;
+#ifdef TARGET_PC
+  // Save-state restore: see the definition.
+  void PortRestoredFromSave(CStateManager& mgr);
+#endif
   void Shuffle(CStateManager& mgr, EStateMsg msg, float dt) override;
   void Skid(CStateManager& mgr, EStateMsg msg, float dt) override;
   void Suck(CStateManager& mgr, EStateMsg msg, float dt) override;
@@ -67,6 +72,7 @@ public:
 
 private:
   class CFlash : public CActor {
+    friend struct PortEntitySchema; // save-state field schema (platform/include/port_entity_schema.h)
   public:
     DECLARE_TYPES_MATCH_OR_ACCEPT;
     void Think(float dt, CStateManager& mgr) override;
@@ -216,6 +222,9 @@ private:
   uchar xb79_bossPhaseActive;
   rstl::vector< uchar > xb7c_;
   float xb8c_avoidStaticCollisionTime;
+#ifdef TARGET_PC
+  bool mPortResetInDetach;
+#endif
 };
 CHECK_SIZEOF(COmegaPirate, (VERSION >= VERSION_GM8P_00 ? 0xba0 : 0xB90))
 

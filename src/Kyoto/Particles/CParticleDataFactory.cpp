@@ -3,7 +3,11 @@
 #include <algorithm>
 
 #ifdef TARGET_PC
+#include <cstdlib>
 #include "aurora/vfx.hpp"
+#include "port_log.h"
+#include "port_vfx_read.h"
+#include "Kyoto/Particles/CPortParticleParseScope.hpp"
 #endif
 #include "Kyoto/CFactoryFnReturn.hpp"
 #include "Kyoto/CRandom16.hpp"
@@ -15,8 +19,13 @@
 #include "Kyoto/Particles/CGenDescription.hpp"
 #include "Kyoto/Particles/CIntElement.hpp"
 #include "Kyoto/Particles/CModVectorElement.hpp"
+#ifdef TARGET_PC
+#include "Kyoto/Particles/CPortCurlNoise.hpp"
+#endif
 #include "Kyoto/Particles/CParticleGen.hpp"
+#include "Kyoto/Particles/CPortKeyframeInput.hpp"
 #include "Kyoto/Particles/CPortParticleVars.hpp"
+#include "Kyoto/Particles/CPortSystemTween.hpp"
 #include "Kyoto/Particles/CRealElement.hpp"
 #include "Kyoto/Particles/CSpawnSystemKeyframeData.hpp"
 #include "Kyoto/Particles/CSwooshDescription.hpp"
@@ -30,6 +39,8 @@
 #include "rstl/algorithm.hpp"
 #include "rstl/list.hpp"
 #include "rstl/optional_object.hpp"
+
+#include <cstring>
 #define SBIG(v) v
 
 CTexture* CreateTexture(int value);
@@ -37,6 +48,320 @@ CTexture* CreateTexture(int value);
 rstl::list< CElementAllocationChunk > sElementAllocationChunks;
 CElementAllocationChunk* IElement::CElementAllocator::sCurrentChunk = nullptr;
 CElementAllocationChunk* IElement::CElementAllocator::sFreeChunk = nullptr;
+
+#ifdef TARGET_PC
+// Set by a CODE emitter (GetEmitterElement 0x264bc4 sets its bool&), read by the EMTR property.
+static bool sPortCodeEmitter = false;
+// Set by a PEMV vector (CGenDescription::xPortPemv), collected per description in GetGPSM.
+static u8 sPortPemv = 0;
+// A PITP mode word with this bit is an ITPE the effect left out (Remastered's default 1);
+// MP_ITPE_DEFAULT=0 drops those, to compare.
+static const u32 kPortSpreadDefault = 0x100;
+static bool PortSpreadDefault() {
+  static const bool on = [] {
+    const char* env = getenv("MP_ITPE_DEFAULT");
+    return env == nullptr || env[0] != '0';
+  }();
+  return on;
+}
+
+namespace {
+// Port-only SLCT (the converter's Writer::Element): an int index, a count word, then count
+// entries of the selecting element's own type.
+template < class Select, class Element >
+Select* PortReadSelect(CInputStream& in, Element* (*readEntry)(CInputStream&)) {
+  CIntElement* index = CParticleDataFactory::GetIntElement(in);
+  const uint count = in.ReadLong();
+  std::vector< Element* > entries;
+  bool ok = index != nullptr && count != 0 && count <= 256;
+  for (uint i = 0; ok && i < count; ++i) {
+    entries.push_back(readEntry(in));
+    ok = entries.back() != nullptr;
+  }
+  if (!ok) {
+    delete index;
+    for (Element* entry : entries) {
+      delete entry;
+    }
+    return nullptr;
+  }
+  return rs_new Select(index, std::move(entries));
+}
+
+// SPA*/DPV*/TPV* (the converter's parent reads): n or a PVAR guid, then the fallback.
+template < class Read, class Element >
+Element* PortReadParentVar(CInputStream& in, EPortParentRead kind, Element* (*get)(CInputStream&)) {
+  SPortParentRead read;
+  read.kind = kind;
+  if (kind == EPortParentRead::System) {
+    read.n = in.ReadLong();
+  } else {
+    in.ReadBytes(read.guid.bytes.data(), 16);
+  }
+  Element* fallback = get(in);
+  if (fallback == nullptr) {
+    return nullptr;
+  }
+  return rs_new Read(read, fallback);
+}
+} // namespace
+
+// A PSYS body (after the CNST class id): u32 count, then per item u32 type, slot and
+// init-only flag and the element. Null on a malformed one. Swooshes read it too.
+CPortSys* PortReadSys(CInputStream& in) {
+  const u32 count = in.ReadLong();
+  if (count > 256) {
+    return nullptr;
+  }
+  std::unique_ptr< CPortSys > sys(new CPortSys());
+  sys->items.resize(count);
+  for (SPortSysItem& item : sys->items) {
+    const u32 type = in.ReadLong();
+    item.slot = in.ReadLong();
+    item.initOnly = in.ReadLong() != 0;
+    if (type > static_cast< u32 >(EPortVarType::Vector) || item.slot > 255) {
+      return nullptr;
+    }
+    item.type = static_cast< EPortVarType >(type);
+    bool ok = false;
+    switch (item.type) {
+    case EPortVarType::Real:
+      ok = (item.real = CParticleDataFactory::GetRealElement(in)) != nullptr;
+      break;
+    case EPortVarType::Int:
+      ok = (item.intE = CParticleDataFactory::GetIntElement(in)) != nullptr;
+      break;
+    case EPortVarType::Color:
+      ok = (item.color = CParticleDataFactory::GetColorElement(in)) != nullptr;
+      break;
+    default:
+      ok = (item.vec = CParticleDataFactory::GetVectorElement(in)) != nullptr;
+      break;
+    }
+    if (!ok) {
+      return nullptr;
+    }
+    sys->counts[type] = std::max(sys->counts[type], item.slot + 1);
+    if (!item.initOnly && item.slot < 10) {
+      sys->defined[type] |= 1u << item.slot;
+    }
+  }
+  return sys.release();
+}
+
+CPortPartVars* PortReadPartVars(CInputStream& in, bool swoosh) {
+  const u32 count = in.ReadLong();
+  if (count > 21) {
+    return nullptr;
+  }
+  std::unique_ptr< CPortPartVars > vars(new CPortPartVars());
+  vars->items.resize(count);
+  u32 seen = 0;
+  bool bad = false;
+  for (SPortPartVarItem& item : vars->items) {
+    const u32 kind = in.ReadLong();
+    const u32 slot = in.ReadLong();
+    item.constAfterStart = in.ReadLong() != 0;
+    if (kind > 4) {
+      return nullptr;  // the item's body length is unknown: the stream cannot be resynced
+    }
+    // A bad slot or a duplicate (it would evaluate the variable twice) still reads its element,
+    // so the rest of the property is consumed and the stream stays in sync; the table is dropped.
+    if (slot >= (kind >= 2 ? 4u : kind == 1 ? 9u : 8u) ||
+        (swoosh ? kind == 0 : kind == 1 && slot != 8)) {
+      bad = true;
+    } else {
+      // Bits: ADV 0..8, IAV 9..12, VAV 13..16, CAV 17..20.
+      const u32 bit = 1u << (kind >= 2 ? 9 + (kind - 2) * 4 + slot : slot);
+      bad = bad || (seen & bit) != 0;
+      seen |= bit;
+    }
+    item.kind = static_cast< EPortPartVarKind >(kind);
+    item.slot = slot;
+    if (kind == 1 && (item.real = CParticleDataFactory::GetRealElement(in)) == nullptr) {
+      return nullptr;
+    }
+    if (kind == 2 && (item.intE = CParticleDataFactory::GetIntElement(in)) == nullptr) {
+      return nullptr;
+    }
+    if (kind == 3 && (item.vec = CParticleDataFactory::GetVectorElement(in)) == nullptr) {
+      return nullptr;
+    }
+    if (kind == 4 && (item.color = CParticleDataFactory::GetColorElement(in)) == nullptr) {
+      return nullptr;
+    }
+  }
+  return bad ? nullptr : vars.release();
+}
+
+namespace {
+
+enum EPortKssmKind { kPKK_Real, kPKK_Vector, kPKK_Rotation };
+
+// One node of a PKSM component tree (the converter's Writer::Component*), appended to kssm.nodes
+// with its index in `out`; false on anything the converter does not write.
+bool PortReadKssmNode(CInputStream& in, CGenDescription::PortKssm& kssm,
+                      CGenDescription::PortKssmComponent& component, EPortKssmKind kind, int depth,
+                      u32& out, bool noneIsAbsent = false) {
+  if (depth > 64 || kssm.nodes.size() >= 100000) {
+    return false;
+  }
+  CGenDescription::PortKssmNode node;
+  node.op = in.ReadLong();
+  if (noneIsAbsent && node.op == SBIG('NONE')) {
+    out = ~0u;
+    return true;
+  }
+  EPortKssmKind args[5];
+  int argCount = 0;
+  if (kind == kPKK_Real) {
+    switch (node.op) {
+    case SBIG('CNST'):
+      node.value = in.ReadFloat();
+      break;
+    case SBIG('VARF'):
+    case SBIG('PSYR'):
+      node.slot = in.ReadLong();
+      break;
+    case SBIG('KEYE'): {
+      const u32 percent = in.ReadLong();
+      in.ReadLong();
+      node.loop = in.ReadChar() != 0;
+      in.ReadChar();
+      in.ReadLong();
+      node.loopStart = in.ReadLong();
+      const u32 count = in.ReadLong();
+      if (percent != 0 || count == 0 || count > kPortVfxMaxElems) {
+        return false;
+      }
+      node.keys.resize(count);
+      for (u32 i = 0; i < count; ++i) {
+        node.keys[i] = in.ReadFloat();
+      }
+      break;
+    }
+    case SBIG('IRND'):
+      node.slot = component.latches;
+      component.latches += 1;
+      args[0] = args[1] = kPKK_Real;
+      argCount = 2;
+      break;
+    case SBIG('ADD_'):
+    case SBIG('MULT'):
+    case SBIG('RAND'):
+      args[0] = args[1] = kPKK_Real;
+      argCount = 2;
+      break;
+    default:
+      return false;
+    }
+  } else if (kind == kPKK_Vector) {
+    switch (node.op) {
+    case SBIG('EXTT'):
+    case SBIG('EXTS'):
+      break;
+    case SBIG('KPIN'):
+      node.slot = component.latches;
+      component.latches += 3;
+      args[0] = kPKK_Vector;
+      argCount = 1;
+      break;
+    case SBIG('ADD_'):
+    case SBIG('MULT'):
+      args[0] = args[1] = kPKK_Vector;
+      argCount = 2;
+      break;
+    case SBIG('ROTV'):
+      args[0] = kPKK_Vector;
+      args[1] = kPKK_Rotation;
+      argCount = 2;
+      break;
+    case SBIG('CNST'):
+      args[0] = args[1] = args[2] = kPKK_Real;
+      argCount = 3;
+      break;
+    case SBIG('CIRC'):
+      args[0] = args[1] = kPKK_Vector;
+      args[2] = args[3] = args[4] = kPKK_Real;
+      argCount = 5;
+      break;
+    default:
+      return false;
+    }
+  } else {
+    switch (node.op) {
+    case SBIG('EXTR'):
+    case SBIG('IDNT'):
+      break;
+    case SBIG('REUL'):
+      args[0] = args[1] = args[2] = kPKK_Real;
+      argCount = 3;
+      break;
+    case SBIG('RADD'):
+      args[0] = args[1] = kPKK_Rotation;
+      argCount = 2;
+      break;
+    case SBIG('KPIN'):
+      node.slot = component.latches;
+      component.latches += 4;
+      args[0] = kPKK_Rotation;
+      argCount = 1;
+      break;
+    default:
+      return false;
+    }
+  }
+  node.argCount = u32(argCount);
+  out = u32(kssm.nodes.size());
+  kssm.nodes.push_back(node);
+  for (int i = 0; i < argCount; ++i) {
+    u32 arg;
+    if (!PortReadKssmNode(in, kssm, component, args[i], depth + 1, arg)) {
+      return false;
+    }
+    kssm.nodes[out].args[i] = arg;
+  }
+  return true;
+}
+
+// Whether a vector tree reads EXTT outside any KPIN (KPIN keeps only its frame-0 value).
+bool PortKssmLiveExtt(const CGenDescription::PortKssm& kssm, u32 index) {
+  const CGenDescription::PortKssmNode& node = kssm.nodes[index];
+  if (node.op == SBIG('EXTT')) {
+    return true;
+  }
+  if (node.op == SBIG('KPIN')) {
+    return false;
+  }
+  for (u32 i = 0; i < node.argCount; ++i) {
+    if (PortKssmLiveExtt(kssm, node.args[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// One KSSM SMOV component: pos vector, delta, rot (NONE = absent), modifier (GRAV or NONE).
+bool PortReadKssmComponent(CInputStream& in, CGenDescription::PortKssm& kssm,
+                           CGenDescription::PortKssmComponent& component) {
+  if (!PortReadKssmNode(in, kssm, component, kPKK_Vector, 0, component.pos)) {
+    return false;
+  }
+  component.liveExtt = PortKssmLiveExtt(kssm, component.pos);
+  for (float& delta : component.delta) {
+    delta = in.ReadFloat();
+  }
+  if (!PortReadKssmNode(in, kssm, component, kPKK_Rotation, 0, component.rot, true)) {
+    return false;
+  }
+  const u32 modifier = in.ReadLong();
+  if (modifier == SBIG('GRAV')) {
+    return PortReadKssmNode(in, kssm, component, kPKK_Vector, 0, component.grav);
+  }
+  return modifier == SBIG('NONE');
+}
+} // namespace
+#endif
 
 void* IElement::CElementAllocator::Alloc(size_t size, const char*, const char*) {
   if (sCurrentChunk == nullptr || !sCurrentChunk->CanAllocate(size)) {
@@ -105,7 +430,18 @@ CGenDescription* CParticleDataFactory::CreateGeneratorDescription(CInputStream& 
     return nullptr;
   }
   CGenDescription* desc = rs_new CGenDescription;
+#ifdef TARGET_PC
+  std::vector< const CREPortKeep* >* const outerKeeps = CPortKeepGlobals::sCollect;
+  CPortKeepGlobals::sCollect = &desc->xPortKeeps;
+  const u8 outerPemv = sPortPemv;
+  sPortPemv = 0;
+#endif
   CreateGPSM(desc, in, assets, pool);
+#ifdef TARGET_PC
+  CPortKeepGlobals::sCollect = outerKeeps;
+  desc->xPortPemv = sPortPemv;
+  sPortPemv = outerPemv;
+#endif
   LoadGPSMTokens(desc);
   return desc;
 }
@@ -140,250 +476,38 @@ void CParticleDataFactory::LoadGPSMTokens(CGenDescription* desc) {
   for (auto& extra : desc->xPortExtraSwooshes) {
     extra.swoosh.ForceCache();
   }
+  if (desc->xPortPsps) {
+    desc->xPortPsps->ForceCache();
+  }
+  if (desc->xPortPspsSwoosh) {
+    desc->xPortPspsSwoosh->ForceCache();
+  }
+  if (desc->xPortKssm) {
+    for (auto& table : desc->xPortKssm->tables) {
+      for (auto& entry : table.entries) {
+        for (auto& spawn : entry.spawns) {
+          if (spawn.type == SBIG('PART')) {
+            spawn.part->ForceCache();
+          } else if (spawn.type == SBIG('SWHC')) {
+            spawn.swoosh->ForceCache();
+          }
+        }
+      }
+    }
+  }
 #endif
 }
 
 #ifdef TARGET_PC
-// Bounds on the port blocks' counts: a VMAT has three UV transforms, and the real particles carry
-// a handful of VPMT/VSMT rows.
-static constexpr u32 kPortVfxMaxVtmt = 3;
-static constexpr u32 kPortVfxMaxElems = 64;
-
-// The VMSH blob v1 (build/mpr/vfx/DESIGN.md section 1). Anything unreadable leaves the PART
-// without a mesh, so its model particles draw as retail.
-static bool PortReadVfxMesh(CPortVfxData& vfx, CInputStream& in, u32 nbytes) {
-  u32 consumed = 0;
-  auto skip = [&]() {
-    for (; consumed + 4 <= nbytes; consumed += 4) {
-      in.ReadLong();
-    }
-  };
-  vfx.meshVerts = vfx.meshTris = 0;
-  vfx.meshV.clear();
-  vfx.meshIdx16.clear();
-  vfx.meshIdx32.clear();
-  if (nbytes < 12) {
-    skip();
-    return true;
-  }
-  const u32 version = in.ReadLong();
-  const u32 nv = in.ReadLong();
-  const u32 nt = in.ReadLong();
-  consumed = 12;
-  const bool wide = nv > 65535;
-  const u64 expect = 12 + u64(nv) * 32 + u64(nt) * 3 * (wide ? 4 : 2);
-  if (version != 1 || nv == 0 || nt == 0 || expect != nbytes) {
-    skip();
-    return true;
-  }
-  vfx.meshV.resize(size_t(nv) * 8);
-  for (float& f : vfx.meshV) {
-    f = in.ReadFloat();
-  }
-  consumed += nv * 32;
-  if (wide) {
-    vfx.meshIdx32.resize(size_t(nt) * 3);
-    for (u32& i : vfx.meshIdx32) {
-      i = in.ReadLong();
-    }
-  } else {
-    vfx.meshIdx16.resize(size_t(nt) * 3);
-    for (u16& i : vfx.meshIdx16) {
-      i = in.ReadShort();
-    }
-  }
-  // The batch indexes its per-particle vertex copy with these, so they must stay inside it.
-  const auto outOfRange = [nv](auto i) { return u32(i) >= nv; };
-  if (std::any_of(vfx.meshIdx32.begin(), vfx.meshIdx32.end(), outOfRange) ||
-      std::any_of(vfx.meshIdx16.begin(), vfx.meshIdx16.end(), outOfRange)) {
-    vfx.meshV.clear();
-    vfx.meshIdx16.clear();
-    vfx.meshIdx32.clear();
-    return true;
-  }
-  vfx.meshVerts = nv;
-  vfx.meshTris = nt;
-  return true;
-}
-
-static CPortVfxData& PortVfxData(std::unique_ptr< CPortVfxData >& vfx) {
-  if (!vfx) {
-    vfx.reset(new CPortVfxData);
-  }
-  return *vfx;
-}
-
-// The VMAT blob v2 (build/mpr/vfx/DESIGN.md section 1). An unknown version is skipped
-// (the material stays absent, so the PART draws as retail).
-static bool PortReadVfxMat(CPortVfxData& vfx, CInputStream& in, u32 nbytes, CSimplePool* pool) {
-  CPortVfxMat& m = vfx.mat;
-  m = CPortVfxMat();
-  u32 consumed = 0;
-  const auto skipRest = [&]() {
-    for (; consumed + 4 <= nbytes; consumed += 4) {
-      in.ReadLong();
-    }
-  };
-  if (nbytes < 16) {
-    skipRest();
-    return true;
-  }
-  const u32 version = in.ReadLong();
-  const u32 features = in.ReadLong();
-  const u32 blend = in.ReadLong();
-  const u32 ntex = in.ReadLong();
-  consumed = 16;
-  // Words after the header: 11 per texture, then 7 slots, 2 ramp rows, the add row, the 11 sources
-  // (3 each) and modulate, depthSoften and spriteCenter. Anything else is not a v2 blob this reader
-  // knows: it is skipped whole, before anything is built, and the PART draws as retail.
-  constexpr u32 kTexWords = 11;
-  constexpr u32 kTailWords = 7 + 2 + 1 + 3 * 11 + 3;
-  if (version != 2 || ntex > 4 || blend > aurora::gfx::vfx::MaxBlend || nbytes != (kTexWords * ntex + kTailWords) * 4 + 16) {
-    skipRest();
-    return true;
-  }
-  m.version = version;
-  m.features = features;
-  m.blend = blend;
-  for (u32 i = 0; i < ntex; ++i) {
-    const CAssetId id = in.ReadLong();
-    TToken< CTexture > tok = id == 0
-                                 ? TToken< CTexture >(CreateTexture(-1))
-                                 : TToken< CTexture >(pool->GetObj(SObjectTag(SBIG('TXTR'), id)));
-    // Built from the token: assigning into a default (null) token would release a null reference.
-    CPortVfxMat::Tex t{TCachedToken< CTexture >(tok)};
-    t.uvSet = in.ReadLong();
-    t.wrapS = in.ReadLong();
-    t.wrapT = in.ReadLong();
-    t.linear = in.ReadLong();
-    t.cols = in.ReadLong();
-    t.rows = in.ReadLong();
-    t.layers = in.ReadLong();
-    t.warped = in.ReadLong();
-    t.warpScale[0] = in.ReadFloat();
-    t.warpScale[1] = in.ReadFloat();
-    m.tex.push_back(t);
-  }
-  m.colorSlot = in.ReadInt32();
-  m.opacitySlot = in.ReadInt32();
-  m.rampSlot = in.ReadInt32();
-  m.ramp2Slot = in.ReadInt32();
-  m.thresholdSlot = in.ReadInt32();
-  m.indirectSlot = in.ReadInt32();
-  m.paletteSlot = in.ReadInt32();
-  m.rampRow[0] = in.ReadInt32();
-  m.rampRow[1] = in.ReadInt32();
-  m.addRow = in.ReadInt32();
-  for (CPortVfxMat::Src& s : m.src) {
-    s.row = in.ReadInt32();
-    s.comp = in.ReadInt32();
-    s.value = in.ReadFloat();
-  }
-  m.modulate = in.ReadFloat();
-  m.depthSoften = in.ReadFloat();
-  m.spriteCenter = in.ReadLong();
-  return true;
-}
-// The port-only material properties a converted PART or SWSH carries (VMAT, VMSH, VTMT, VPMT,
-// VSMT, SSZE, ITEN, VORN). False when the stream can't be resynchronised.
-bool CParticleDataFactory::PortReadVfxProperty(FourCC clsId, std::unique_ptr< CPortVfxData >& vfxPtr,
-                                               CInputStream& in, CSimplePool* pool) {
-  switch (clsId) {
-  case SBIG('VMAT'): {
-    GetClassID(in);
-    const u32 nbytes = in.ReadLong();
-    if (!PortReadVfxMat(PortVfxData(vfxPtr), in, nbytes, pool)) {
-      return false;
-    }
-  } break;
-  case SBIG('VMSH'): {
-    GetClassID(in);
-    const u32 nbytes = in.ReadLong();
-    if (!PortReadVfxMesh(PortVfxData(vfxPtr), in, nbytes)) {
-      return false;
-    }
-  } break;
-  case SBIG('VTMT'): {
-    CPortVfxData& vfx = PortVfxData(vfxPtr);
-    GetClassID(in);
-    for (CRealElement* e : vfx.vtmt) {
-      delete e;
-    }
-    vfx.vtmt.clear();
-    vfx.vtmtCount = in.ReadLong();
-    if (vfx.vtmtCount > kPortVfxMaxVtmt) {
-      // The stream can't be resynchronised; drop the port material so the PART draws as retail.
-      vfxPtr.reset();
-      return false;
-    }
-    for (u32 i = 0; i < vfx.vtmtCount * 6; ++i) {
-      vfx.vtmt.push_back(GetRealElement(in));
-    }
-  } break;
-  case SBIG('VPMT'):
-  case SBIG('VSMT'): {
-    // VPMT: {kind row comp element}; VSMT: {target kind element}
-    const bool isVpmt = clsId == SBIG('VPMT');
-    std::vector< CPortVfxElem >& list = isVpmt ? PortVfxData(vfxPtr).vpmt : PortVfxData(vfxPtr).vsmt;
-    GetClassID(in);
-    const u32 count = in.ReadLong();
-    if (count > kPortVfxMaxElems) {
-      vfxPtr.reset();
-      return false;
-    }
-    for (u32 i = 0; i < count; ++i) {
-      CPortVfxElem elem;
-      if (isVpmt) {
-        elem.kind = in.ReadLong();
-        elem.a = in.ReadLong();
-        elem.b = in.ReadLong();
-      } else {
-        elem.a = in.ReadLong();
-        elem.kind = in.ReadLong();
-      }
-      switch (elem.kind) {
-      case CPortVfxElem::kReal:
-        elem.real = GetRealElement(in);
-        break;
-      case CPortVfxElem::kVector:
-        elem.vec = GetVectorElement(in);
-        break;
-      case CPortVfxElem::kInt:
-        elem.integer = GetIntElement(in);
-        break;
-      case CPortVfxElem::kColor:
-        elem.color = GetColorElement(in);
-        break;
-      default:
-        vfxPtr.reset(); // frees the elements read so far
-        return false;
-      }
-      list.push_back(elem);
-    }
-  } break;
-  case SBIG('SSZE'): {
-    CPortVfxData& vfx = PortVfxData(vfxPtr);
-    delete vfx.ssze;
-    vfx.ssze = GetRealElement(in);
-  } break;
-  case SBIG('ITEN'): {
-    CPortVfxData& vfx = PortVfxData(vfxPtr);
-    delete vfx.iten;
-    vfx.iten = GetRealElement(in);
-  } break;
-  case SBIG('VORN'):
-    GetClassID(in);
-    PortVfxData(vfxPtr).vorn = in.ReadLong();
-    break;
-  default:
-    break;
-  }
-  return true;
-}
+// CParticleDataFactory::PortReadVfxProperty and its VMSH/VMAT readers live in
+// platform/port_particle_vfx_read.cpp.
 #endif
 
 bool CParticleDataFactory::CreateGPSM(CGenDescription* desc, CInputStream& in,
                                       rstl::vector< CAssetId >& resources, CSimplePool* pool) {
+#ifdef TARGET_PC
+  CPortParticleParseScope parseScope;
+#endif
   bool done = false;
   CRandom16 random(99);
   CGlobalRandom context(random);
@@ -445,7 +569,13 @@ bool CParticleDataFactory::CreateGPSM(CGenDescription* desc, CInputStream& in,
       delete GetVectorElement(in);
       break;
     case SBIG('EMTR'):
+#ifdef TARGET_PC
+      sPortCodeEmitter = false;
+#endif
       desc->x2c_EMTR = GetEmitterElement(in);
+#ifdef TARGET_PC
+      desc->xPortCodeSpawn = sPortCodeEmitter;
+#endif
       break;
     case SBIG('SIZE'):
       desc->x38_SIZE = GetRealElement(in);
@@ -458,16 +588,47 @@ bool CParticleDataFactory::CreateGPSM(CGenDescription* desc, CInputStream& in,
       break;
     case SBIG('VMD1'):
       desc->x31_28_VMD1 = GetBool(in);
+#ifdef TARGET_PC
+      if (desc->x31_28_VMD1) {
+        desc->xPortVelocityGlobal[0] = false;
+      }
+#endif
       break;
     case SBIG('VMD2'):
       desc->x31_29_VMD2 = GetBool(in);
+#ifdef TARGET_PC
+      if (desc->x31_29_VMD2) {
+        desc->xPortVelocityGlobal[1] = false;
+      }
+#endif
       break;
     case SBIG('VMD3'):
       desc->x31_30_VMD3 = GetBool(in);
+#ifdef TARGET_PC
+      if (desc->x31_30_VMD3) {
+        desc->xPortVelocityGlobal[2] = false;
+      }
+#endif
       break;
     case SBIG('VMD4'):
       desc->x31_31_VMD4 = GetBool(in);
+#ifdef TARGET_PC
+      if (desc->x31_31_VMD4) {
+        desc->xPortVelocityGlobal[3] = false;
+      }
+#endif
       break;
+#ifdef TARGET_PC
+    case SBIG('VGD1'):
+    case SBIG('VGD2'):
+    case SBIG('VGD3'):
+    case SBIG('VGD4'):
+      GetClassID(in);
+      if (in.ReadLong() != 0) {
+        desc->xPortVelocityGlobal[clsId - SBIG('VGD1')] = true;
+      }
+      break;
+#endif
     case SBIG('VEL1'):
       desc->x68_VEL1 = GetModVectorElement(in);
       break;
@@ -528,21 +689,149 @@ bool CParticleDataFactory::CreateGPSM(CGenDescription* desc, CInputStream& in,
     case SBIG('XFMD'): {
       GetClassID(in);
       const u32 mode = in.ReadLong();
-      desc->xPortXfmd = mode == kPortXfmdFollow || mode == kPortXfmdFollowUnscaled
+      desc->xPortXfmd = mode == kPortXfmdSystem || mode == kPortXfmdFollow ||
+                                mode == kPortXfmdFollowUnscaled
                             ? static_cast< u8 >(mode)
                             : static_cast< u8 >(kPortXfmdRetail);
+    } break;
+    // Port-only Remastered INTS system scale (CGenDescription::xPortIntScale).
+    case SBIG('PINS'):
+      delete desc->xPortIntScale;
+      desc->xPortIntScale = GetVectorElement(in);
+      break;
+    // Port-only Remastered SPWS child spawn scale (CGenDescription::xPortSpawnScale).
+    case SBIG('PSWS'):
+      delete desc->xPortSpawnScale;
+      desc->xPortSpawnScale = GetVectorElement(in);
+      break;
+    // Port-only Remastered INTR/INTT system orientation and translation
+    // (CGenDescription::xPortIntRotation/xPortIntTranslation).
+    case SBIG('PINR'):
+      delete desc->xPortIntRotation;
+      desc->xPortIntRotation = GetVectorElement(in);
+      break;
+    case SBIG('PINT'):
+      delete desc->xPortIntTranslation;
+      desc->xPortIntTranslation = GetVectorElement(in);
+      break;
+    // Port-only Remastered SYST/TEMT under XFMD 1 (CGenDescription::xPortSysTranslation/
+    // xPortTemTranslation).
+    case SBIG('PSYT'):
+      delete desc->xPortSysTranslation;
+      desc->xPortSysTranslation = GetVectorElement(in);
+      break;
+    case SBIG('PTMT'):
+      delete desc->xPortTemTranslation;
+      desc->xPortTemTranslation = GetVectorElement(in);
+      break;
+    // Port-only Remastered OVEC (CGenDescription::xPortOvec).
+    case SBIG('POVC'):
+      delete desc->xPortOvec;
+      desc->xPortOvec = GetVectorElement(in);
+      break;
+    // Port-only Remastered PMRB/PMCF model rotation frame (CGenDescription::xPortPmrqFrame).
+    case SBIG('PMRF'): {
+      GetClassID(in);
+      const u32 frame = in.ReadLong();
+      desc->xPortPmrqFrame = frame <= 2 ? static_cast< u8 >(frame) : 0;
+    } break;
+    // Port-only Remastered FRMD face-reflection mode (CGenDescription::xPortFrmd).
+    case SBIG('PFRM'): {
+      GetClassID(in);
+      const u32 mode = in.ReadLong();
+      desc->xPortFrmd = mode <= 3 ? static_cast< u8 >(mode) : 0;
     } break;
     // Port-only Remastered particle variables (PVRT); a malformed table leaves none.
     case SBIG('PVRT'):
       GetClassID(in);
       desc->xPortVars.reset(PortReadVarTable(in));
       break;
+    // Port-only Remastered system variables (PSYS); a malformed one leaves none.
+    case SBIG('PSYS'):
+      GetClassID(in);
+      desc->xPortSys.reset(PortReadSys(in));
+      break;
+    // Port-only PADO: the order ADV1..8 are evaluated in, a count and 0-based indices.
+    case SBIG('PADO'): {
+      GetClassID(in);
+      const u32 count = in.ReadLong();
+      desc->xPortAdvOrder.clear();
+      if (count > 8) {
+        break;
+      }
+      // Each index at most once: a duplicate would run one ADV twice and skip another.
+      u32 seen = 0;
+      for (u32 i = 0; i < count; ++i) {
+        const u32 n = in.ReadLong();
+        if (n < 8 && (seen & (1u << n)) == 0) {
+          seen |= 1u << n;
+          desc->xPortAdvOrder.push_back(static_cast< u8 >(n));
+        }
+      }
+      if (desc->xPortAdvOrder.size() != count) {
+        desc->xPortAdvOrder.clear();
+      }
+      break;
+    }
+    // Port-only PPVR: Remastered's variables ADV1..9 and IAV0..3 in SortVars order (PortReadPartVars).
+    case SBIG('PPVR'):
+      GetClassID(in);
+      desc->xPortPartVars.reset(PortReadPartVars(in, false));
+      if (!desc->xPortPartVars) {
+        PortLog::Write("particles: malformed PPVR, falling back to the retail ADV path\n");
+      }
+      break;
     // Port-only marker of a converted Remastered PART (xPortIrnd).
     case SBIG('PIRN'):
       GetClassID(in);
       desc->xPortIrnd = in.ReadLong() != 0;
+      // Must precede expressions. A legacy trailing PIRN cannot undo earlier folding.
+      CPortParticleParseScope::particleInitialRandom = desc->xPortIrnd;
+      // PPRM overrides the converted format's default sprite primitive.
+      if (desc->xPortIrnd && desc->xPortPrimitive == 255) desc->xPortPrimitive = 1;
       break;
-    // Port-only metadata for the one source-proven nested smooth point light.
+    // Port-only visor effect data of a converted Remastered PART: present, and the splat size
+    // range (VESN/VESM as float bits).
+    case SBIG('PVSD'):
+      GetClassID(in);
+      desc->xPortVisorData = in.ReadLong() != 0;
+      break;
+    case SBIG('PVSN'):
+    case SBIG('PVSM'): {
+      GetClassID(in);
+      const uint bits = in.ReadLong();
+      float value;
+      std::memcpy(&value, &bits, sizeof(value));
+      (clsId == SBIG('PVSN') ? desc->xPortVisorMinScale : desc->xPortVisorMaxScale) = value;
+      break;
+    }
+    // Port-only visor effect override data: the three colours, the blend and the ticks.
+    case SBIG('PVSC'):
+      delete desc->xPortVisorStartColor;
+      desc->xPortVisorStartColor = GetColorElement(in);
+      break;
+    case SBIG('PVMC'):
+      delete desc->xPortVisorMidColor;
+      desc->xPortVisorMidColor = GetColorElement(in);
+      break;
+    case SBIG('PVTC'):
+      delete desc->xPortVisorEndColor;
+      desc->xPortVisorEndColor = GetColorElement(in);
+      break;
+    case SBIG('PVBS'):
+      delete desc->xPortVisorBlend;
+      desc->xPortVisorBlend = GetRealElement(in);
+      break;
+    case SBIG('PVDT'):
+      GetClassID(in);
+      desc->xPortVisorTicks = static_cast< int >(in.ReadLong());
+      break;
+    // Port-only first word of a converted Remastered PART's GUID (the child seed hashes it).
+    case SBIG('PGID'):
+      GetClassID(in);
+      desc->xPortGuidWord = in.ReadLong();
+      break;
+    // Port-only metadata for the one nested Remastered point light (any child generator).
     case SBIG('PHDR'):
       GetClassID(in);
       desc->xPortNestedHdrLight = in.ReadLong() != 0;
@@ -550,6 +839,55 @@ bool CParticleDataFactory::CreateGPSM(CGenDescription* desc, CInputStream& in,
     case SBIG('PIR0'):
       delete desc->xPortNestedLightInnerRadius;
       desc->xPortNestedLightInnerRadius = GetRealElement(in);
+      break;
+    case SBIG('PHFO'):
+      GetClassID(in);
+      desc->xPortNestedLightFalloff = static_cast< u8 >(in.ReadLong() & 3);
+      break;
+    case SBIG('PLIX'):
+      GetClassID(in);
+      desc->xPortNestedLightInverseExposure = in.ReadLong() != 0;
+      break;
+    case SBIG('PLSP'):
+      GetClassID(in);
+      desc->xPortNestedLightWiden = in.ReadFloat();
+      break;
+    case SBIG('PLIA'):
+      GetClassID(in);
+      desc->xPortNestedLightSpot = true;
+      desc->xPortNestedLightInnerAngle = in.ReadFloat();
+      break;
+    case SBIG('PLOA'):
+      GetClassID(in);
+      desc->xPortNestedLightSpot = true;
+      desc->xPortNestedLightOuterAngle = in.ReadFloat();
+      break;
+    case SBIG('PLON'):
+      GetClassID(in);
+      desc->xPortLightOnce = in.ReadLong() != 0;
+      break;
+    case SBIG('PKIL'):
+      GetClassID(in);
+      desc->xPortKill = in.ReadLong() != 0;
+      break;
+    // Port-only: Remastered's fixed system bounds (FXBR/FXBM/FXBO), min then max.
+    case SBIG('PFXB'): {
+      GetClassID(in);
+      if (in.ReadLong() != 6) {
+        return false;
+      }
+      float bounds[6];
+      for (int i = 0; i < 6; ++i) {
+        bounds[i] = in.ReadFloat();
+      }
+      desc->xPortFixedBounds = true;
+      desc->xPortFixedBoundsMin = CVector3f(bounds[0], bounds[1], bounds[2]);
+      desc->xPortFixedBoundsMax = CVector3f(bounds[3], bounds[4], bounds[5]);
+      break;
+    }
+    case SBIG('PFXC'):
+      GetClassID(in);
+      desc->xPortBoundsNoChildren = in.ReadLong() != 0;
       break;
     case SBIG('POR0'):
       delete desc->xPortNestedLightOuterRadius;
@@ -572,23 +910,283 @@ bool CParticleDataFactory::CreateGPSM(CGenDescription* desc, CInputStream& in,
       }
       break;
     }
+    // Port-only: Remastered's spawn tables (xPortKssm): CNST, the end frame and the tables; per
+    // table its start, whether the period is constant, the period, and the entries; per entry
+    // its frame and spawns; per spawn the type, the asset and the instance count.
+    case SBIG('PKSM'): {
+      GetClassID(in);
+      std::unique_ptr< CGenDescription::PortKssm > kssm(new CGenDescription::PortKssm);
+      kssm->end = in.ReadLong();
+      const u32 tables = in.ReadLong();
+      if (tables > kPortVfxMaxElems) {
+        return false;
+      }
+      kssm->tables.resize(tables);
+      for (CGenDescription::PortKssmTable& table : kssm->tables) {
+        table.start = in.ReadLong();
+        table.periodConst = in.ReadLong() != 0;
+        table.periodElement = GetIntElement(in);
+        table.period = 0;
+        if (table.periodElement != nullptr) {
+          table.periodElement->GetValue(0, table.period);
+        }
+        const u32 entries = in.ReadLong();
+        if (entries > 1000) {
+          return false;
+        }
+        table.entries.resize(entries);
+        for (CGenDescription::PortKssmEntry& entry : table.entries) {
+          entry.frame = in.ReadLong();
+          const u32 spawns = in.ReadLong();
+          if (spawns > 100) {
+            return false;
+          }
+          entry.spawns.resize(spawns);
+          for (CGenDescription::PortKssmSpawn& spawn : entry.spawns) {
+            spawn.type = in.ReadLong();
+            const CAssetId id = in.Get< CAssetId >();
+            spawn.instances = GetIntElement(in);
+            spawn.component = in.ReadLong();
+            if (spawn.type == SBIG('PART')) {
+              spawn.part.emplace(
+                  TToken< CGenDescription >(pool->GetObj(SObjectTag(CParticleGen::ResType(), id))));
+            } else if (spawn.type == SBIG('SWHC')) {
+              spawn.swoosh.emplace(
+                  TToken< CSwooshDescription >(pool->GetObj(SObjectTag(SBIG('SWHC'), id))));
+            } else if (spawn.type == SBIG('ELSC')) {
+              spawn.electric.emplace(
+                  TToken< CElectricDescription >(pool->GetObj(SObjectTag(SBIG('ELSC'), id))));
+            } else {
+              return false;
+            }
+          }
+        }
+      }
+      // Then the SEVT components the spawns place their children with: per component its pos
+      // tree, the constant delta, the rot tree or NONE, and NONE or GRAV and its vector tree.
+      const u32 components = in.ReadLong();
+      if (components > 1000) {
+        return false;
+      }
+      kssm->components.resize(components);
+      for (CGenDescription::PortKssmComponent& component : kssm->components) {
+        if (!PortReadKssmComponent(in, *kssm, component)) {
+          return false;
+        }
+      }
+      for (const CGenDescription::PortKssmTable& table : kssm->tables) {
+        for (const CGenDescription::PortKssmEntry& entry : table.entries) {
+          for (const CGenDescription::PortKssmSpawn& spawn : entry.spawns) {
+            if (spawn.component != ~0u && spawn.component >= components) {
+              return false;
+            }
+          }
+        }
+      }
+      desc->xPortKssm = std::move(kssm);
+      break;
+    }
+    // Port-only: XFMD 4's mover (PSMV, xPortMover) or emitter mover (PEMR, xPortEmvr): CNST,
+    // the component count (0 or 1), then the component as in PKSM.
+    case SBIG('PSMV'):
+    case SBIG('PEMR'): {
+      const bool emvr = clsId == SBIG('PEMR');
+      GetClassID(in);
+      std::unique_ptr< CGenDescription::PortKssm > mover(new CGenDescription::PortKssm);
+      const u32 components = in.ReadLong();
+      if (components > 1) {
+        return false;
+      }
+      mover->components.resize(components);
+      for (CGenDescription::PortKssmComponent& component : mover->components) {
+        if (!PortReadKssmComponent(in, *mover, component)) {
+          return false;
+        }
+      }
+      (emvr ? desc->xPortEmvr : desc->xPortMover) = std::move(mover);
+      break;
+    }
+    case SBIG('PPRM'):
+      GetClassID(in);
+      desc->xPortPrimitive = u8(in.ReadLong());
+      break;
     // Port-only: Remastered's sprite polygon (SSHP 3-6; xPortSpriteShape).
     case SBIG('PSHP'):
       GetClassID(in);
       desc->xPortSpriteShape = u8(in.ReadLong());
       break;
-    // Port-only: converted Remastered model particles that face the camera (xPortFaceCamera).
-    case SBIG('PFCM'):
+    // Port-only: Remastered's PBDM 1 or 3 (xPortBlend).
+    case SBIG('PBDM'):
       GetClassID(in);
-      desc->xPortFaceCamera = in.ReadLong() != 0;
+      desc->xPortBlend = u8(in.ReadLong());
       break;
+    // Port-only: Remastered's ZTES 0 (xPortNoZTest).
+    case SBIG('PZTS'):
+      GetClassID(in);
+      desc->xPortNoZTest = in.ReadLong() == 0;
+      break;
+    // Port-only: Remastered's IVSE 0 (xPortNoIvse).
+    case SBIG('PIVS'):
+      GetClassID(in);
+      desc->xPortNoIvse = in.ReadLong() == 0;
+      break;
+    // Port-only: Remastered's WSTP 1/2 (xPortWaterSort).
+    case SBIG('PWST'):
+      GetClassID(in);
+      desc->xPortWaterSort = u8(in.ReadLong());
+      break;
+    // Port-only: Remastered's ISVF (xPortInheritVel), after PEMV's mode word.
+    case SBIG('PISV'): {
+      GetClassID(in);
+      sPortPemv = u8(in.ReadLong() + 1);
+      delete desc->xPortInheritVel;
+      desc->xPortInheritVel = GetRealElement(in);
+      break;
+    }
+    // Port-only: Remastered's IEVM (xPortInheritVelMax), the float bits.
+    case SBIG('PIEV'): {
+      GetClassID(in);
+      const u32 bits = in.ReadLong();
+      std::memcpy(&desc->xPortInheritVelMax, &bits, sizeof(bits));
+      break;
+    }
+    // Port-only: an own-material model generator's ITEN (xPortModelIten).
+    case SBIG('PITN'):
+      delete desc->xPortModelIten;
+      desc->xPortModelIten = GetRealElement(in);
+      break;
+    // Port-only: Remastered's secondary size (xPortSsze).
+    case SBIG('SSZE'):
+      delete desc->xPortSsze;
+      desc->xPortSsze = GetRealElement(in);
+      break;
+    // Port-only: Remastered's ITPE 1 (xPortSpread), with PEMV's mode word.
+    case SBIG('PITP'): {
+      GetClassID(in);
+      const u32 word = in.ReadLong();
+      if ((word & kPortSpreadDefault) == 0 || PortSpreadDefault()) {
+        sPortPemv = u8((word & 0xff) + 1);
+        desc->xPortSpread = true;
+      }
+      break;
+    }
+    // Port-only: Remastered's SHTM, SHTT, PMOV and PMPV (CGenDescription::xPortShutdownMode and
+    // the elements after it).
+    case SBIG('PSHM'):
+      GetClassID(in);
+      desc->xPortShutdownMode = u8(in.ReadLong());
+      break;
+    case SBIG('PISD'):
+      GetClassID(in);
+      desc->xPortChildShutdownByMode = in.ReadLong() != 0;
+      break;
+    case SBIG('POSD'):
+      GetClassID(in);
+      desc->xPortChildInheritsShutdownMode = in.ReadLong() != 0;
+      break;
+    case SBIG('PBOR'):
+      GetClassID(in);
+      desc->xPortBirthOrientation = in.ReadLong() != 0;
+      break;
+    case SBIG('PBLT'):
+      GetClassID(in);
+      desc->xPortBakedLighting = in.ReadLong() != 0;
+      break;
+    case SBIG('VMPC'):
+      GetClassID(in);
+      desc->xPortVelocityAtCreation = in.ReadLong() != 0;
+      break;
+    case SBIG('DVVN'):
+      GetClassID(in);
+      desc->xPortDefaultValuesVersion = u8(in.ReadLong());
+      desc->xPortExposurePolicy = true;
+      desc->xPortInverseExposure = desc->xPortDefaultValuesVersion == 3 || desc->xPortDefaultValuesVersion == 4;
+      break;
+    case SBIG('IEXP'):
+      GetClassID(in);
+      desc->xPortExposurePolicy = true;
+      desc->xPortInverseExposure = in.ReadLong() != 0;
+      break;
+    case SBIG('PSHT'):
+      delete desc->xPortShutdownTime;
+      desc->xPortShutdownTime = GetIntElement(in);
+      break;
+    case SBIG('PSPS'): {
+      // CNST id: a child GENP; SWHC id: a child swoosh.
+      desc->xPortPsps = rstl::optional_object_null();
+      desc->xPortPspsSwoosh = rstl::optional_object_null();
+      const FourCC clsId = GetClassID(in);
+      if (clsId == SBIG('NONE')) {
+        break;
+      }
+      const CAssetId id = in.Get< CAssetId >();
+      if (clsId == SBIG('SWHC')) {
+        if (id != 0) {
+          desc->xPortPspsSwoosh =
+              TCachedToken< CSwooshDescription >(pool->GetObj(SObjectTag(SBIG('SWHC'), id)));
+        }
+      } else if (id != 0) {
+        rstl::optional_object< TToken< CGenDescription > > child(
+            GetChildGeneratorDesc(id, pool, resources));
+        if (child) {
+          desc->xPortPsps = TCachedToken< CGenDescription >(*child);
+        }
+      }
+      break;
+    }
+    case SBIG('PSMX'):
+      delete desc->xPortPsmx;
+      desc->xPortPsmx = GetIntElement(in);
+      break;
+    case SBIG('PMOV'):
+      delete desc->xPortPmov;
+      desc->xPortPmov = GetVectorElement(in);
+      break;
+    case SBIG('PMPV'):
+      delete desc->xPortPmpv;
+      desc->xPortPmpv = GetVectorElement(in);
+      break;
+    // Port-only: Remastered's DFOG 1 (xPortUnfogged).
+    case SBIG('PDFG'):
+      GetClassID(in);
+      desc->xPortUnfogged = in.ReadLong() != 0;
+      break;
+    // Port-only: Remastered's DBIS (xPortDepthBias), a constant real.
+    case SBIG('PDBS'):
+      GetClassID(in);
+      desc->xPortDepthBias = in.ReadFloat();
+      break;
+    // Port-only: Remastered's DBSO 0 (xPortDepthBiasUsesDepthRange).
+    case SBIG('PDBO'):
+      GetClassID(in);
+      desc->xPortDepthBiasUsesDepthRange = in.ReadLong() != 0;
+      break;
+    // Port-only: Remastered's SBIS (xPortSortBias), a constant real.
+    case SBIG('PSBS'):
+      GetClassID(in);
+      desc->xPortSortBias = in.ReadFloat();
+      break;
+    // Port-only: Remastered's SLDS, a constant real; stored squared (xPortSleepDistanceSq).
+    case SBIG('PSLD'): {
+      GetClassID(in);
+      const float distance = in.ReadFloat();
+      desc->xPortSleepDistanceSq = distance * distance;
+      break;
+    }
     // Port-only Remastered particle material (build/mpr/vfx/DESIGN.md section 1).
     case SBIG('VMAT'):
     case SBIG('VMSH'):
+    case SBIG('VPRM'):
     case SBIG('VTMT'):
+    case SBIG('VTRS'):
+    case SBIG('VATX'):
+    case SBIG('VAT2'):
+    case SBIG('VTP2'):
+    case SBIG('VATF'):
+    case SBIG('VTFB'):
+    case SBIG('VTRT'):
     case SBIG('VPMT'):
     case SBIG('VSMT'):
-    case SBIG('SSZE'):
     case SBIG('ITEN'):
     case SBIG('VORN'):
       if (!PortReadVfxProperty(clsId, desc->xPortVfx, in, pool)) {
@@ -767,6 +1365,9 @@ bool CParticleDataFactory::CreateGPSM(CGenDescription* desc, CInputStream& in,
     }
   }
 
+#ifdef TARGET_PC
+  desc->xPortVisibilityQuery = CPortParticleParseScope::visibilityQuery;
+#endif
   return true;
 }
 
@@ -788,6 +1389,12 @@ CIntElement* CParticleDataFactory::GetIntElement(CInputStream& in) {
   // Port-only VARI: a Remastered particle variable of the system being evaluated (PVRT index).
   case SBIG('VARI'):
     return rs_new CIEPortVar(in.ReadLong());
+  case SBIG('SPAI'):
+    return PortReadParentVar< CIEPortParentVar >(in, EPortParentRead::System, &GetIntElement);
+  case SBIG('DPVI'):
+    return PortReadParentVar< CIEPortParentVar >(in, EPortParentRead::Direct, &GetIntElement);
+  case SBIG('TPVI'):
+    return PortReadParentVar< CIEPortParentVar >(in, EPortParentRead::Topmost, &GetIntElement);
 #endif
   case SBIG('CNST'): {
     return rs_new CIEConstant(GetInt(in));
@@ -861,6 +1468,34 @@ CIntElement* CParticleDataFactory::GetIntElement(CInputStream& in) {
     const bool loop = GetBool(in);
     return rs_new CIEFrameIndexFromAnimationTime(start, count, divisor, loop);
   }
+  case SBIG('PLPT'): {
+    const int offset = in.ReadLong();
+    return rs_new CIEPortLifetimePercent(offset, GetIntElement(in));
+  }
+  case SBIG('PAP0'):
+    return rs_new CIEPortParticleVar(0);
+  case SBIG('PAP1'):
+    return rs_new CIEPortParticleVar(1);
+  case SBIG('PAP2'):
+    return rs_new CIEPortParticleVar(2);
+  case SBIG('PAP3'):
+    return rs_new CIEPortParticleVar(3);
+  case SBIG('PRAN'): {
+    CIntElement* a = GetIntElement(in);
+    CIntElement* b = GetIntElement(in);
+    return rs_new CIEPortRandom(a, b);
+  }
+  // ABS_ (CIEAbsoluteValue 0x2a86b0): one int child.
+  case SBIG('ABS_'): {
+    CIntElement* value = GetIntElement(in);
+    if (value == nullptr) {
+      return nullptr;
+    }
+    return rs_new CIEPortAbs(value);
+  }
+  // Port-only PSYI: a PSYS int slot of the system being evaluated.
+  case SBIG('PSYI'):
+    return rs_new CIEPortSysVar(in.ReadLong());
 #endif
   case SBIG('PULS'): {
     CIntElement* a = GetIntElement(in);
@@ -902,6 +1537,88 @@ CRealElement* CParticleDataFactory::GetRealElement(CInputStream& in) {
   // Port-only VARF: a Remastered particle variable of the system being evaluated (PVRT index).
   case SBIG('VARF'):
     return rs_new CREPortVar(in.ReadLong());
+  // Port-only PSDT: the system's shutdown countdown fraction left (SDTR).
+  case SBIG('PSDT'):
+    return rs_new CREPortShutdownRemaining();
+  // Port-only PVSQ: the system's occlusion-query visibility (VISQ); the system then issues queries.
+  case SBIG('PVSQ'):
+    CPortParticleParseScope::visibilityQuery = true;
+    return rs_new CREPortVisibility();
+  // Port-only PDML: a component (0-2) of the dominant light direction (Remastered's DOML).
+  case SBIG('PDML'): {
+    const u32 component = in.ReadLong();
+    return component < 3 ? rs_new CREPortDominantLight(component) : nullptr;
+  }
+  // Port-only PSYR: a PSYS real slot of the system being evaluated.
+  case SBIG('PSYR'):
+    return rs_new CREPortSysVar(in.ReadLong());
+  // Port-only PKPR: a per-particle KPIN latch (slot), then its element.
+  case SBIG('PKPR'): {
+    const u32 slot = in.ReadLong();
+    CRealElement* value = GetRealElement(in);
+    if (value == nullptr || slot >= SPortKeep::kMax) {
+      delete value;
+      return nullptr;
+    }
+    return rs_new CREPortKeep(slot, value);
+  }
+  // Port-only PIRS: Remastered's IRSN, a PKPR-counter slot (or kNoSlot), then its real.
+  case SBIG('PIRS'): {
+    const u32 slot = in.ReadLong();
+    CRealElement* value = GetRealElement(in);
+    if (value == nullptr) {
+      return nullptr;
+    }
+    return rs_new CREPortInitialRandomSign(slot, value);
+  }
+  // Port-only PMXV, the converter's name for Remastered's MPXV (MPT_CREExternalValue 0x29715c):
+  // the index, then the fallback real.
+  case SBIG('PMXV'): {
+    CIntElement* index = GetIntElement(in);
+    CRealElement* fallback = GetRealElement(in);
+    if (index == nullptr || fallback == nullptr) {
+      delete index;
+      delete fallback;
+      return nullptr;
+    }
+    return rs_new CREPortExternalVar(index, fallback);
+  }
+  // ABS_ (CREAbsoluteValue 0x295094), RSGN (CRERandomSign 0x299318): one real child.
+  case SBIG('ABS_'): {
+    CRealElement* value = GetRealElement(in);
+    if (value == nullptr) {
+      return nullptr;
+    }
+    return rs_new CREPortAbs(value);
+  }
+  case SBIG('RSGN'): {
+    CRealElement* value = GetRealElement(in);
+    if (value == nullptr) {
+      return nullptr;
+    }
+    return rs_new CREPortRandomSign(value);
+  }
+  // COSE (CRECosineWave 0x298788): frequency, amplitude, phase, as SINE.
+  case SBIG('COSE'): {
+    CRealElement* frequency = GetRealElement(in);
+    CRealElement* amplitude = GetRealElement(in);
+    CRealElement* phase = GetRealElement(in);
+    if (frequency == nullptr || amplitude == nullptr || phase == nullptr) {
+      delete frequency;
+      delete amplitude;
+      delete phase;
+      return nullptr;
+    }
+    return rs_new CREPortCosineWave(frequency, amplitude, phase);
+  }
+  case SBIG('SPAF'):
+    return PortReadParentVar< CREPortParentVar >(in, EPortParentRead::System, &GetRealElement);
+  case SBIG('DPVF'):
+    return PortReadParentVar< CREPortParentVar >(in, EPortParentRead::Direct, &GetRealElement);
+  case SBIG('TPVF'):
+    return PortReadParentVar< CREPortParentVar >(in, EPortParentRead::Topmost, &GetRealElement);
+  case SBIG('SLCT'):
+    return PortReadSelect< CREPortSelect >(in, &CParticleDataFactory::GetRealElement);
 #endif
   case SBIG('CNST'): {
     return rs_new CREConstant(GetReal(in));
@@ -991,6 +1708,53 @@ CRealElement* CParticleDataFactory::GetRealElement(CInputStream& in) {
     CRealElement* b = GetRealElement(in);
     return rs_new CREDistanceFromCameraBlend(a, b, clsId == SBIG('DFCP'));
   }
+  case SBIG('KEWS'): {
+    return rs_new CREPortSwooshNodeTime(GetRealElement(in));
+  }
+  case SBIG('KESP'): {
+    return rs_new CREPortSlot2Time(GetRealElement(in));
+  }
+  case SBIG('PKYF'): {
+    // Remastered's KEYF: the loop byte, the key count, the loop start, start and rate, the keys,
+    // then the input element.
+    const bool loop = in.ReadBool();
+    int count = static_cast< int >(in.ReadLong());
+    const float loopStart = in.ReadFloat();
+    const float start = in.ReadFloat();
+    const float rate = in.ReadFloat();
+    // A zero or implausible key count has no keys to read at the input (the original indexes
+    // key 0 regardless): the element evaluates to 0.
+    if (count <= 0 || count > 0x100000) {
+      PortLog::Write("particles: PKYF with key count %d, evaluating to 0\n", count);
+      count = 0;
+    }
+    std::vector< float > keys;
+    for (int i = 0; i < count; ++i) {
+      keys.push_back(in.ReadFloat());
+    }
+    return rs_new CREPortKeyframeInput(loop, count, loopStart, start, rate, std::move(keys),
+                                       GetRealElement(in));
+  }
+  case SBIG('PGTC'): {
+    return rs_new CREPortTotalCreatedParticleCount();
+  }
+  case SBIG('PSLW'): {
+    CRealElement* a = GetRealElement(in);
+    CRealElement* b = GetRealElement(in);
+    return rs_new CREPortSystemTween(a, b);
+  }
+  case SBIG('DIVD'): {
+    CRealElement* a = GetRealElement(in);
+    CRealElement* b = GetRealElement(in);
+    return rs_new CREPortDivide(a, b);
+  }
+  case SBIG('T2S_'): {
+    CIntElement* a = GetIntElement(in);
+    if (a == nullptr) {
+      return nullptr;
+    }
+    return rs_new CREPortTicksToSeconds(a);
+  }
 #endif
   case SBIG('PAP1'): {
     return rs_new CREParticleAccessParameter1();
@@ -1016,6 +1780,10 @@ CRealElement* CParticleDataFactory::GetRealElement(CInputStream& in) {
   case SBIG('PAP8'): {
     return rs_new CREParticleAccessParameter8();
   }
+#ifdef TARGET_PC
+  case SBIG('PAP9'):
+    return rs_new CREParticleAccessParameter9();
+#endif
   case SBIG('VXTR'): {
     CVectorElement* a = GetVectorElement(in);
     return rs_new CREVectorXToReal(a);
@@ -1100,6 +1868,253 @@ CVectorElement* CParticleDataFactory::GetVectorElement(CInputStream& in) {
 #ifdef TARGET_PC
   case SBIG('VARV'):
     ret = rs_new CVEPortVar(in.ReadLong());
+    break;
+  // Port-only PSYV: a PSYS vector slot of the system being evaluated.
+  case SBIG('PSYV'):
+    ret = rs_new CVEPortSysVar(in.ReadLong());
+    break;
+  // ABS_ (CVEAbsoluteValue 0x29e254): one vector child.
+  case SBIG('ABS_'): {
+    CVectorElement* value = GetVectorElement(in);
+    ret = value != nullptr ? rs_new CVEPortAbs(value) : nullptr;
+    break;
+  }
+  case SBIG('SPAV'):
+    return PortReadParentVar< CVEPortParentVar >(in, EPortParentRead::System, &GetVectorElement);
+  case SBIG('DPVV'):
+    return PortReadParentVar< CVEPortParentVar >(in, EPortParentRead::Direct, &GetVectorElement);
+  case SBIG('TPVV'):
+    return PortReadParentVar< CVEPortParentVar >(in, EPortParentRead::Topmost, &GetVectorElement);
+  case SBIG('SLCT'):
+    return PortReadSelect< CVEPortSelect >(in, &CParticleDataFactory::GetVectorElement);
+  case SBIG('RNDV'):
+    ret = rs_new CVEPortRandomVector(GetRealElement(in));
+    break;
+  case SBIG('PCRN'): {
+    // CVECurlNoise_Perlin3d: P, F, A, then the optional field (NONE | CNST + asset id).
+    CVectorElement* pos = GetVectorElement(in);
+    CRealElement* freq = GetRealElement(in);
+    CVectorElement* amp = GetVectorElement(in);
+    CVEPortCurlNoise::FieldHandle* handle = nullptr;
+    if (GetClassID(in) == SBIG('CNST')) {
+      handle = CVEPortCurlNoise::MakeHandle(in.ReadLong());
+    }
+    ret = rs_new CVEPortCurlNoise(pos, freq, amp, handle);
+    break;
+  }
+  case SBIG('PCRO'): {
+    // CVECurlNoise_PerlinOctave3d: P, the frequency, the octave count, the gain, A.
+    CVectorElement* pos = GetVectorElement(in);
+    CRealElement* freq = GetRealElement(in);
+    CIntElement* octaves = GetIntElement(in);
+    CRealElement* gain = GetRealElement(in);
+    CVectorElement* amp = GetVectorElement(in);
+    ret = rs_new CVEPortCurlNoiseOctave(pos, freq, octaves, gain, amp);
+    break;
+  }
+  case SBIG('PCRS'): {
+    // CVECurlNoise_Perlin2dSlice*: raw u32 slice (1 XY, 2 XZ, 3 YZ), P, F, A.
+    const uint slice = in.ReadLong();
+    CVectorElement* pos = GetVectorElement(in);
+    CRealElement* freq = GetRealElement(in);
+    CVectorElement* amp = GetVectorElement(in);
+    ret = rs_new CVEPortCurlNoiseSlice(slice, pos, freq, amp);
+    break;
+  }
+  case SBIG('PRTV'): {
+    // Port-only ROTV: the vector, the rotation kind, and REUL's three angles.
+    CVectorElement* vec = GetVectorElement(in);
+    const FourCC kind = GetClassID(in);
+    CRealElement* x = nullptr;
+    CRealElement* y = nullptr;
+    CRealElement* z = nullptr;
+    if (kind == SBIG('REUL')) {
+      x = GetRealElement(in);
+      y = GetRealElement(in);
+      z = GetRealElement(in);
+    }
+    ret = rs_new CVEPortRotateVector(vec, kind, x, y, z);
+    break;
+  }
+  case SBIG('PNCV'):
+    ret = rs_new CVEPortNormalizedVelocity();
+    break;
+  case SBIG('ANCR'): {
+    CRealElement* rotateX = GetRealElement(in);
+    CRealElement* rotateY = GetRealElement(in);
+    CRealElement* rotateZ = GetRealElement(in);
+    CRealElement* xRange = GetRealElement(in);
+    CRealElement* yRange = GetRealElement(in);
+    CRealElement* magnitude = GetRealElement(in);
+    ret = rs_new CVEPortAngleCone(rotateX, rotateY, rotateZ, xRange, yRange, magnitude);
+    break;
+  }
+  case SBIG('PANM'): {
+    CRealElement* rotateX = GetRealElement(in);
+    CRealElement* rotateY = GetRealElement(in);
+    CRealElement* rotateZ = GetRealElement(in);
+    CRealElement* minAngle = GetRealElement(in);
+    CRealElement* maxAngle = GetRealElement(in);
+    CRealElement* magnitude = GetRealElement(in);
+    if (rotateX == nullptr || rotateY == nullptr || rotateZ == nullptr || minAngle == nullptr || maxAngle == nullptr || magnitude == nullptr) {
+      delete rotateX;
+      delete rotateY;
+      delete rotateZ;
+      delete minAngle;
+      delete maxAngle;
+      delete magnitude;
+      return nullptr;
+    }
+    ret = rs_new CVEPortAngleConeMinMax(rotateX, rotateY, rotateZ, minAngle, maxAngle, magnitude);
+    break;
+  }
+  case SBIG('PANV'): {
+    CRealElement* rotateX = GetRealElement(in);
+    CRealElement* rotateY = GetRealElement(in);
+    CRealElement* rotateZ = GetRealElement(in);
+    CRealElement* minAngle = GetRealElement(in);
+    CRealElement* maxAngle = GetRealElement(in);
+    CRealElement* magnitude = GetRealElement(in);
+    CIntElement* polarCount = GetIntElement(in);
+    CRealElement* polarVariance = GetRealElement(in);
+    CIntElement* azimuthCount = GetIntElement(in);
+    CRealElement* azimuthVariance = GetRealElement(in);
+    const u8 shuffle = u8(in.ReadChar());
+    if (rotateX == nullptr || rotateY == nullptr || rotateZ == nullptr || minAngle == nullptr || maxAngle == nullptr ||
+        magnitude == nullptr || polarCount == nullptr || polarVariance == nullptr || azimuthCount == nullptr ||
+        azimuthVariance == nullptr) {
+      delete rotateX;
+      delete rotateY;
+      delete rotateZ;
+      delete minAngle;
+      delete maxAngle;
+      delete magnitude;
+      delete polarCount;
+      delete polarVariance;
+      delete azimuthCount;
+      delete azimuthVariance;
+      return nullptr;
+    }
+    ret = rs_new CVEPortAngleConeMinMaxVariance(rotateX, rotateY, rotateZ, minAngle, maxAngle, magnitude, polarCount,
+                                                polarVariance, azimuthCount, azimuthVariance, shuffle);
+    break;
+  }
+  case SBIG('PKYF'): {
+    // Remastered's vector KEYF: as the real PKYF, with three floats per key.
+    const bool loop = in.ReadBool();
+    int count = static_cast< int >(in.ReadLong());
+    const float loopStart = in.ReadFloat();
+    const float start = in.ReadFloat();
+    const float rate = in.ReadFloat();
+    if (count <= 0 || count > 0x100000) {
+      PortLog::Write("particles: vector PKYF with key count %d, evaluating to 0\n", count);
+      count = 0;
+    }
+    std::vector< CVector3f > keys;
+    for (int i = 0; i < count; ++i) {
+      const float x = in.ReadFloat();
+      const float y = in.ReadFloat();
+      const float z = in.ReadFloat();
+      keys.push_back(CVector3f(x, y, z));
+    }
+    ret = rs_new CVEPortKeyframeInput(loop, count, loopStart, start, rate, std::move(keys), GetRealElement(in));
+    break;
+  }
+  case SBIG('PMAC'): {
+    CRealElement* xCentre = GetRealElement(in);
+    CRealElement* yCentre = GetRealElement(in);
+    CRealElement* xRange = GetRealElement(in);
+    CRealElement* yRange = GetRealElement(in);
+    CRealElement* magnitude = GetRealElement(in);
+    if (xCentre == nullptr || yCentre == nullptr || xRange == nullptr || yRange == nullptr || magnitude == nullptr) {
+      delete xCentre;
+      delete yCentre;
+      delete xRange;
+      delete yRange;
+      delete magnitude;
+      return nullptr;
+    }
+    ret = rs_new CVEPortMpac(xCentre, yCentre, xRange, yRange, magnitude);
+    break;
+  }
+  case SBIG('PCRC'): {
+    CVectorElement* centre = GetVectorElement(in);
+    CVectorElement* axis = GetVectorElement(in);
+    CRealElement* start = GetRealElement(in);
+    CIntElement* count = GetIntElement(in);
+    CRealElement* variance = GetRealElement(in);
+    CRealElement* radius = GetRealElement(in);
+    const u8 shuffle = u8(in.ReadChar());
+    if (centre == nullptr || axis == nullptr || start == nullptr || count == nullptr || variance == nullptr ||
+        radius == nullptr) {
+      delete centre;
+      delete axis;
+      delete start;
+      delete count;
+      delete variance;
+      delete radius;
+      return nullptr;
+    }
+    ret = rs_new CVEPortCircle(centre, axis, start, count, variance, radius, shuffle);
+    break;
+  }
+  case SBIG('PLWV'): {
+    CVectorElement* start = GetVectorElement(in);
+    CVectorElement* end = GetVectorElement(in);
+    CIntElement* count = GetIntElement(in);
+    CRealElement* variance = GetRealElement(in);
+    const u8 shuffle = u8(in.ReadChar());
+    if (start == nullptr || end == nullptr || count == nullptr || variance == nullptr) {
+      delete start;
+      delete end;
+      delete count;
+      delete variance;
+      return nullptr;
+    }
+    ret = rs_new CVEPortLine(start, end, count, variance, shuffle);
+    break;
+  }
+  case SBIG('PMCN'): {
+    CVectorElement* direction = GetVectorElement(in);
+    CRealElement* radius = GetRealElement(in);
+    if (direction == nullptr || radius == nullptr) {
+      delete direction;
+      delete radius;
+      return nullptr;
+    }
+    ret = rs_new CVEPortCone(direction, radius);
+    break;
+  }
+  case SBIG('NORM'):
+    ret = rs_new CVEPortNormalize(GetVectorElement(in));
+    break;
+  case SBIG('BSIS'):
+  case SBIG('BSSC'):
+    ret = rs_new CVEPortBasis(GetVectorElement(in), clsId == SBIG('BSSC'));
+    break;
+  case SBIG('PRZY'):
+  case SBIG('PRYZ'): {
+    CVectorElement* first = GetVectorElement(in);
+    CVectorElement* second = GetVectorElement(in);
+    CVectorElement* fallback = GetVectorElement(in);
+    ret = rs_new CVEPortRotationFromAxis(first, second, fallback, clsId == SBIG('PRYZ'));
+    break;
+  }
+  case SBIG('PEMV'): {
+    // The mode word: 0 the external translation, 1 the local one, 2 the local one plus the
+    // description's constant POFS (XFMD 5).
+    const u32 mode = in.ReadLong();
+    sPortPemv = u8(mode + 1);
+    ret = rs_new CVEPortEmitterVelocity();
+    break;
+  }
+  case SBIG('CMPS'):
+  case SBIG('CPSS'):
+  case SBIG('EXTT'):
+  case SBIG('EXTS'):
+  case SBIG('EXTR'):
+  case SBIG('CMRT'):
+    ret = rs_new CVEPortSystemVector(clsId);
     break;
 #endif
   case SBIG('NONE'):
@@ -1261,6 +2276,13 @@ CEmitterElement* CParticleDataFactory::GetEmitterElement(CInputStream& in) {
   CEmitterElement* ret;
   FourCC clsId = GetClassID(in);
   switch (clsId) {
+#ifdef TARGET_PC
+  // CODE: a null emitter, and the generator spawns only from code (desc[0x2fa] bit 4).
+  case SBIG('CODE'):
+    sPortCodeEmitter = true;
+    ret = nullptr;
+    break;
+#endif
   case SBIG('NONE'):
     ret = nullptr;
     break;
@@ -1305,6 +2327,87 @@ CEmitterElement* CParticleDataFactory::GetEmitterElement(CInputStream& in) {
                                 angleYRange);
     break;
   }
+#ifdef TARGET_PC
+  case SBIG('ASPR'): {
+    CVectorElement* origin = GetVectorElement(in);
+    CRealElement* rotateX = GetRealElement(in);
+    CRealElement* rotateY = GetRealElement(in);
+    CRealElement* rotateZ = GetRealElement(in);
+    CRealElement* range1 = GetRealElement(in);
+    CRealElement* range2 = GetRealElement(in);
+    CRealElement* radius = GetRealElement(in);
+    CRealElement* speed = GetRealElement(in);
+    ret = rs_new CEEPortAngleSphere(origin, rotateX, rotateY, rotateZ, range1, range2, radius,
+                                    speed);
+    break;
+  }
+  case SBIG('PASV'): {
+    CVectorElement* origin = GetVectorElement(in);
+    CRealElement* rotateX = GetRealElement(in);
+    CRealElement* rotateY = GetRealElement(in);
+    CRealElement* rotateZ = GetRealElement(in);
+    CRealElement* range1 = GetRealElement(in);
+    CRealElement* range2 = GetRealElement(in);
+    CIntElement* polarCount = GetIntElement(in);
+    CRealElement* polarVariance = GetRealElement(in);
+    CRealElement* azimuthRange = GetRealElement(in);
+    CIntElement* azimuthCount = GetIntElement(in);
+    CRealElement* azimuthVariance = GetRealElement(in);
+    CRealElement* radius = GetRealElement(in);
+    CRealElement* speed = GetRealElement(in);
+    const u8 shuffle = u8(in.ReadChar());
+    ret = rs_new CEEPortAngleSphereVariance(origin, rotateX, rotateY, rotateZ, range1, range2, polarCount,
+                                            polarVariance, azimuthRange, azimuthCount, azimuthVariance, radius, speed,
+                                            shuffle);
+    break;
+  }
+  case SBIG('PLNE'): {
+    CVectorElement* position = GetVectorElement(in);
+    CVectorElement* euler = GetVectorElement(in);
+    CVectorElement* velocity = GetVectorElement(in);
+    CRealElement* wx = GetRealElement(in);
+    CRealElement* wz = GetRealElement(in);
+    CRealElement* spread = GetRealElement(in);
+    ret = rs_new CEEPortPlane(position, euler, velocity, wx, wz, spread);
+    break;
+  }
+  case SBIG('PLNV'): {
+    CVectorElement* position = GetVectorElement(in);
+    CVectorElement* euler = GetVectorElement(in);
+    CRealElement* velocityY = GetRealElement(in);
+    CRealElement* wx = GetRealElement(in);
+    CRealElement* wz = GetRealElement(in);
+    CRealElement* spread = GetRealElement(in);
+    CIntElement* countX = GetIntElement(in);
+    CRealElement* varianceX = GetRealElement(in);
+    CIntElement* countZ = GetIntElement(in);
+    CRealElement* varianceZ = GetRealElement(in);
+    const u8 shuffle = u8(in.ReadChar());
+    ret = rs_new CEEPortPlaneVariance(position, euler, velocityY, wx, wz, spread, countX,
+                                      varianceX, countZ, varianceZ, shuffle);
+    break;
+  }
+  case SBIG('PSPV'): {
+    CVectorElement* position = GetVectorElement(in);
+    CRealElement* radius = GetRealElement(in);
+    CRealElement* speed = GetRealElement(in);
+    CIntElement* count1 = GetIntElement(in);
+    CRealElement* variance1 = GetRealElement(in);
+    CIntElement* count2 = GetIntElement(in);
+    CRealElement* variance2 = GetRealElement(in);
+    const u8 shuffle = u8(in.ReadChar());
+    ret = rs_new CEEPortSphereVariance(position, radius, speed, count1, variance1, count2, variance2, shuffle);
+    break;
+  }
+  case SBIG('PELP'): {
+    CVectorElement* centre = GetVectorElement(in);
+    CVectorElement* size = GetVectorElement(in);
+    CRealElement* speed = GetRealElement(in);
+    const bool surfaceOnly = in.ReadChar() != 0;
+    ret = rs_new CEEPortEllipsoid(centre, size, speed, surfaceOnly);
+    break;
+  }
+#endif
   default:
     ret = nullptr;
     break;
@@ -1345,6 +2448,16 @@ CModVectorElement* CParticleDataFactory::GetModVectorElement(CInputStream& in) {
     }
     break;
   }
+#ifdef TARGET_PC
+  case SBIG('PCRM'): {
+    // CMVECurlNoise: raw u32 mode, V, t.
+    const uint mode = in.ReadLong();
+    CVectorElement* v = GetVectorElement(in);
+    CRealElement* t = GetRealElement(in);
+    ret = rs_new CMVEPortCurlNoise(mode, v, t);
+    break;
+  }
+#endif
   case SBIG('GRAV'): {
     ret = rs_new CMVEGravity(GetVectorElement(in));
     break;
@@ -1439,6 +2552,12 @@ CColorElement* CParticleDataFactory::GetColorElement(CInputStream& in) {
   case SBIG('VARC'):
     ret = rs_new CCEPortVar(in.ReadLong());
     break;
+  case SBIG('SPAC'):
+    return PortReadParentVar< CCEPortParentVar >(in, EPortParentRead::System, &GetColorElement);
+  case SBIG('DPVC'):
+    return PortReadParentVar< CCEPortParentVar >(in, EPortParentRead::Direct, &GetColorElement);
+  case SBIG('TPVC'):
+    return PortReadParentVar< CCEPortParentVar >(in, EPortParentRead::Topmost, &GetColorElement);
   case SBIG('MULT'): {
     CColorElement* a = GetColorElement(in);
     CColorElement* b = GetColorElement(in);
@@ -1451,6 +2570,8 @@ CColorElement* CParticleDataFactory::GetColorElement(CInputStream& in) {
     ret = rs_new CCEPortModifyAlpha(c, a);
     break;
   }
+  case SBIG('SLCT'):
+    return PortReadSelect< CCEPortSelect >(in, &CParticleDataFactory::GetColorElement);
 #endif
   case SBIG('CNST'): {
     CElementAllocationChunk* allocationContext = IElement::CElementAllocator::GetCurrentChunk();
@@ -1594,6 +2715,24 @@ CUVElement* CParticleDataFactory::GetTextureElement(CInputStream& in, CSimplePoo
     TToken< CTexture > tex = id == 0 ? TToken< CTexture >(CreateTexture(-1))
                                      : TToken< CTexture >(resPool->GetObj(SObjectTag(SBIG('TXTR'), id)));
     ret = rs_new CUVEAtlasTexture(tex, cols, rows, count, mode, flipX);
+    break;
+  }
+  case SBIG('PAFB'): {
+    // 'CNST' <TXTR id>, then cols, rows, count, loop, flipX and the cycle as int elements
+    CAssetId id = 0;
+    FourCC subId = GetClassID(in);
+    if (subId != SBIG('NONE')) {
+      id = in.ReadLong();
+    }
+    CIntElement* cols = GetIntElement(in);
+    CIntElement* rows = GetIntElement(in);
+    CIntElement* count = GetIntElement(in);
+    CIntElement* loop = GetIntElement(in);
+    CIntElement* flipX = GetIntElement(in);
+    CIntElement* cycle = GetIntElement(in);
+    TToken< CTexture > tex = id == 0 ? TToken< CTexture >(CreateTexture(-1))
+                                     : TToken< CTexture >(resPool->GetObj(SObjectTag(SBIG('TXTR'), id)));
+    ret = rs_new CUVEAtlasTexture(tex, cols, rows, count, loop, flipX, cycle);
     break;
   }
 #endif

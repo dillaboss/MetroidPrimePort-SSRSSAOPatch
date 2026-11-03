@@ -19,11 +19,13 @@
 // The output is derived from the player's own copy of both games and is for
 // their use only; nothing produced here may ship.
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "port_remastered_cmdl.h"
@@ -31,6 +33,11 @@
 #include "port_remastered_report.h"
 
 namespace PortRemastered {
+
+// The matrix that carries a normal through the orient M (gc = M * remastered): the inverse
+// transpose of M, so a normal stays perpendicular to the surface under a non-uniform scale.
+// Equals M for a rotation or mirror. A singular M gives the zero matrix.
+void NormalMatrix(const double (*M)[3], double out[3][3]);
 
 struct ConvertOptions {
   uint32_t retail = 0;  // CMDL id the model replaces
@@ -74,6 +81,39 @@ struct ConvertOptions {
   // `retail` and `skins` are still read for the materials and the skeleton.
   uint32_t outputModel = 0;
   std::vector<uint32_t> outputSkins;
+  // Weights chosen elsewhere (a model re-skinned onto the retail skeleton, port_dread_samus.h): per
+  // vertex buffer of the model, per vertex, (retail bone id, weight). When set they are written as
+  // given, quantised as the votes are, instead of the nearest-retail-vertex votes, and under every
+  // id in `skins` (the caller's skeleton binds them all, so no bone-set check). Every buffer a mesh
+  // draws needs one list per vertex. Empty: the votes.
+  std::vector<std::vector<std::vector<std::pair<uint32_t, float>>>> boneWeights;
+  // Optional, both or neither, for the votes: each Remastered skin joint's pivot (the translation
+  // of its inverse bind's inverse), Remastered model space, by joint index; and the retail
+  // skeleton of skins[0] (CINF joints: id, parent id, bind head in retail model space). A joint
+  // whose pivot sits on one retail bone's head drops that bone's ancestors from its vote (the
+  // Parasite Queen's jaw, else torn between Jaw_1 and Head_1).
+  std::vector<std::array<double, 3>> jointPivots;
+  struct RetailBone {
+    uint32_t id = 0;
+    uint32_t parent = 0xFFFFFFFFu;
+    double head[3] = {};
+  };
+  std::vector<RetailBone> retailBones;
+  // Optional, both or neither, for the votes: the retail CMDL and CSKR whose vertices vote in place
+  // of `retail` and skins[0]'s. A character's frozen model (Remastered's property 0x0364A97A,
+  // drawn by CAnimDataMP1 0xc4f648 as a render proxy of the character, on its skeleton) stands in
+  // for the character's ice overlay, a shell pushed out along its normals that only roughly
+  // follows the body; the body it covers votes. The weights are still written under `skins`.
+  uint32_t weightModel = 0;
+  uint32_t weightSkin = 0;
+  // More than the retail model's material sets: set 0 is copied up to this many (a model drawn
+  // with a shader set its retail one lacks, the Dread cannon's one per beam). 0 keeps the retail
+  // count.
+  uint32_t materialSets = 0;
+  // Per output material set, the PBR maps it samples in place of the model's own: source texture
+  // id (pak order, as ConvertIO::texture is asked) -> the id it is swapped for. Sets past the end
+  // swap nothing.
+  std::vector<std::map<ModelUuid, ModelUuid>> setTextures;
   // A texture's id is hashed from a tag naming its source. These wrap the
   // Remastered texture's uuid in that tag; the test tool sets them to
   // reproduce the reference converter's ids, the game leaves them empty.
@@ -81,9 +121,13 @@ struct ConvertOptions {
   std::string textureSuffix;
   // Optional: receives the converted level of detail as one plain mesh (the VMSH blob a
   // model particle draws, see build/mpr/vfx/DESIGN.md), in the written CMDL's model space:
-  // big-endian u32 version (1), vertex count, triangle count; per vertex position[3],
-  // normal[3], uv[2] as f32; then the indices, u16 up to 65535 vertices, else u32. Back-face
-  // copies are left out. Cleared when the model has no usable mesh.
+  // big-endian u32 version (2), vertex count, triangle count, flags (bit 0 every vertex has a
+  // tangent, bit 1 a colour), orient[3][3] and offset[3] as f32; per vertex position[3],
+  // normal[3] (orient x Remastered's, unnormalised), uv[2], tangent[4] (likewise, w the
+  // handedness with orient's mirror folded in; zero without one), colour[4] (Remastered's float
+  // COLOR, else 1) as f32; then the indices, u16 up to 65535 vertices, else u32. Back-face
+  // copies are left out. Cleared when the model has no usable mesh. Readers take v1 too (no
+  // flags, orient or offset; position, normal, uv only).
   std::vector<uint8_t>* vmsh = nullptr;
 };
 
@@ -96,6 +140,11 @@ struct ConvertIO {
   // The top mip of a Remastered texture as RGBA8. The id is in a pak's byte
   // order (what IdToString prints), not the order a model stores it in.
   std::function<bool(const ModelUuid& id, Image& out, std::string& error)> texture;
+  // Optional: a plain 2D BC6H (HDR) Remastered texture as a whole .dds with its range kept:
+  // its own blocks where the import writes BC, RGBA16F where it writes ASTC; the top level's
+  // longest edge at most maxEdge (0: the source's own). The converter asks it for a colour map
+  // whose Image came back with `hdr` set. False when there is none (the 8-bit .dds stays).
+  std::function<bool(const ModelUuid& id, int maxEdge, std::vector<uint8_t>& dds, std::string& error)> hdrDds;
   // Optional: the top mip of every face of a Remastered cube map as linear RGBA floats,
   // 6 faces of edge * edge texels (DecodeTxtrCubeLinear). Without it no material gets a
   // reflection cube of its own.
@@ -119,6 +168,9 @@ struct ConvertIO {
   std::function<bool(const std::string& key)> relink;
   std::function<void(const std::string& key, const std::string& value, const std::vector<std::string>& files)>
       remember;
+  // Optional: called once for each texture id the converter gives a Remastered texture,
+  // with that texture's id (one source can get several, one per cap or alpha use).
+  std::function<void(const ModelUuid& src, uint32_t id)> textureId;
   // Optional: called once per output material, in output order (the materials report).
   std::function<void(const MaterialDecision& decision)> decision;
 };

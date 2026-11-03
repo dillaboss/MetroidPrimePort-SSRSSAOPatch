@@ -17,17 +17,100 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # x64, and arm64 for Windows on Arm machines (issue #163), each built
+    # natively on its own runner. The x64 entry's suffix is empty so its cache
+    # keys and artifact name stay what they were.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+            suffix: ""
+            target: x86_64-pc-windows-msvc
+            msystem: MINGW64
+            msys-install: make diffutils tar xz curl mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm
+            ffmpeg-args: ""
+          - arch: arm64
+            runner: windows-11-arm
+            suffix: -arm64
+            target: aarch64-pc-windows-msvc
+            msystem: CLANGARM64
+            msys-install: make diffutils tar xz curl mingw-w64-clang-aarch64-clang
+            ffmpeg-args: --cc=clang --cxx=clang++
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: ${{ matrix.arch }}
 
       - uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
         with:
-          key: ${{ runner.os }}-clangcl
+          key: ${{ runner.os }}-clangcl${{ matrix.suffix }}
           # Objects this build did not use are dropped before saving.
           evict-old-files: job
+
+      # The x64 runner has OpenSSL installed; the arm64 one does not. vcpkg
+      # builds it there, as static libraries on the DLL runtime (/MD, CMake's
+      # default), like the x64 runner's. Cached until the vcpkg tree changes.
+      # Both runners take libusb from vcpkg (below).
+      - name: Locate vcpkg
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $root -or -not (Test-Path "$root/vcpkg.exe")) {
+            $root = "$env:RUNNER_TEMP/vcpkg"
+            git clone --depth 1 https://github.com/microsoft/vcpkg $root
+            & "$root/bootstrap-vcpkg.bat" -disableMetrics
+          }
+          "root=$root" >> $env:GITHUB_OUTPUT
+          "rev=$(git -C $root rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: matrix.arch == 'arm64'
+        id: openssl
+        with:
+          path: openssl-arm64
+          key: openssl-arm64-windows-static-md-${{ steps.vcpkg.outputs.rev }}
+
+      - name: Build OpenSSL
+        if: matrix.arch == 'arm64' && steps.openssl.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          & "${{ steps.vcpkg.outputs.root }}/vcpkg.exe" install openssl:arm64-windows-static-md --x-install-root=openssl-arm64
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg failed to build OpenSSL' }
+
+      - name: Point CMake at OpenSSL
+        if: matrix.arch == 'arm64'
+        shell: pwsh
+        run: '"OPENSSL_ROOT_DIR=$env:GITHUB_WORKSPACE/openssl-arm64/arm64-windows-static-md" >> $env:GITHUB_ENV'
+
+      # SDL reaches a GameCube adapter in Wii U mode (057E:0337, Nintendo's
+      # own and Mayflash's) only through libusb (issue #222). SDL loads
+      # libusb-1.0.dll at run time, so the package ships it and the game
+      # still starts without it; the adapter also needs the WinUSB driver
+      # (Zadig), as in Dolphin.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: libusb
+        with:
+          path: libusb
+          key: libusb-${{ matrix.arch }}-windows-${{ steps.vcpkg.outputs.rev }}
+
+      - name: Build libusb
+        if: steps.libusb.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          & "${{ steps.vcpkg.outputs.root }}/vcpkg.exe" install libusb:${{ matrix.arch }}-windows --x-install-root=libusb
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg failed to build libusb' }
+
+      - name: Point CMake at libusb
+        shell: pwsh
+        run: |
+          $root = "$env:GITHUB_WORKSPACE/libusb/${{ matrix.arch }}-windows".Replace('\', '/')
+          "LIBUSB_ROOT=$root" >> $env:GITHUB_ENV
 
       # Configure downloads and unpacks about a dozen dependencies. Keep the
       # unpacked sources and the stamps that say they are current; the build
@@ -37,16 +120,21 @@ jobs:
           path: |
             build-win/_deps/*-src
             build-win/_deps/*-subbuild
-          key: deps-windows-${{ hashFiles('CMakeLists.txt', 'extern/aurora/**/CMakeLists.txt', 'extern/aurora/**/*.cmake') }}
+          key: deps-windows${{ matrix.suffix }}-${{ hashFiles('CMakeLists.txt', 'extern/aurora/**/CMakeLists.txt', 'extern/aurora/**/*.cmake') }}
 
+      # No precompiled headers: ccache can hand back a .pch from an earlier run,
+      # which clang then rejects because cmake_pch.c is newer than it.
       - name: Configure
         run: >
           cmake -S . -B build-win -G Ninja
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_C_COMPILER=clang-cl
           -DCMAKE_CXX_COMPILER=clang-cl
+          -DCMAKE_C_COMPILER_TARGET=${{ matrix.target }}
+          -DCMAKE_CXX_COMPILER_TARGET=${{ matrix.target }}
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
           -DAURORA_ENABLE_TESTS=ON
           -DMP_BUILD_TESTS=ON
           -DBUILD_SHARED_LIBS=OFF
@@ -54,24 +142,21 @@ jobs:
           -DAURORA_SDL3_LINKAGE=static
           -DAURORA_NOD_LINKAGE=static
           -DOPENSSL_USE_STATIC_LIBS=TRUE
+          -DLibUSB_LIBRARY=${{ env.LIBUSB_ROOT }}/lib/libusb-1.0.lib
+          -DLibUSB_INCLUDE_PATH=${{ env.LIBUSB_ROOT }}/include/libusb-1.0
 
-      - name: Build
-        run: cmake --build build-win -j
+      # SDL drops libusb without an error when it cannot use it.
+      - name: Check SDL has libusb
+        shell: pwsh
+        run: |
+          $config = Get-ChildItem -Recurse build-win/_deps/sdl-build -Filter SDL_build_config.h | Select-Object -First 1
+          if (-not $config -or -not (Select-String -Path $config.FullName -Pattern '#define SDL_LIBUSB_DYNAMIC "libusb-1\.0\.dll"')) { throw 'SDL was configured without libusb: GameCube adapters in Wii U mode would not work' }
 
-      - name: Test
-        run: ctest --test-dir build-win -L port --output-on-failure
-
-      # ctest only prints a test's output when it fails, so the wss:// evidence
-      # - the verified handshake and the rejections - would otherwise never
-      # appear in the log. Run it once more directly to record it.
-      - name: Show the TLS handshake result
-        run: ./build-win/port_ws_tests.exe
-
-      - name: Build FIFO regressions
-        run: cmake --build build-win --target gx_fifo_tests -j
-
-      - name: Test FIFO regressions
-        run: ./build-win/extern/aurora/tests/gx_fifo_tests.exe --gtest_brief=1
+      # Build, the port's tests, the TLS log and the GX FIFO regressions.
+      - uses: ./.github/actions/build-and-test
+        with:
+          build-dir: build-win
+          jobs: "-j"
 
       # The Remastered import decodes that game's H.264 movies with ffmpeg, run
       # as a separate program, and Windows has none of its own. The package
@@ -82,13 +167,13 @@ jobs:
         id: ffmpeg
         with:
           path: ffmpeg-min/out
-          key: ffmpeg-min-${{ hashFiles('tools/build_ffmpeg_min.sh') }}
+          key: ffmpeg-min${{ matrix.suffix }}-${{ hashFiles('tools/build_ffmpeg_min.sh') }}
 
       - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         if: steps.ffmpeg.outputs.cache-hit != 'true'
         with:
-          msystem: MINGW64
-          install: make diffutils tar xz curl mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm
+          msystem: ${{ matrix.msystem }}
+          install: ${{ matrix.msys-install }}
 
       # Linked statically and on Win32 threads, so the program needs no
       # MinGW runtime DLL beside it.
@@ -96,7 +181,7 @@ jobs:
         if: steps.ffmpeg.outputs.cache-hit != 'true'
         shell: msys2 {0}
         run: |
-          bash tools/build_ffmpeg_min.sh ffmpeg-min --disable-pthreads --enable-w32threads --extra-ldflags=-static
+          bash tools/build_ffmpeg_min.sh ffmpeg-min ${{ matrix.ffmpeg-args }} --disable-pthreads --enable-w32threads --extra-ldflags=-static
           mkdir -p ffmpeg-min/out
           cp ffmpeg-min/ffmpeg.exe ffmpeg-min/COPYING.LGPLv2.1 ffmpeg-min/ffmpeg-build.txt ffmpeg-min/out/
 
@@ -114,15 +199,9 @@ jobs:
           $root = Split-Path $include
           # The button-prompt textures and the pipeline cache seed are built into
           # the executable (MP_EMBED_RESOURCES), so the zip carries no copies.
+          # The licences come from tools/collect_licenses.sh in the next step;
+          # the ones only this package needs are added here.
           New-Item -ItemType Directory -Force -Path dist/licenses | Out-Null
-          # The port's own grant and notice travel with the package too.
-          Copy-Item LICENSE dist/licenses/port-license.txt
-          Copy-Item NOTICE dist/licenses/port-notice.txt
-          Copy-Item extern/aurora/LICENSE dist/licenses/aurora.txt
-          Copy-Item extern/musyx/LICENSE dist/licenses/musyx.txt
-          Copy-Item extern/astcenc/LICENSE.txt dist/licenses/astcenc.txt
-          Copy-Item extern/GamepadMotionHelpers/LICENSE dist/licenses/gamepadmotionhelpers.txt
-          Copy-Item packaging/licenses/*.txt dist/licenses/
           Copy-Item docs/NATIVE_PORT.md dist/README.md
           Copy-Item docs/SETTINGS.md dist/SETTINGS.md
           Copy-Item docs/MODS.md dist/MODS.md
@@ -132,18 +211,20 @@ jobs:
           Copy-Item ffmpeg-min/out/ffmpeg.exe dist/
           Copy-Item ffmpeg-min/out/COPYING.LGPLv2.1 dist/licenses/ffmpeg-LGPL-2.1.txt
           Copy-Item ffmpeg-min/out/ffmpeg-build.txt dist/licenses/ffmpeg.txt
-          # Keep notices supplied by the fetched runtime packages too.
-          Get-ChildItem build-win/_deps -Recurse -File -Include LICENSE*,COPYING*,NOTICE* |
-            ForEach-Object {
-              $relative = [System.IO.Path]::GetRelativePath((Resolve-Path build-win/_deps), $_.FullName)
-              $destination = Join-Path dist/licenses $relative
-              New-Item -ItemType Directory -Force -Path (Split-Path $destination) | Out-Null
-              Copy-Item $_.FullName $destination
-            }
-          if (Test-Path build-win/_deps/freetype-src/docs/FTL.TXT) { Copy-Item build-win/_deps/freetype-src/docs/FTL.TXT dist/licenses/freetype-FTL.txt }
+          # libusb is LGPL and loaded at run time: the DLL and its licence.
+          Copy-Item "$env:LIBUSB_ROOT/bin/libusb-1.0.dll" dist/
+          Copy-Item "$env:LIBUSB_ROOT/share/libusb/copyright" dist/licenses/libusb.txt
+          # The runner's OpenSSL is linked in, and its licence is not in _deps.
           $license = @("$root/license.txt", "$root/LICENSE.txt") | Where-Object { Test-Path $_ } | Select-Object -First 1
           if ($license) { Copy-Item $license dist/licenses/openssl.txt }
           else { Invoke-WebRequest https://raw.githubusercontent.com/openssl/openssl/openssl-3.5/LICENSE.txt -OutFile dist/licenses/openssl.txt }
+
+      # The port's own grant and notice, the vendored snapshots', every fetched
+      # package's and packaging/licenses/, as the Linux packages collect them.
+      # Git Bash, which every Windows runner has, runs it.
+      - name: Collect licences
+        shell: bash
+        run: bash tools/collect_licenses.sh build-win dist/licenses
 
       # Fail if a library that should be static is imported as a DLL again.
       - name: Check the executable's imports
@@ -151,7 +232,7 @@ jobs:
         run: |
           $imports = & dumpbin /dependents dist/metroid_prime_port.exe
           $imports
-          $bad = $imports | Select-String -Pattern '^\s*(SDL3|zlib1|zlib-ng\d*|libpng\d*|nod|libssl-3-x64|libcrypto-3-x64)\.dll' -AllMatches
+          $bad = $imports | Select-String -Pattern '^\s*(SDL3|zlib1|zlib-ng\d*|libpng\d*|nod|libssl-3(-x64|-arm64)?|libcrypto-3(-x64|-arm64)?)\.dll' -AllMatches
           if ($bad) { throw "Executable imports DLLs that should be static: $bad" }
 
       # The runner has OpenSSL and other runtimes on PATH, which hid a DLL
@@ -179,5 +260,5 @@ jobs:
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: metroid_prime_port-windows
+          name: metroid_prime_port-windows${{ matrix.suffix }}
           path: dist

@@ -28,6 +28,7 @@ class CGuiWidget;
 class CHudBallInterface;
 class CHudBossEnergyInterface;
 class CHudEnergyInterface;
+class CHudRadialSelect;
 class CHudHelmetInterface;
 class CHudMissileInterface;
 class CHudRadarInterface;
@@ -62,6 +63,23 @@ public:
   // Smooth frames: true poses the HUD lag/bob at the presented time, false
   // puts the last tick's back.
   void PortPresentHudLag(bool present, bool mouseLookFree = false) const;
+  // Remastered mode with the HDR scene: the damage Add filter (slot A, shape 0) is added in the
+  // bloom composite, not drawn here. True with its colour when this HUD has one this frame.
+  bool PortCompositeTint(float rgba[4]) const;
+  // Likewise the radial filter (slot B, shape 0xd): true with its gradient (apex c0, rim c1,
+  // frame multiplier c2) when this HUD has one this frame.
+  bool PortCompositeRadial(float c0[4], float c1[4], float c2[4]) const;
+  // CMFGame sets it when the composite took the tint; Draw then skips the filter, once.
+  static void PortSetTintFolded(bool folded);
+  // Trilogy's HUD text comes from STRG_Hud, and STRG_Main index mainIdx (1..16) is STRG_Hud's
+  // mainIdx - 1. Without it (GC) this is gpStringTable->GetString(mainIdx).
+  static const wchar_t* PortHudString(int mainIdx);
+  // STRG_Hud index idx on Trilogy, STRG_Main index idx otherwise (0..7, the visor and beam names,
+  // match in English).
+  static const wchar_t* PortHudStringAt(int idx);
+  // Remastered's CHUDVisorEffectData::IsValid 0xcb0f78: its projection is set only by the
+  // CSamusHudMP1 ctor (Initialize 0xcb0eb4), so it holds once the HUD exists.
+  static bool PortExists();
 #endif
   void ProcessControllerInput(const CFinalInput& input);
   void UpdateStateTransition(float dt, const CStateManager& mgr);
@@ -241,10 +259,20 @@ private:
     , valid(false) {}
   };
   SPortHudLag xPortLag[2];
+  static bool sPortTintFolded;
+  // Remastered mode (its HUD frames) with a HUD drawn: the composite folds the filter in.
+  bool PortCompositeRemastered() const;
   uint xPortLagGeneration = 0;     // tick of xPortLag[1]
   uint xPortLagPrevGeneration = 0; // tick of xPortLag[0]
   bool xPortLagPresented = false;
   void PortApplyHudLag(const SPortHudLag& state);
+  // Trilogy: STRG_Hud, CSamusHud+0x494 (fn_801C5694); null on GC.
+  rstl::single_ptr< TLockedToken< CStringTable > > xPortHudStrings;
+  static const CStringTable* sPortHudStrings;
+  // Trilogy with the radial menus setting: the Wii's radial visor [0] and beam [1] menus,
+  // made on first use.
+  rstl::single_ptr< CHudRadialSelect > xPortRadial[2];
+  float PortRadialOpen() const;
 #endif
 
   rstl::reserved_vector< bool, 4 > BuildPlayerHasVisors(const CStateManager& mgr) const;

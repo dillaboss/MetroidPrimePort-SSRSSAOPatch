@@ -9,6 +9,7 @@
 #include "port_revision_scripts.h"
 
 #include <algorithm>
+#include <set>
 
 namespace PortSkipCutscenes {
 namespace {
@@ -95,6 +96,20 @@ std::vector< uint8_t > HallOfTheEldersOps() {
   return std::move(w.ops);
 }
 
+const uint32_t kDeckAlphaElevator = 0xAE1EC8BD;
+
+// The Frigate's item loss: retail takes Samus's suit items away when the
+// elevator cinematic's fourth camera (00050115) ends, by a Reset of spawn
+// point 00050140. randomprime's skip object only sends that spawn point
+// SetToZero (teleport), so a skip before that camera left her every item
+// until the Landing Site (issue #233). Reset teleports as well.
+std::vector< uint8_t > DeckAlphaElevatorOps() {
+  OpWriter w;
+  w.conn(3, 0x00050001, 9 /* Zero */, 13 /* SetToZero */, 0x00050140);
+  w.conn(4, 0x00050001, 9, 10 /* Reset */, 0x00050140);
+  return std::move(w.ops);
+}
+
 const uint32_t kArtifactTemple = 0x2398E906;
 
 // Randomized games' Artifact Temple (applied after the patches above): the
@@ -129,6 +144,7 @@ std::vector< uint8_t > TempleOps() {
 }
 
 bool PatchScripts(uint32_t mreaId, const uint8_t* scly, size_t size, std::vector< uint8_t >& out);
+bool PatchDoors(uint32_t mreaId, const uint8_t* scly, size_t size, std::vector< uint8_t >& out);
 
 } // namespace
 
@@ -140,6 +156,8 @@ bool PatchArea(uint32_t mreaId, const uint8_t* scly, size_t size, std::vector< u
   out.clear();
   if (Active())
     PatchScripts(mreaId, scly, size, out);
+  else
+    PatchDoors(mreaId, scly, size, out);
   // Revision compatibility (USA 1.00 behaviour on later discs), after the
   // patches above. Randomized games always want it; otherwise it's the
   // setting. A miss keeps what the patches above made.
@@ -185,6 +203,15 @@ bool PatchScripts(uint32_t mreaId, const uint8_t* scly, size_t size, std::vector
       out.swap(hall);
     else
       PortLog::Write("skippable cutscenes: Hall of the Elders control release doesn't match, left as is\n");
+  }
+  if (skipped && mreaId == kDeckAlphaElevator && !Forced()) {
+    // Randomized games keep randomprime's skip as it is.
+    const std::vector< uint8_t > ops = DeckAlphaElevatorOps();
+    std::vector< uint8_t > reset;
+    if (ApplyOps(out.data(), out.size(), ops.data(), ops.size(), reset) == 0)
+      out.swap(reset);
+    else
+      PortLog::Write("skippable cutscenes: Frigate item loss on skip doesn't match, left as is\n");
   }
   const bool apGame = PortAp::RandomizedGame();
   if (skipped && mreaId == kLandingSite && apGame) {
@@ -236,18 +263,29 @@ bool PatchScripts(uint32_t mreaId, const uint8_t* scly, size_t size, std::vector
     else
       PortLog::Write("archipelago: room %08X's option patch doesn't match, left as is\n", mreaId);
   }
+  PatchDoors(mreaId, scly, size, out);
+  return !out.empty();
+}
+
+// The door types of a seed and of the doorways the player unlocked, on top of
+// `out` when that holds a patched script, else on `scly`. The only door pass
+// of a room load, run whether or not skippable cutscenes are on.
+bool PatchDoors(uint32_t mreaId, const uint8_t* scly, size_t size, std::vector< uint8_t >& out) {
   std::vector< uint8_t > doorOps;
   const bool patched = !out.empty();
-  if (PortAp::DoorOps(mreaId, patched ? out.data() : scly, patched ? out.size() : size, doorOps)) {
-    // The seed's door types.
-    std::vector< uint8_t > doors;
-    if (ApplyOps(patched ? out.data() : scly, patched ? out.size() : size, doorOps.data(),
-                 doorOps.size(), doors) == 0)
-      out.swap(doors);
-    else
-      PortLog::Write("archipelago: room %08X's door patch doesn't match, left as is\n", mreaId);
+  if (!PortAp::DoorOps(mreaId, patched ? out.data() : scly, patched ? out.size() : size, doorOps))
+    return false;
+  std::vector< uint8_t > doors;
+  if (ApplyOps(patched ? out.data() : scly, patched ? out.size() : size, doorOps.data(),
+               doorOps.size(), doors) != 0) {
+    // Once per room: the room loads again on every visit.
+    static std::set< uint32_t > sWarned;
+    if (sWarned.insert(mreaId).second)
+      PortLog::Write("doors: room %08X's door patch doesn't match, left as is\n", mreaId);
+    return false;
   }
-  return !out.empty();
+  out.swap(doors);
+  return true;
 }
 
 } // namespace

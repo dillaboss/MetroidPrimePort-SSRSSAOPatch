@@ -1,4 +1,7 @@
 #include "port_gci.h"
+#include "port_env.h"
+#include "port_strings.h"
+#include "port_bytes.h"
 
 #include <aurora/card.h>
 
@@ -6,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +27,10 @@
 #endif
 #include <windows.h>
 #include <shlobj.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -42,11 +50,23 @@ const char* GameCode() { return sGameCode; }
 
 const char* CardRegion() { return sGameCode[3] == 'P' ? "EUR" : "USA"; }
 
-ExportFormat NativeExport() { return PortSaveConvert::NativeFormat(sGameCode[3] == 'P'); }
+bool OnTrilogyDisc() { return std::memcmp(sGameCode, "R3M", 3) == 0; }
 
-const char* GameCodeOf(ExportFormat format) { return format == ExportFormat::PalGci ? "GM8P" : "GM8E"; }
+// A Trilogy disc's (R3ME/R3MP) saves have PAL's container but the Trilogy's
+// own relay, door and scan order.
+ExportFormat NativeExport() { return PortSaveConvert::NativeFormat(sGameCode[3] == 'P', OnTrilogyDisc()); }
 
-const char* CardRegionOf(ExportFormat format) { return format == ExportFormat::PalGci ? "EUR" : "USA"; }
+const char* GameCodeOf(ExportFormat format) {
+  if (format == ExportFormat::TriGci)
+    return OnTrilogyDisc() ? sGameCode : "R3ME";
+  return format == ExportFormat::PalGci ? "GM8P" : "GM8E";
+}
+
+const char* CardRegionOf(ExportFormat format) {
+  if (format == ExportFormat::TriGci)
+    return OnTrilogyDisc() ? CardRegion() : "USA";
+  return format == ExportFormat::PalGci ? "EUR" : "USA";
+}
 
 std::string PathString(const fs::path& path) {
   const auto u8 = path.u8string();
@@ -75,7 +95,7 @@ bool ReadAll(const fs::path& path, std::vector<uint8_t>& out, std::string& error
     error = "cannot open " + PathString(path);
     return false;
   }
-  out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+  out = port::ReadAll(in);
   if (in.bad()) {
     error = "cannot read " + PathString(path);
     return false;
@@ -85,29 +105,101 @@ bool ReadAll(const fs::path& path, std::vector<uint8_t>& out, std::string& error
 
 // Written beside the target and renamed over it, so a failed write leaves no
 // half file. The temporary name does not end in .gci: a card never reads it.
-bool WriteAll(const fs::path& path, const std::vector<uint8_t>& data, std::string& error) {
+fs::path TempOf(const fs::path& path) {
   fs::path temp = path;
   temp += ".tmp";
-  {
-    std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-    out.write(reinterpret_cast< const char* >(data.data()),
-              static_cast< std::streamsize >(data.size()));
-    out.close();
-    if (!out) {
-      std::error_code ignored;
-      fs::remove(temp, ignored);
-      error = "cannot write " + PathString(path);
-      return false;
-    }
+  return temp;
+}
+
+// Pushes the temporary file's bytes to the disk, so a rename of it cannot land
+// before its data does.
+bool SyncFile(const fs::path& file) {
+#if defined(_WIN32)
+  const HANDLE handle = CreateFileW(file.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    return false;
   }
-  std::error_code ec;
-  fs::rename(temp, path, ec);
-  if (ec) {
-    fs::remove(temp, ec);
+  const bool ok = FlushFileBuffers(handle) != 0;
+  CloseHandle(handle);
+  return ok;
+#else
+  const int fd = open(file.c_str(), O_RDONLY);
+  if (fd < 0) {
+    return false;
+  }
+  // A file system that cannot sync (EINVAL, ENOTSUP) still gets the write; only
+  // an I/O error fails.
+  const bool ok = fsync(fd) == 0 || errno == EINVAL || errno == ENOTSUP;
+  close(fd);
+  return ok;
+#endif
+}
+
+// Pushes the rename itself to the disk. Best effort: some file systems cannot
+// sync a directory, and the rename has happened either way.
+void SyncDirectory(const fs::path& file) {
+#if !defined(_WIN32)
+  fs::path dir = file.parent_path();
+  if (dir.empty()) {
+    dir = ".";
+  }
+  const int fd = open(dir.c_str(), O_RDONLY);
+  if (fd >= 0) {
+    fsync(fd);
+    close(fd);
+  }
+#else
+  (void)file; // the rename in CommitTemp is MOVEFILE_WRITE_THROUGH
+#endif
+}
+
+bool WriteTemp(const fs::path& path, const std::vector<uint8_t>& data, std::string& error) {
+  const fs::path temp = TempOf(path);
+  std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+  out.write(reinterpret_cast< const char* >(data.data()), static_cast< std::streamsize >(data.size()));
+  out.close();
+  if (!out) {
+    std::error_code ignored;
+    fs::remove(temp, ignored);
     error = "cannot write " + PathString(path);
     return false;
   }
+  if (!SyncFile(temp)) {
+    std::error_code ignored;
+    fs::remove(temp, ignored);
+    error = "cannot flush " + PathString(path) + " to disk";
+    return false;
+  }
   return true;
+}
+
+bool CommitTemp(const fs::path& path, std::string& error) {
+  const fs::path temp = TempOf(path);
+#if defined(_WIN32)
+  // std::filesystem::rename is MoveFileExW(REPLACE_EXISTING); add write-through.
+  if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    std::error_code ignored;
+    fs::remove(temp, ignored);
+    error = "cannot write " + PathString(path);
+    return false;
+  }
+#else
+  std::error_code ec;
+  fs::rename(temp, path, ec);
+  if (ec) {
+    error = "cannot write " + PathString(path) + ": " + ec.message();
+    std::error_code ignored;
+    fs::remove(temp, ignored);
+    return false;
+  }
+  SyncDirectory(path);
+#endif
+  return true;
+}
+
+bool WriteAll(const fs::path& path, const std::vector<uint8_t>& data, std::string& error) {
+  return WriteTemp(path, data, error) && CommitTemp(path, error);
 }
 
 bool ReadHeader(const fs::path& path, Header& out) {
@@ -142,8 +234,11 @@ std::string Timestamp() {
   return buffer;
 }
 
+// A file moved into _replaced, and where it came from.
+using Moved = std::vector< std::pair< fs::path, fs::path > >;
+
 // Moves a file into <folder>/_replaced under a name that is not taken yet.
-bool MoveAside(const fs::path& file, std::string& error) {
+bool MoveAside(const fs::path& file, std::string& error, Moved* moved = nullptr) {
   std::error_code ec;
   const fs::path dir = file.parent_path() / "_replaced";
   fs::create_directories(dir, ec);
@@ -157,7 +252,19 @@ bool MoveAside(const fs::path& file, std::string& error) {
     error = "cannot move " + PathString(file) + " aside: " + ec.message();
     return false;
   }
+  if (moved != nullptr) {
+    moved->emplace_back(file, target);
+  }
   return true;
+}
+
+// Puts files moved aside back where they were, after the write that was to
+// replace them failed: a failed import must not leave the card without its save.
+void Restore(const Moved& moved) {
+  for (auto it = moved.rbegin(); it != moved.rend(); ++it) {
+    std::error_code ec;
+    fs::rename(it->second, it->first, ec);
+  }
 }
 
 void AddError(Report& report, std::string error) {
@@ -248,8 +355,13 @@ std::string Report::Summary(const char* verb) const {
   return text;
 }
 
-bool InstallGci(const fs::path& folder, const std::vector<uint8_t>& gci, std::string& error,
-                bool* replacedOut) {
+namespace {
+
+// Written to a temporary file before anything is moved aside, so a write that
+// fails (full disk, read-only folder) leaves the card as it was. Files moved
+// aside are added to *moved, the file written to *written.
+bool Install(const fs::path& folder, const std::vector<uint8_t>& gci, std::string& error,
+             Moved& moved, fs::path* written) {
   Header header;
   if (!ParseHeader(gci.data(), gci.size(), header, error)) {
     return false;
@@ -261,7 +373,17 @@ bool InstallGci(const fs::path& folder, const std::vector<uint8_t>& gci, std::st
     return false;
   }
   const fs::path target = folder / PathFromString(DiskName(header));
-  bool replaced = false;
+  if (!WriteTemp(target, gci, error)) {
+    return false;
+  }
+  const size_t movedBefore = moved.size();
+  const auto fail = [&] {
+    std::error_code ignored;
+    fs::remove(TempOf(target), ignored);
+    Restore(Moved(moved.begin() + static_cast< std::ptrdiff_t >(movedBefore), moved.end()));
+    moved.resize(movedBefore);
+    return false;
+  };
   // A card refuses two files with one identity, whatever they are called, and
   // the file at the target name has to go even if it is something else.
   // Listed first, then moved: the listing's error is the only one that means
@@ -275,7 +397,7 @@ bool InstallGci(const fs::path& folder, const std::vector<uint8_t>& gci, std::st
   }
   if (ec) {
     error = "cannot list " + PathString(folder) + ": " + ec.message();
-    return false;
+    return fail();
   }
   for (const fs::path& path : candidates) {
     Header existing;
@@ -283,54 +405,77 @@ bool InstallGci(const fs::path& folder, const std::vector<uint8_t>& gci, std::st
     const bool sameIdentity = ReadHeader(path, existing) && existing.game == header.game &&
                               existing.maker == header.maker &&
                               existing.fileName == header.fileName;
-    if (sameName || sameIdentity) {
-      if (!MoveAside(path, error)) {
-        return false;
-      }
-      replaced = true;
+    if ((sameName || sameIdentity) && !MoveAside(path, error, &moved)) {
+      return fail();
     }
   }
-  if (!WriteAll(target, gci, error)) {
+  if (!CommitTemp(target, error)) {
+    return fail();
+  }
+  if (written != nullptr) {
+    *written = target;
+  }
+  return true;
+}
+
+} // namespace
+
+bool InstallGci(const fs::path& folder, const std::vector<uint8_t>& gci, std::string& error,
+                bool* replacedOut) {
+  Moved moved;
+  if (!Install(folder, gci, error, moved, nullptr)) {
     return false;
   }
   if (replacedOut != nullptr) {
-    *replacedOut = replaced;
+    *replacedOut = !moved.empty();
   }
   return true;
 }
 
 namespace {
 
-void Install(Report& report, const fs::path& folder, const std::vector<uint8_t>& gci) {
-  std::string error;
-  bool replaced = false;
-  if (InstallGci(folder, gci, error, &replaced)) {
-    ++report.copied;
-    report.replaced += replaced ? 1 : 0;
-  } else {
-    AddError(report, error);
-  }
-}
-
 // The game keeps one save as "MetroidPrime A" or "B" and loads whichever is
 // newer, so an imported A beside a newer B would be ignored. A save therefore
-// moves as a set: every game file already there is moved aside first.
-void InstallSet(Report& report, const fs::path& folder, const std::vector<std::vector<uint8_t>>& set,
+// moves as a set: every game file already there is moved aside first. If any
+// file of the set fails, the ones written are removed and the old set is put
+// back, so the card keeps a save it can load. The files take code as their
+// game code: a Trilogy disc's card holds GameCube PAL files under R3ME/R3MP.
+void InstallSet(Report& report, const fs::path& folder, std::vector<std::vector<uint8_t>> set,
                 const std::string& code = sGameCode) {
   if (set.empty()) {
     return;
   }
+  for (auto& gci : set) {
+    if (gci.size() >= kHeaderSize && code.size() == 4) {
+      std::memcpy(gci.data(), code.data(), 4);
+    }
+  }
+  Moved moved;
   for (const fs::path& old : FilesOf(folder, code)) {
     std::string error;
-    if (!MoveAside(old, error)) {
+    if (!MoveAside(old, error, &moved)) {
+      Restore(moved);
       AddError(report, error);
       return;
     }
-    ++report.replaced;
   }
+  std::vector< fs::path > written;
   for (const auto& gci : set) {
-    Install(report, folder, gci);
+    std::string error;
+    fs::path target;
+    if (!Install(folder, gci, error, moved, &target)) {
+      for (const fs::path& path : written) {
+        std::error_code ignored;
+        fs::remove(path, ignored);
+      }
+      Restore(moved);
+      AddError(report, error + " (nothing was replaced)");
+      return;
+    }
+    written.push_back(target);
   }
+  report.copied += static_cast< int >(written.size());
+  report.replaced += static_cast< int >(moved.size());
 }
 
 void CollectName(const char* fileName, void* userData) {
@@ -366,8 +511,12 @@ struct Converted {
   uint32_t newest = 0;
 };
 
-std::string ConversionNote(const PortSaveConvert::Conversion& conversion) {
-  std::string text = std::string("converted from ") + PortSaveConvert::FormatName(conversion.from);
+std::string ConversionNote(const PortSaveConvert::Conversion& conversion, const std::vector<uint8_t>& bytes) {
+  // A Trilogy disc's card files hold PAL's layout; name them by what they are.
+  const bool trilogy = bytes.size() >= 4 && std::memcmp(bytes.data(), "R3M", 3) == 0;
+  std::string text = std::string("converted from ") +
+                     (trilogy ? (bytes[3] == 'P' ? "Trilogy (PAL)" : "Trilogy (USA)")
+                              : PortSaveConvert::FormatName(conversion.from));
   if (conversion.stats.Any()) {
     text += " (" + conversion.stats.Summary() + ")";
   }
@@ -390,23 +539,23 @@ bool Convert(const std::vector<uint8_t>& bytes, const std::vector<uint8_t>& art,
     return false;
   }
   out.gci = std::move(conversion.gci);
-  out.note = ConversionNote(conversion);
+  out.note = ConversionNote(conversion, bytes);
   out.newest = conversion.newest;
   if (bytes.size() >= 0x2C) {
-    out.modTime = uint32_t(bytes[0x28]) << 24 | uint32_t(bytes[0x29]) << 16 | uint32_t(bytes[0x2A]) << 8 | bytes[0x2B];
+    out.modTime = port::GetBE32(bytes, 0x28);
   }
   return true;
 }
 
 bool IsNative(const std::vector<uint8_t>& bytes) {
-  return PortSaveConvert::Detect(bytes.data(), bytes.size()) == PortSaveConvert::NativeFormat(OnPalDisc());
+  return PortSaveConvert::Detect(bytes.data(), bytes.size()) == NativeExport();
 }
 
 // Installs a set of candidate files: when some already are the disc's format
 // only those count; otherwise the newest is converted (the converted names
-// would collide, and the game loads one save).
+// would collide, and the game loads one save). They are installed as code's.
 void InstallCandidates(Report& report, const fs::path& folder, const std::string& name,
-                       const std::vector<std::vector<uint8_t>>& found) {
+                       const std::vector<std::vector<uint8_t>>& found, const std::string& code = sGameCode) {
   std::vector<std::vector<uint8_t>> native;
   for (const auto& bytes : found) {
     if (IsNative(bytes)) {
@@ -414,7 +563,7 @@ void InstallCandidates(Report& report, const fs::path& folder, const std::string
     }
   }
   if (!native.empty()) {
-    InstallSet(report, folder, native);
+    InstallSet(report, folder, native, code);
     return;
   }
   const std::vector<uint8_t> art = ExistingArt(folder);
@@ -435,7 +584,7 @@ void InstallCandidates(Report& report, const fs::path& folder, const std::string
   if (!have) {
     return;
   }
-  InstallSet(report, folder, {best.gci});
+  InstallSet(report, folder, {best.gci}, code);
   report.note = report.note.empty() ? best.note : report.note + "; " + best.note;
 }
 
@@ -584,9 +733,22 @@ Report ImportFile(const fs::path& source, const fs::path& folder, const fs::path
 
 std::vector<fs::path> GameFiles(const fs::path& folder) { return FilesOf(folder, sGameCode); }
 
-Report ImportFolder(const fs::path& source, const fs::path& folder) {
+std::vector<fs::path> ImportableFiles(const fs::path& source) {
+  for (const char* code : {static_cast< const char* >(sGameCode), "GM8E", "GM8P", "R3ME", "R3MP"}) {
+    auto files = FilesOf(source, code);
+    if (!files.empty()) {
+      return files;
+    }
+  }
+  return {};
+}
+
+namespace {
+
+// Copies a save set into folder as code's, converted if it is another release's.
+Report CopyFiles(const fs::path& source, const std::vector<fs::path>& files, const fs::path& folder,
+                 const std::string& code) {
   Report report;
-  const auto files = GameFiles(source);
   if (files.empty()) {
     AddError(report, "no Metroid Prime save in " + PathString(source));
   }
@@ -600,8 +762,15 @@ Report ImportFolder(const fs::path& source, const fs::path& folder) {
     }
     set.push_back(std::move(bytes));
   }
-  InstallSet(report, folder, set);
+  if (!set.empty()) {
+    InstallCandidates(report, folder, PathString(source.filename()), set, code);
+  }
   return report;
+}
+} // namespace
+
+Report ImportFolder(const fs::path& source, const fs::path& folder) {
+  return CopyFiles(source, ImportableFiles(source), folder, sGameCode);
 }
 
 bool ExportBytes(const fs::path& folder, ExportFormat format, std::vector<uint8_t>& gci, std::string& note,
@@ -652,7 +821,7 @@ Report ExportFolder(const fs::path& folder, const fs::path& dest, ExportFormat f
     return report;
   }
   if (format == NativeExport()) {
-    return ImportFolder(folder, dest);
+    return CopyFiles(folder, GameFiles(folder), dest, GameCodeOf(format));
   }
   std::vector<uint8_t> gci;
   std::string error;
@@ -674,6 +843,7 @@ Report ExportRaw(const fs::path& folder, const fs::path& image, ExportFormat for
   std::vector<std::vector<uint8_t>> set;
   std::vector<std::string> names;
   std::string converted;
+  const char* code = GameCodeOf(format);
   if (format != NativeExport()) {
     std::vector<uint8_t> gci;
     std::string error;
@@ -695,6 +865,7 @@ Report ExportRaw(const fs::path& folder, const fs::path& image, ExportFormat for
         return report;
       }
       names.push_back(header.fileName);
+      std::memcpy(bytes.data(), code, 4); // a Trilogy disc's files go out as GameCube ones
       set.push_back(std::move(bytes));
     }
   }
@@ -713,7 +884,6 @@ Report ExportRaw(const fs::path& folder, const fs::path& image, ExportFormat for
     report.note = report.note.empty() ? converted : converted + "; " + report.note;
   }
   const std::string imagePath = PathString(image);
-  const char* code = GameCodeOf(format);
   // As for folders: the other of A/B, if the image has it, would win when newer.
   std::vector<std::string> existing;
   if (fs::exists(image, ec)) {
@@ -799,7 +969,7 @@ std::vector<fs::path> AutoDolphinRoots() {
   }
   CoTaskMemFree(documents);
 #else
-  const char* home = std::getenv("HOME");
+  const char* home = port::HomeFolder();
   const std::string homeDir = home != nullptr ? home : "";
 #if defined(__APPLE__)
   if (!homeDir.empty()) {
@@ -900,6 +1070,20 @@ fs::path SharedCardBase(std::string* why) {
     }
     return {};
   }
+  // The emulator's GameCube card isn't Trilogy's (its saves live in a Wii
+  // save.bin): a Trilogy disc keeps the port's own card and mirrors it
+  // (SyncTrilogyShare).
+  if (std::memcmp(sGameCode, "R3M", 3) == 0) {
+    if (why != nullptr) {
+      *why = TrilogyShareBin().empty()
+                 ? std::string("No Trilogy save in the emulator (Wii/title/00010000/") +
+                       (OnPalDisc() ? "52334d50" : "52334d45") +
+                       "/data/save.bin): start Trilogy there once."
+                 : "On Trilogy the port keeps its own card and mirrors it with the emulator's "
+                   "Trilogy save: the newer one wins, the other is kept (_replaced, save.bin.bak).";
+    }
+    return {};
+  }
   std::error_code ec;
   const std::vector<fs::path> roots = DolphinRoots();
   for (const fs::path& root : roots) {
@@ -944,11 +1128,12 @@ DolphinCard FindDolphinCard(const char* region) {
   return card;
 }
 
-fs::path FindDolphinTrilogy() {
-  // The Trilogy's title ids: R3ME (USA) and R3MP (PAL).
+namespace {
+
+fs::path FindTrilogyBin(std::initializer_list<const char*> titles) {
   std::error_code ec;
   for (const fs::path& root : DolphinRoots()) {
-    for (const char* title : {"52334d45", "52334d50"}) {
+    for (const char* title : titles) {
       const fs::path bin = root / "Wii/title/00010000" / title / "data/save.bin";
       if (fs::is_regular_file(bin, ec)) {
         return bin;
@@ -956,6 +1141,69 @@ fs::path FindDolphinTrilogy() {
     }
   }
   return {};
+}
+
+} // namespace
+
+fs::path FindDolphinTrilogy() {
+  // The Trilogy's title ids: R3ME (USA) and R3MP (PAL).
+  return FindTrilogyBin({"52334d45", "52334d50"});
+}
+
+fs::path TrilogyShareBin() {
+  if (!ShareEmulatorCard() || std::memcmp(sGameCode, "R3M", 3) != 0) {
+    return {};
+  }
+  return FindTrilogyBin({OnPalDisc() ? "52334d50" : "52334d45"});
+}
+
+bool SyncTrilogy(const fs::path& folder, const fs::path& bin, bool pull) {
+  // What a sync failed on, so a save it cannot take is not retried every check.
+  static fs::file_time_type sFailedCard{};
+  static fs::file_time_type sFailedBin{};
+  std::error_code ec;
+  const fs::file_time_type binTime = fs::last_write_time(bin, ec);
+  if (ec) {
+    return false;
+  }
+  const std::vector<fs::path> files = GameFiles(folder);
+  fs::file_time_type cardTime = fs::file_time_type::min();
+  for (const fs::path& file : files) {
+    cardTime = std::max(cardTime, fs::last_write_time(file, ec));
+  }
+  if (!files.empty() && cardTime > binTime && cardTime != sFailedCard) {
+    if (ExportTrilogy(folder, bin).copied == 0) {
+      sFailedCard = cardTime;
+      return false;
+    }
+    // Equal times mean in step.
+    fs::last_write_time(bin, cardTime, ec);
+    return false;
+  }
+  if (!pull || binTime <= cardTime || binTime == sFailedBin) {
+    return false;
+  }
+  if (ImportFile(bin, folder, folder).copied == 0) {
+    sFailedBin = binTime;
+    return false;
+  }
+  for (const fs::path& file : GameFiles(folder)) {
+    fs::last_write_time(file, binTime, ec);
+  }
+  MarkCardChanged();
+  return true;
+}
+
+bool SyncTrilogyShare(bool pull) {
+  static std::chrono::steady_clock::time_point sNext{};
+  const auto now = std::chrono::steady_clock::now();
+  if (now < sNext) {
+    return false;
+  }
+  sNext = now + std::chrono::milliseconds(500);
+  const fs::path bin = TrilogyShareBin();
+  const fs::path folder = bin.empty() ? fs::path() : MountedCardFolder();
+  return !folder.empty() && SyncTrilogy(folder, bin, pull);
 }
 
 fs::path MountedCardFolder() {
@@ -980,6 +1228,93 @@ Report MigrateMountedLegacyPal() {
     MarkCardChanged();
   }
   return migrated;
+}
+
+namespace {
+struct Release {
+  const char* code;
+  const char* label;
+};
+constexpr Release kReleases[] = {
+    {"GM8E", "Metroid Prime (USA GameCube)"},
+    {"GM8P", "Metroid Prime (PAL GameCube)"},
+    {"R3ME", "Metroid Prime Trilogy (USA)"},
+    {"R3MP", "Metroid Prime Trilogy (PAL)"},
+};
+
+fs::path RestoreMarker(const fs::path& folder) { return folder / (std::string(".restore-offered-") + sGameCode); }
+} // namespace
+
+std::vector<OtherRelease> OtherReleaseSaves() {
+  std::vector<OtherRelease> found;
+  fs::path folder = MountedCardFolder();
+  if (folder.empty()) {
+    return found;
+  }
+  if (!folder.has_filename()) {
+    folder = folder.parent_path(); // a trailing separator
+  }
+  // <base>/<region>/Card A: the other region's card sits beside this one.
+  const fs::path base = folder.parent_path().parent_path();
+  const fs::path cardName = folder.filename();
+  for (const Release& release : kReleases) {
+    if (std::strncmp(release.code, sGameCode, 4) == 0) {
+      continue;
+    }
+    const fs::path source = base / (release.code[3] == 'P' ? "EUR" : "USA") / cardName;
+    OtherRelease other{source, release.code, release.label, fs::file_time_type::min()};
+    bool any = false;
+    for (const fs::path& file : FilesOf(source, release.code)) {
+      // Only files with a game in them: an empty card is nothing to restore.
+      std::vector<uint8_t> bytes;
+      std::string error;
+      PortSaveConvert::Format format;
+      PortSaveConvert::Save save;
+      if (!ReadAll(file, bytes, error) ||
+          !PortSaveConvert::Read(bytes.data(), bytes.size(), format, save, nullptr, error)) {
+        continue;
+      }
+      std::error_code ec;
+      other.written = std::max(other.written, fs::last_write_time(file, ec));
+      any = true;
+    }
+    if (any) {
+      found.push_back(std::move(other));
+    }
+  }
+  std::sort(found.begin(), found.end(),
+            [](const OtherRelease& a, const OtherRelease& b) { return a.written > b.written; });
+  return found;
+}
+
+Report RestoreFrom(const OtherRelease& source) {
+  const fs::path folder = MountedCardFolder();
+  if (folder.empty()) {
+    Report report;
+    AddError(report, "the memory card is not a GCI folder");
+    return report;
+  }
+  Report report = CopyFiles(source.folder, FilesOf(source.folder, source.code), folder, sGameCode);
+  if (report.copied > 0) {
+    MarkCardChanged();
+  }
+  return report;
+}
+
+std::vector<OtherRelease> RestoreToOffer() {
+  const fs::path folder = MountedCardFolder();
+  std::error_code ec;
+  if (folder.empty() || !GameFiles(folder).empty() || fs::exists(RestoreMarker(folder), ec)) {
+    return {};
+  }
+  return OtherReleaseSaves();
+}
+
+void MarkRestoreOffered() {
+  const fs::path folder = MountedCardFolder();
+  if (!folder.empty()) {
+    std::ofstream(RestoreMarker(folder)) << "asked\n";
+  }
 }
 
 void MarkCardChanged() { sCardChanged = true; }

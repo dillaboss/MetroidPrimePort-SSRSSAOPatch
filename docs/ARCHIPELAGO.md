@@ -1,9 +1,10 @@
 # Archipelago client
 
 The port can join an Archipelago multiworld directly: a native client in
-`platform/port_apclient.cpp` speaks the AP protocol over a WebSocket and hands
-items to the player state, and collected pickups are reported back as location
-checks. All of it is opt-in; with no configuration the port is unaffected.
+`platform/port_apclient.cpp` (its socket thread in
+`platform/port_apclient_worker.cpp`) speaks the AP protocol over a WebSocket and
+hands items to the player state, and collected pickups are reported back as
+location checks. All of it is opt-in; with no configuration the port is unaffected.
 
 Seeds come from Archipelago's Metroid Prime world, maintained at
 `github.com/UltiNaruto/MetroidAPrime` (a fork of `Electro1512/MetroidAPrime`,
@@ -67,6 +68,14 @@ With the built-in tables, the client does what the AP ISO patch would:
   `pickup_meta.rs.in`) remove the script objects tied to each pickup's retail
   item (its cutscene, and the artifact special functions), and move what the cutscene's end did onto a relay that
   the pickup fires, so a pickup no longer plays its retail item's cutscene.
+- A pickup plays the jingle of the item placed there, as randomprime's
+  `PickupType::attainment_audio_file_name` does: the artifact jingle for
+  artifacts, the item jingle for upgrades and launchers, the short one for
+  expansions, Energy Tanks, refills and another game's items. The location
+  table names each pickup's jingle StreamedAudio (`attainment_audio`);
+  `CScriptStreamedMusic` swaps its file on Play once the item is scouted.
+  Before the scout arrives, the retail jingle plays. The offline randomizer
+  shares this path.
 - Slot data sets the Missile Launcher and main Power Bomb requirements (ammo
   capacity follows the world's rules: up to 999 missiles and 99 power bombs
   in a seed's game, 250 and 8 anywhere else), DeathLink, and `non_varia_heat_damage`
@@ -225,7 +234,7 @@ back to `/system/etc/security/cacerts`; the first directory with a certificate
 wins) and fails loudly, naming every directory tried, when none exist.
 
 Both halves are proven on the Android emulator; the recipe and the expected log
-lines are in [ANDROID_BUILD_PROBE.md](ANDROID_BUILD_PROBE.md#wss-on-android-proven-end-to-end).
+lines are in [ANDROID.md](ANDROID.md#wss-on-android-proven-end-to-end).
 
 ## Configuration
 
@@ -440,6 +449,29 @@ dots; console `tracker` prints the same list); its rules are compiled from the
 The port's screenshot capture does not
 include Aurora's UI layer, so an F1 screenshot will not show either.
 
+## What the log records
+
+`metroid_prime_port.log` (attach it to a report) follows every item and check, so a
+missing item can be traced to where it stopped (`archipelago:` lines):
+
+- `connected as slot N, team T; the server has K location(s) checked; seed options: ...`:
+  the handshake, and the options that change grants (`missile_launcher`, `main_power_bomb`).
+- `check <world:area:entity> (location ID) queued to send` when a pickup is collected, or
+  `... was recorded already ...; not sent again` when the server or the game had it, so
+  no item comes back for it.
+- `received N item(s) from #I (next expected #E, ...)`, then one `item #I <id> <name>: game
+  item T, capacity +C, amount +A` per item; `(the loaded game holds it already: counted,
+  not granted)` during a replay, and a line for a gap and the resend it asks for.
+- `applied item #I <name>: <item> a/c -> a/c (amount/capacity)`: the inventory before and
+  after, once the game takes the grant.
+- `lining up a loaded game: ...`, then `in step`, `holds X of Y ...; asking the server for
+  the rest` with `rewinding: ...`, or `taking the loaded game to hold ...`: what a save,
+  resume or save state brings, and what the client does about it.
+- `DeathLink: N death(s) from the multiworld`.
+
+Without Archipelago, a seed's pickups log `randomizer: picked up <key>: <item>, capacity
++C, amount +A; now a/c` (the per-check `randomizer_checks.log` is unchanged).
+
 ## Verified
 
 - `port_apclient_tests` covers configuration parsing and its error cases, the
@@ -473,7 +505,11 @@ include Aurora's UI layer, so an F1 screenshot will not show either.
 ## Not done yet
 
 - **Hints.** `!hint <name>` on the Archipelago page's Chat sub-tab asks the server, and the Artifact
-  Temple totems name each artifact's location (from `artifact_locations` slot
-  data, stored hints or scouts). There is no hint list beyond that.
+  Temple totems name each artifact's location (from `artifact_locations` slot data, stored hints or
+  scouts). Finishing a totem scan (not the text refresh at room load) also asks the server to hint
+  that artifact (`LocationScouts` with `create_as_hint` 2, once per location) when it is in this
+  slot's own world; one in another player's world is not hinted by the scan (the AP world's
+  `artifact_hints` option already makes every artifact a start hint). There is no hint list beyond
+  that.
 - **Pickup models.** Models come from the connect-time scouts, which are not
   saved, so an offline session shows retail models.

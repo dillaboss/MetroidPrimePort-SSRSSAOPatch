@@ -1,7 +1,7 @@
 #pragma once
 
-// Reads the RomFS of Metroid Prime Remastered straight out of the user's .nsp
-// or gamecard image (.xci).
+// Reads the RomFS of a Switch title (Metroid Prime Remastered, Metroid Dread)
+// straight out of the user's .nsp or gamecard image (.xci).
 //
 // Nothing is extracted: Open() parses the PFS0 (or the gamecard's HFS0
 // partitions), the ticket, the NCA header and the RomFS tables (a few MB), and
@@ -47,8 +47,9 @@ public:
   bool Open(const std::string& path);
   void Close();
   // The bytes read, fewer than `size` at the end of the file. Safe from any
-  // number of threads at once: a descriptor is read with pread, and the stream
-  // (Windows) takes a lock around its seek and read.
+  // number of threads at once: a descriptor is read with pread, a Windows handle
+  // with overlapped reads at an offset, and the stream (the fallback when
+  // neither opens) takes a lock around its seek and read.
   size_t ReadSome(uint64_t offset, void* out, size_t size);
   // False unless all of `size` bytes were read.
   bool ReadAt(uint64_t offset, void* out, size_t size);
@@ -57,6 +58,7 @@ private:
   std::mutex m_streamMutex;
   std::ifstream m_stream;
   int m_fd = -1;
+  void* m_handle = nullptr; // Windows: a HANDLE opened for overlapped reads
 };
 
 class Nsp {
@@ -69,6 +71,9 @@ public:
   bool Open(const std::string& nspPath, const std::string& keysPath, std::string& error);
   void Close();
   bool IsOpen() const { return m_open; }
+  // The title's program id, from the chosen program NCA's header (offset 0x210);
+  // 0 while no image is open.
+  uint64_t ProgramId() const { return m_open ? m_programId : 0; }
 
   // Sorted by path.
   const std::vector<RomfsFile>& Files() const { return m_files; }
@@ -97,6 +102,7 @@ private:
   bool ReadFrom(const Section& section, uint64_t offset, void* out, size_t size, std::string& error) const;
 
   bool m_open = false;
+  uint64_t m_programId = 0;
   mutable SourceFile m_file;
   // Absolute position of the section in the .nsp, and of the RomFS inside it.
   uint64_t m_sectionBase = 0;
@@ -114,6 +120,10 @@ private:
   uint64_t m_exefsPfs = 0;
   uint64_t m_exefsPfsSize = 0;
 };
+
+// Program ids (ProgramId()) of the titles the port reads.
+constexpr uint64_t kRemasteredProgramId = 0x010012101468C000ull; // read from the user's own image
+constexpr uint64_t kDreadProgramId = 0x010093801237C000ull;
 
 // Metroid Prime Remastered's environment BRDF table, 0x100 bytes of the executable
 // ("main"'s NSO image at kBrdfLutMemOffset). Only its SHA-256 is known here: the

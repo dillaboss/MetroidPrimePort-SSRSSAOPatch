@@ -157,7 +157,11 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass, const wgp
   pass.SetBlendConstant(&data.color);
   pass.SetViewport(0.f, 0.f, static_cast<float>(targetSize.width), static_cast<float>(targetSize.height), data.depth,
                    data.depth);
-  pass.SetScissorRect(0, 0, targetSize.width, targetSize.height);
+  if (data.rect.width > 0 && data.rect.height > 0) {
+    pass.SetScissorRect(data.rect.x, data.rect.y, data.rect.width, data.rect.height);
+  } else {
+    pass.SetScissorRect(0, 0, targetSize.width, targetSize.height);
+  }
   pass.Draw(3);
 }
 } // namespace aurora::gfx::clear

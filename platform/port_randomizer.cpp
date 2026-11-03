@@ -1,4 +1,5 @@
 #include "port_env.h"
+#include "port_strings.h"
 #include "port_json.h"
 #include "port_randomizer.h"
 #include "port_log.h"
@@ -73,7 +74,7 @@ std::string UserDirectory() {
 }
 
 std::string SeedPath() {
-  if (const char* env = std::getenv("MP_RANDO_SEED")) {
+  if (const char* env = port::EnvString("MP_RANDO_SEED")) {
     if (env[0] != '\0')
       return env;
   }
@@ -208,7 +209,7 @@ bool LoadSeed(State& state) {
   std::ifstream input(path, std::ios::binary);
   if (!input)
     return false;
-  const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+  const std::string text = port::ReadAllText(input);
   if (input.bad()) {
     PortLog::Write( "randomizer: seed read error at byte offset 0: could not read file\n");
     return false;
@@ -506,6 +507,19 @@ void RecordCheck(uint32_t worldAssetId, uint32_t areaAssetId, uint32_t entityId,
     char line[128];
     std::snprintf(line, sizeof(line), "CHECK %s %s\n", key, ItemName(itemType));
     AppendLog("randomizer_checks.log", line);
+  } catch (...) {
+  }
+}
+
+void LogPickupGrant(uint32_t worldAssetId, uint32_t areaAssetId, uint32_t entityId, int itemType,
+                    int capacity, int amount, int amountAfter, int capacityAfter) {
+  try {
+    if (!GetState().enabled)
+      return;
+    char key[32];
+    FormatLocationKey(worldAssetId, areaAssetId, entityId, key, sizeof(key));
+    PortLog::Write("randomizer: picked up %s: %s, capacity +%d, amount +%d; now %d/%d (amount/capacity)\n",
+                   key, ItemName(itemType), capacity, amount, amountAfter, capacityAfter);
   } catch (...) {
   }
 }

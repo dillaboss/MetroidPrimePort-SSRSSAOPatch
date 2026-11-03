@@ -1,4 +1,5 @@
 #include "port_gci.h"
+#include "port_test.h"
 
 #include <aurora/aurora.h>
 
@@ -22,14 +23,6 @@ void log_internal(AuroraLogLevel, const char*, const char* message, unsigned int
 namespace fs = std::filesystem;
 
 namespace {
-int sFailures = 0;
-
-void Check(bool condition, const char* what) {
-  if (!condition) {
-    std::fprintf(stderr, "FAIL: %s\n", what);
-    ++sFailures;
-  }
-}
 
 std::vector<uint8_t> MakeGci(const char* game, const char* name, uint16_t blocks, uint8_t fill) {
   std::vector<uint8_t> gci(PortGci::kHeaderSize + blocks * PortGci::kBlockSize, fill);
@@ -78,20 +71,20 @@ int main() {
     const auto good = MakeGci("GM8E", "MetroidPrime A", 3, 0x11);
     PortGci::Header header;
     std::string error;
-    Check(PortGci::ParseHeader(good.data(), good.size(), header, error), "good header parses");
-    Check(header.fileName == "MetroidPrime A" && header.blockCount == 3, "header fields");
-    Check(PortGci::IsGameFile(header), "GM8E/01 is the game's");
-    Check(PortGci::DiskName(header) == "01-GM8E-MetroidPrime A.gci", "Dolphin disk name");
+    CHECK_MSG(PortGci::ParseHeader(good.data(), good.size(), header, error), "good header parses");
+    CHECK_MSG(header.fileName == "MetroidPrime A" && header.blockCount == 3, "header fields");
+    CHECK_MSG(PortGci::IsGameFile(header), "GM8E/01 is the game's");
+    CHECK_MSG(PortGci::DiskName(header) == "01-GM8E-MetroidPrime A.gci", "Dolphin disk name");
     auto shortData = good;
     shortData.pop_back();
-    Check(!PortGci::ParseHeader(shortData.data(), shortData.size(), header, error),
-          "size mismatch rejected");
+    CHECK_MSG(!PortGci::ParseHeader(shortData.data(), shortData.size(), header, error),
+              "size mismatch rejected");
     auto zero = MakeGci("GM8E", "x", 1, 0);
     zero[0x39] = 0;
-    Check(!PortGci::ParseHeader(zero.data(), zero.size(), header, error), "zero blocks rejected");
+    CHECK_MSG(!PortGci::ParseHeader(zero.data(), zero.size(), header, error), "zero blocks rejected");
     const auto slashes = MakeGci("GM8E", "a/b:c", 1, 0);
     PortGci::ParseHeader(slashes.data(), slashes.size(), header, error);
-    Check(PortGci::DiskName(header) == "01-GM8E-a_b_c.gci", "disk name sanitised");
+    CHECK_MSG(PortGci::DiskName(header) == "01-GM8E-a_b_c.gci", "disk name sanitised");
   }
 
   // Import into a card folder: new, then replacing the same identity kept
@@ -105,12 +98,12 @@ int main() {
   Write(source, incoming);
   {
     const auto report = PortGci::ImportFile(source, card, root / "scratch");
-    Check(report.copied == 1 && report.replaced == 1 && report.skipped == 0, "import replaces");
-    Check(Read(card / "01-GM8E-MetroidPrime A.gci") == incoming, "imported bytes");
-    Check(!fs::exists(card / "renamed.gci"), "old identity moved");
-    Check(CountGci(card / "_replaced") == 1, "old file kept in _replaced");
-    Check(fs::exists(card / "01-GZLE-other.gci"), "other game untouched");
-    Check(PortGci::GameFiles(card).size() == 1, "one game file");
+    CHECK_MSG(report.copied == 1 && report.replaced == 1 && report.skipped == 0, "import replaces");
+    CHECK_MSG(Read(card / "01-GM8E-MetroidPrime A.gci") == incoming, "imported bytes");
+    CHECK_MSG(!fs::exists(card / "renamed.gci"), "old identity moved");
+    CHECK_MSG(CountGci(card / "_replaced") == 1, "old file kept in _replaced");
+    CHECK_MSG(fs::exists(card / "01-GZLE-other.gci"), "other game untouched");
+    CHECK_MSG(PortGci::GameFiles(card).size() == 1, "one game file");
   }
 #ifndef _WIN32
   // An entry that cannot be inspected (a symlink loop) is passed over; it is
@@ -120,46 +113,46 @@ int main() {
     fs::create_directories(odd);
     std::error_code ec;
     fs::create_symlink("loop.gci", odd / "loop.gci", ec);
-    Check(!ec, "symlink loop created");
+    CHECK_MSG(!ec, "symlink loop created");
     const auto report = PortGci::ImportFile(source, odd, root / "scratch");
-    Check(report.copied == 1 && report.skipped == 0, "import beside an unreadable entry");
+    CHECK_MSG(report.copied == 1 && report.skipped == 0, "import beside an unreadable entry");
   }
 #endif
   // Another game's .gci is refused.
   {
     Write(root / "zelda.gci", MakeGci("GZLE", "zelda", 1, 0));
     const auto report = PortGci::ImportFile(root / "zelda.gci", card, root / "scratch");
-    Check(report.copied == 0 && report.skipped == 1, "other game's save refused");
+    CHECK_MSG(report.copied == 0 && report.skipped == 1, "other game's save refused");
     const auto junk = std::vector<uint8_t>(100, 7);
     Write(root / "junk.gci", junk);
-    Check(PortGci::ImportFile(root / "junk.gci", card, root / "scratch").copied == 0,
-          "junk refused");
+    CHECK_MSG(PortGci::ImportFile(root / "junk.gci", card, root / "scratch").copied == 0,
+              "junk refused");
   }
 
   // Export to a folder, then a raw card, and import the raw card back.
   {
     const fs::path dolphin = root / "dolphin" / "Card A";
     auto report = PortGci::ExportFolder(card, dolphin);
-    Check(report.copied == 1 && Read(dolphin / "01-GM8E-MetroidPrime A.gci") == incoming,
-          "export to folder");
-    Check(PortGci::ExportFolder(card, card).copied == 0, "export into itself refused");
+    CHECK_MSG(report.copied == 1 && Read(dolphin / "01-GM8E-MetroidPrime A.gci") == incoming,
+              "export to folder");
+    CHECK_MSG(PortGci::ExportFolder(card, card).copied == 0, "export into itself refused");
 
     const fs::path raw = root / "MemoryCardA.USA.raw";
     report = PortGci::ExportRaw(card, raw);
-    Check(report.copied == 1 && report.skipped == 0, "export to a new raw card");
+    CHECK_MSG(report.copied == 1 && report.skipped == 0, "export to a new raw card");
     report = PortGci::ExportRaw(card, raw);
-    Check(report.copied == 1 && fs::exists(root / "MemoryCardA.USA.raw.bak"),
-          "export over a raw card keeps a backup");
+    CHECK_MSG(report.copied == 1 && fs::exists(root / "MemoryCardA.USA.raw.bak"),
+              "export over a raw card keeps a backup");
 
     const fs::path fresh = root / "fresh";
     report = PortGci::ImportFile(raw, fresh, root / "scratch");
-    Check(report.copied == 1 && report.skipped == 0, "import from raw card");
+    CHECK_MSG(report.copied == 1 && report.skipped == 0, "import from raw card");
     const auto back = Read(fresh / "01-GM8E-MetroidPrime A.gci");
     // Placement fields (first block) can differ; the name and data must not.
-    Check(back.size() == incoming.size() &&
-              std::memcmp(back.data() + 8, incoming.data() + 8, 32) == 0 &&
-              std::memcmp(back.data() + 64, incoming.data() + 64, incoming.size() - 64) == 0,
-          "raw round trip keeps the save");
+    CHECK_MSG(back.size() == incoming.size() &&
+                  std::memcmp(back.data() + 8, incoming.data() + 8, 32) == 0 &&
+                  std::memcmp(back.data() + 64, incoming.data() + 64, incoming.size() - 64) == 0,
+              "raw round trip keeps the save");
   }
 
   // The game alternates between the A and B files and loads the newer, so an
@@ -172,21 +165,58 @@ int main() {
     const fs::path onlyA = root / "onlyA.gci";
     Write(onlyA, MakeGci("GM8E", "MetroidPrime A", 2, 0x66));
     const auto report = PortGci::ImportFile(onlyA, ab, root / "scratch");
-    Check(report.copied == 1 && report.replaced == 1, "import A replaces B");
-    Check(PortGci::GameFiles(ab).size() == 1 && fs::exists(ab / "01-GM8E-MetroidPrime A.gci"),
-          "only A left");
+    CHECK_MSG(report.copied == 1 && report.replaced == 1, "import A replaces B");
+    CHECK_MSG(PortGci::GameFiles(ab).size() == 1 && fs::exists(ab / "01-GM8E-MetroidPrime A.gci"),
+              "only A left");
 
     const fs::path raw = root / "ab.raw";
     const fs::path withB = root / "withB";
     fs::create_directories(withB);
     Write(withB / "01-GM8E-MetroidPrime B.gci", MakeGci("GM8E", "MetroidPrime B", 2, 0x77));
-    Check(PortGci::ExportRaw(withB, raw).copied == 1, "raw card with B");
-    Check(PortGci::ExportRaw(ab, raw).copied == 1, "raw card with A");
+    CHECK_MSG(PortGci::ExportRaw(withB, raw).copied == 1, "raw card with B");
+    CHECK_MSG(PortGci::ExportRaw(ab, raw).copied == 1, "raw card with A");
     const fs::path check = root / "abcheck";
-    Check(PortGci::ImportFile(raw, check, root / "scratch").copied == 1 &&
-              PortGci::GameFiles(check).size() == 1 &&
-              fs::exists(check / "01-GM8E-MetroidPrime A.gci"),
-          "stale B dropped from the raw card");
+    CHECK_MSG(PortGci::ImportFile(raw, check, root / "scratch").copied == 1 &&
+                  PortGci::GameFiles(check).size() == 1 &&
+                  fs::exists(check / "01-GM8E-MetroidPrime A.gci"),
+              "stale B dropped from the raw card");
+  }
+
+  // A Trilogy disc's card holds its own saves (R3ME/R3MP: PAL's container, the
+  // Trilogy's relay order) beside the GameCube disc's files. Its own go in and
+  // out as they are; a GameCube PAL save is not native (its relays are in PAL's
+  // order), so it is never copied in raw.
+  {
+    PortGci::SetGameCode("R3ME");
+    const fs::path tri = root / "tri";
+    fs::create_directories(tri);
+    const auto gc = MakeGci("GM8E", "MetroidPrime A", 2, 0x12);
+    Write(tri / "01-GM8E-MetroidPrime A.gci", gc);
+    const auto own = MakeGci("R3ME", "MetroidPrime", 3, 0x34);
+    Write(root / "tri.gci", own);
+    auto report = PortGci::ImportFile(root / "tri.gci", tri, root / "scratch");
+    CHECK_MSG(report.copied == 1 && report.replaced == 0 && report.skipped == 0, "Trilogy save into a Trilogy card");
+    CHECK_MSG(Read(tri / "01-R3ME-MetroidPrime.gci") == own, "stored as it is");
+    CHECK_MSG(Read(tri / "01-GM8E-MetroidPrime A.gci") == gc, "the GameCube disc's save untouched");
+    CHECK_MSG(PortGci::GameFiles(tri).size() == 1, "one Trilogy file");
+
+    const fs::path out = root / "tri-out";
+    report = PortGci::ExportFolder(tri, out);
+    CHECK_MSG(report.copied == 1 && Read(out / "01-R3ME-MetroidPrime.gci") == own, "exported as R3ME");
+
+    Write(root / "pal.gci", MakeGci("GM8P", "MetroidPrime", 3, 0x56));
+    report = PortGci::ImportFile(root / "pal.gci", tri, root / "scratch");
+    CHECK_MSG(report.copied == 0 && Read(tri / "01-R3ME-MetroidPrime.gci") == own,
+              "an unreadable PAL save is not copied in raw");
+
+    const fs::path emu = root / "tri-emu";
+    fs::create_directories(emu);
+    Write(emu / "01-R3ME-MetroidPrime.gci", MakeGci("R3ME", "MetroidPrime", 3, 0x56));
+    CHECK_MSG(PortGci::ImportableFiles(emu).size() == 1, "a folder's Trilogy files are importable");
+    report = PortGci::ImportFolder(emu, tri);
+    CHECK_MSG(report.copied == 1 && report.replaced == 1 && Read(tri / "01-R3ME-MetroidPrime.gci")[0x40] == 0x56,
+              "folder import replaces the Trilogy save");
+    PortGci::SetGameCode("GM8E");
   }
 
   // Emulator folder normalisation and the shared card base.
@@ -194,33 +224,38 @@ int main() {
     const fs::path emu = root / "emu";
     const fs::path card = emu / "GC" / "USA" / "Card A";
     fs::create_directories(card);
-    Check(PortGci::NormalizeEmulatorFolder(emu) == emu, "user folder stays");
-    Check(PortGci::NormalizeEmulatorFolder(emu / "GC") == emu, "GC folder -> user folder");
-    Check(PortGci::NormalizeEmulatorFolder(emu / "GC" / "USA") == emu, "region folder -> user folder");
-    Check(PortGci::NormalizeEmulatorFolder(card) == emu, "Card A folder -> user folder");
-    Check(PortGci::NormalizeEmulatorFolder(fs::path(card.string() + "/")) == emu, "trailing slash");
+    CHECK_MSG(PortGci::NormalizeEmulatorFolder(emu) == emu, "user folder stays");
+    CHECK_MSG(PortGci::NormalizeEmulatorFolder(emu / "GC") == emu, "GC folder -> user folder");
+    CHECK_MSG(PortGci::NormalizeEmulatorFolder(emu / "GC" / "USA") == emu, "region folder -> user folder");
+    CHECK_MSG(PortGci::NormalizeEmulatorFolder(card) == emu, "Card A folder -> user folder");
+    CHECK_MSG(PortGci::NormalizeEmulatorFolder(fs::path(card.string() + "/")) == emu, "trailing slash");
 
     PortGci::SetGameCode("GM8E");
     std::string why;
     PortGci::SetEmulatorFolder(PortGci::PathString(card));
-    Check(PortGci::EmulatorFolder() == PortGci::PathString(emu), "folder stored normalised");
+    CHECK_MSG(PortGci::EmulatorFolder() == PortGci::PathString(emu), "folder stored normalised");
     PortGci::SetShareEmulatorCard(false);
-    Check(PortGci::SharedCardBase(&why).empty() && !why.empty(), "sharing off: no base");
-    Check(PortGci::CardTargetDirectory("").empty(), "sharing off: default card");
+    CHECK_MSG(PortGci::SharedCardBase(&why).empty() && !why.empty(), "sharing off: no base");
+    CHECK_MSG(PortGci::CardTargetDirectory("").empty(), "sharing off: default card");
     PortGci::SetShareEmulatorCard(true);
-    Check(PortGci::SharedCardBase() == emu / "GC", "sharing on: <emu>/GC");
-    Check(PortGci::CardTargetDirectory("") == PortGci::PathString(emu / "GC"), "shared card is the target");
-    Check(PortGci::CardTargetDirectory("/ap") == "/ap", "Archipelago card wins");
+    CHECK_MSG(PortGci::SharedCardBase() == emu / "GC", "sharing on: <emu>/GC");
+    CHECK_MSG(PortGci::CardTargetDirectory("") == PortGci::PathString(emu / "GC"), "shared card is the target");
+    CHECK_MSG(PortGci::CardTargetDirectory("/ap") == "/ap", "Archipelago card wins");
+    PortGci::SetGameCode("R3ME");
+    CHECK_MSG(PortGci::SharedCardBase(&why).empty() && why.find("Trilogy") != std::string::npos,
+              "Trilogy disc: no shared card");
+    CHECK_MSG(PortGci::CardTargetDirectory("").empty(), "Trilogy disc: own card");
+    PortGci::SetGameCode("GM8E");
     fs::remove_all(card, ec);
-    Check(PortGci::SharedCardBase(&why).empty() && why.find("GCI Folder") != std::string::npos,
-          "no Card A: reason names the GCI folder");
+    CHECK_MSG(PortGci::SharedCardBase(&why).empty() && why.find("GCI Folder") != std::string::npos,
+              "no Card A: reason names the GCI folder");
     PortGci::SetEmulatorFolder("");
     PortGci::SetShareEmulatorCard(false);
   }
 
   fs::remove_all(root, ec);
-  if (sFailures == 0) {
+  if (port_test::Failures() == 0) {
     std::puts("port_gci tests passed");
   }
-  return sFailures == 0 ? 0 : 1;
+  return PORT_TEST_RESULT();
 }

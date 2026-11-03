@@ -303,10 +303,10 @@ struct Fog {
   float a = 0.f;
   float b = 0.5f;
   float c = 0.f;
-  float rangeCenter = 0.f;
-  std::array<Vec4<float>, 3> rangeK;
+  // The GXFogType: the curve is chosen in the shader, not by the pipeline (ShaderConfig::fogType).
+  u32 type = GX_FOG_NONE;
 };
-static_assert(sizeof(Fog) == 80);
+static_assert(sizeof(Fog) == 32);
 struct AttrArray {
   const void* data;
   u32 size;
@@ -411,6 +411,8 @@ struct GXState {
   u8 sdf = 0; // GX_AURORA_SET_SDF
   u8 hudSample = 0; // GX_AURORA_SET_HUD_SAMPLE
   Vec4<float> hudDyin{0.f, 0.f, 0.f, 0.f}; // its DYIN
+  bool clipPlane = false; // GX_AURORA_SET_CLIP_PLANE
+  Vec4<float> clipPlaneEq{0.f, 0.f, 0.f, 0.f}; // its view-space plane
   u8 depthPrepass = 0; // GX_AURORA_PORT_DEPTH_PREPASS
   std::array<u32, 3> drawTag{0, UINT32_MAX, 0}; // GX_AURORA_SET_DRAW_TAG: asset, model index, material
   u32 drawSerial = 0; // GX_AURORA_PORT_DRAW_SERIAL
@@ -444,10 +446,13 @@ struct GXState {
   Vec4<float> pbrModelDiffuse{1.f, 1.f, 1.f, 1.f};
   Vec4<float> pbrModelIncan{0.f, 0.f, 0.f, 1.f};
   Vec4<float> pbrModelCoverage{1.f, 0.f, 0.f, 0.f};
+  // GX_AURORA_SET_PBR_THERMAL: x, y, blended (1 / 0), w 1 while on (all zero when off)
+  Vec4<float> pbrThermal{};
   std::array<Vec4<float>, 8> pbrShield{}; // GX_AURORA_SET_PBR_SHIELD: CCH0..6, then AUVI xyz + DIFC.w
   // GX_AURORA_SET_PBR_LIGHT_HDR, per light: colour (rgb, falloff + 1; w 0 = off), then
-  // (view position, r0), then (r1, -, -, -).
-  std::array<Vec4<float>, GX::MaxLights * 3> pbrLightHdr{};
+  // (view position, r0), then (r1, specular roughness widen, cone scale, cone bias), then
+  // (view-space way to the light along a spot's axis, -).
+  std::array<Vec4<float>, GX::MaxLights * 4> pbrLightHdr{};
   // GX_AURORA_PORT_VOLUMETRIC_FOG up to its _END: the draws fog themselves (ShaderConfig::volFog)
   // with the recorded fog's near, range, exposure and the start of the world's depth range (nearer is the viewmodel) and its tone curve.
   bool volFog = false;
@@ -455,8 +460,9 @@ struct GXState {
   std::array<Vec4<float>, 3> volFogTone{};
   // GX_AURORA_PORT_SHADOW_*: the following draws are the world's (they cast and receive the sun's
   // shadow), and this frame's sun (shadowActive) with its uniform (gfx/shadow.hpp's Uniform).
-  // GX_AURORA_PORT_PARTICLE_FOG: the draws are particles (vol_fog_mode)
-  bool particleFog = false;
+  // GX_AURORA_PORT_PARTICLE_FOG: the draws are particles, kParticleUnfogged unfogged ones (vol_fog_mode)
+  static constexpr u8 kParticleUnfogged = 2; // GX_PORT_PARTICLE_UNFOGGED
+  u8 particleFog = 0;
   bool shadowCaster = false;
   bool shadowCasterOnly = false; // they cast but aren't drawn (GXPortSetShadowCasterOnly)
   bool shadowActive = false;
@@ -470,6 +476,15 @@ struct GXState {
   bool actorSavedCasterOnly = false;
   bool actorSavedActive = false;
   std::array<Vec4<float>, 36> actorSavedUniform{};
+  // GX_AURORA_PORT_SHELL: 1 while the draws are a silhouette shell's depth prepass, 2 its colour;
+  // shellUniform holds CCH0..CCH4, (time, depth bias, tex0 sRGB, centre view depth), (1 / render target size, 0, 0).
+  u8 shell = 0;
+  std::array<Vec4<float>, 7> shellUniform{};
+  // Maps 0 and 1 as mode 1 found them loaded (TCH0, TCH1): the model's materials load their own
+  // into those slots as it draws, and the colour pass samples these instead, resolved apart from
+  // the slots' own binds (resolve_sampled_textures).
+  std::array<GXTexObj_, 2> shellTexObjs;
+  std::array<gfx::TextureBind, 2> shellTextures;
 
   // GX2 polygon offset state
   f32 frontOffset = 0.0f;
@@ -600,6 +615,8 @@ enum : u8 {
   VolFogPremultiplied = 4, // ONE, INVSRCALPHA, per vertex: colour T + in-scatter alpha
 };
 struct ShaderConfig {
+  // GX_FOG_NONE or, for every other type, GX_FOG_PERSP_LIN (pipeline_fog_type): the curve is the Fog
+  // uniform's, so a fog change (entering water) needs no new pipeline.
   u8 fogType = GX_FOG_NONE;
   u8 vtxStride = 0;
   u8 lineMode : 2 = 0; // 1 = GX_LINES, 2 = GX_LINESTRIP, 3 = GX_POINTS
@@ -618,7 +635,7 @@ struct ShaderConfig {
   u8 sceneHdr : 1 = false;
   u8 pbr = 0; // GX_AURORA_SET_PBR
   u8 sdf = 0; // GX_AURORA_SET_SDF
-  u8 depthOnly = 0; // pass 1 of GX_AURORA_PORT_DEPTH_PREPASS: the colour is not written
+  u8 depthOnly = 0; // pass 1 of GX_AURORA_PORT_DEPTH_PREPASS: the colour is not written (2: pass 3's alpha mark)
   u8 pbrKind = 0; // with pbr, the special surface kind (pbrLayer.y), a constant in the shader
   // GXState::volFog: how the draw fogs itself (VolFog*), chosen from its blend.
   u8 volFog = 0;
@@ -628,7 +645,25 @@ struct ShaderConfig {
   // aurora_set_per_pixel_lighting, on a draw with a lit channel: the GX lights are summed per
   // fragment from the interpolated view-space position and normal instead of per vertex. The
   // old padding, so a config with it off keeps its bytes and cache keys.
-  u8 perPixelLight = 0;
+  u8 perPixelLight : 1 = 0;
+  // GX_AURORA_SET_CLIP_PLANE on a triangle draw: the clip_plane uniform and a discard. A bit of the
+  // perPixelLight byte, so a config with it off keeps its bytes and cache keys.
+  u8 clipPlane : 1 = 0;
+  // GX_AURORA_PORT_SHELL on a triangle draw: Remastered's silhouette shell, 1 its depth prepass, 2
+  // its colour (the shell_* uniforms, the scene copy on texture slot 2). Bits of the same byte.
+  u8 shell : 2 = 0;
+  // With pbr, the mode's cut bit (512, pbr_backlight.w): only a cutout's shader has the cut
+  // discards (a discard forces late depth on every pixel of the draw).
+  u8 pbrCut : 1 = 0;
+  // GX_AURORA_SET_PBR_THERMAL on a PBR draw into the HDR scene: the pbr_thermal uniform and
+  // Model_ThermalOverride's grey in place of the shading. A bit of the same byte, so a config with
+  // it off keeps its bytes and cache keys.
+  u8 pbrThermal : 1 = 0;
+  // With pbr, pbr_static_flags (below): the flags that are the same for the whole game (the BRDF
+  // table, the tone and exposure, the material gain), all on, are constants in the shader in place
+  // of runtime tests; and no debug view is set, so its tests go. Both are bits of the same byte.
+  u8 pbrPlain : 1 = 0;
+  u8 pbrNoDebug : 1 = 0;
   // GX_AURORA_PORT_ACTOR_SHADOW decal: the draw is a receiver redrawn as Remastered's actor shadow
   // decal (multiplies the frame by the shadow, shadowUniform holds its view-space planes). The old
   // padding byte, so other configs keep their bytes and cache keys.
@@ -646,6 +681,34 @@ struct ShaderConfig {
   bool operator==(const ShaderConfig& rhs) const { return memcmp(this, &rhs, sizeof(*this)) == 0; }
 };
 static_assert(std::has_unique_object_representations_v<ShaderConfig>);
+constexpr u8 pipeline_fog_type(u32 fogType) noexcept {
+  return fogType == GX_FOG_NONE ? GX_FOG_NONE : GX_FOG_PERSP_LIN;
+}
+// An alpha compare reference the shader reads from the alpha_ref uniform (ShaderInfo::usesAlphaRef).
+constexpr u32 AlphaRefUniform = 0x100;
+// The reference as the pipeline sees it: only the values that make the compare constant (0 for
+// LESS/GEQUAL, 255 for LEQUAL/GREATER) stay, any other is the uniform's, so a fading cut-out
+// needs no new pipeline per reference.
+constexpr u32 pipeline_alpha_ref(GXCompare comp, u32 ref) noexcept {
+  switch (comp) {
+  case GX_LESS:
+  case GX_GEQUAL:
+    return ref == 0 ? 0 : AlphaRefUniform;
+  case GX_LEQUAL:
+  case GX_GREATER:
+    return ref == 255 ? 255 : AlphaRefUniform;
+  case GX_EQUAL:
+  case GX_NEQUAL:
+    return AlphaRefUniform;
+  default:
+    return 0;
+  }
+}
+constexpr AlphaCompare pipeline_alpha_compare(AlphaCompare ac) noexcept {
+  ac.ref0 = pipeline_alpha_ref(ac.comp0, ac.ref0);
+  ac.ref1 = pipeline_alpha_ref(ac.comp1, ac.ref1);
+  return ac;
+}
 // Whether a draw samples the sun's shadow map: a lit PBR surface drawn in colour without per-pixel fog.
 inline bool shadow_receives(const ShaderConfig& sc) noexcept {
   return sc.shadow && (sc.pbr != 0 || sc.actorDecal != 0) && sc.volFog == VolFogNone && sc.depthOnly == 0 && sc.lineMode == 0 && !sc.drawId;
@@ -682,12 +745,32 @@ struct ShaderInfo {
   bool usesShadow : 1 = false;    // ShaderConfig::shadow: the shadow uniforms and vs_shadow
   bool shadowReceive : 1 = false; // shadow_receives: group 2 uses the shadow layout
   bool actorDecal : 1 = false;    // actor_decal: group 2 uses the shadow layout with the actor maps
-  bool usesHdrTone : 1 = false;   // ShaderConfig::sceneHdr without pbr: the hdr_tone uniform (GXState::pbrTone)
+  bool usesHdrTone : 1 = false;   // sceneHdr without pbr: hdr_tone (pbrTone) and hdr_tev_blend
+  bool usesClipPlane : 1 = false; // ShaderConfig::clipPlane: the clip_plane uniform
+  bool usesShell : 1 = false;
+  bool usesPbrThermal : 1 = false; // ShaderConfig::pbrThermal: the pbr_thermal uniform
+  bool usesAlphaRef : 1 = false;   // an alpha compare reference is AlphaRefUniform: the alpha_ref uniform
+  bool shellScene : 1 = false; // the shell's colour pass: texture slot 2 holds the scene copy     // ShaderConfig::shell: the shell uniforms; colour: the scene copy on slot 2
 };
 struct BindGroupRanges {
   std::array<gfx::Range, MaxIndexAttr> vaRanges{};
 };
+// GX_AURORA_PORT_DEPTH_PREPASS: whether the current draw can go in the depth-only pass and then
+// shade where the depth is equal. It must replace every pixel it passes (depth tested LEQUAL and
+// written; colour and alpha written without a blend), so the frame is what one depth-tested pass
+// of the same draws gives: the last of the nearest draws at a pixel wins either way.
+bool depth_prepass_eligible(u8 lineMode) noexcept;
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept;
+// ShaderConfig::pbrPlain and pbrNoDebug from the current state: bit 0 and bit 1. The tests
+// PbrGen::foldStatic replaces, each as the shader makes it from the uniforms (shader_info.cpp):
+// pbr_light_scale.z, pbr_tone[1].x, pbr_tone[0].w, pbr_up.w; pbr_volume[5].w and pbr_layer.w are
+// the debug views.
+inline u8 pbr_static_flags() noexcept {
+  const bool plain = g_gxState.pbrBrdfLut && g_gxState.pbrTone[1].x() > 0.f && g_gxState.pbrTone[0].w() > 0.f &&
+                     g_gxState.pbrUp.w() > 0.f;
+  const bool noDebug = !(g_gxState.pbrVolumeRows[5].w() > 0.5f) && !(g_gxState.pbrLayer.w() > 0.5f);
+  return (plain ? 1 : 0) | (noDebug ? 2 : 0);
+}
 // aurora_set_per_pixel_lighting; any thread.
 void set_per_pixel_lighting(bool enabled) noexcept;
 bool per_pixel_lighting() noexcept;
@@ -709,12 +792,28 @@ inline bool wants_per_pixel_light(const ShaderConfig& config) noexcept {
   }
   return false;
 }
+// How a draw writes GXSetDstAlpha's constant alpha (the pipeline's blend constant). None: alpha as blended
+// (no dst alpha, or a zero one, or the fallback below). Replace: the shader writes alpha 1 and the blend takes
+// the constant times it. DualSource: as Replace, the TEV alpha going to the colour blend as the second source,
+// for a draw whose colour blend reads the source alpha. Without the device feature that draw stays None: its
+// alpha is then the constant times the TEV alpha.
+enum class DstAlphaMode : u8 { None, Replace, DualSource };
+DstAlphaMode dst_alpha_mode(const PipelineConfig& config) noexcept;
 wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
-                                    wgpu::ShaderModule shader, const char* label) noexcept;
+                                    wgpu::ShaderModule shader, const char* label,
+                                    DstAlphaMode dstAlphaMode = DstAlphaMode::None) noexcept;
 std::string build_shader_source(const ShaderConfig& config) noexcept;
+// source (build_shader_source's) writing its alpha as mode has it.
+// False (source unchanged) when it has no fs_main return to rewrite: the draw must then use DstAlphaMode::None.
+bool apply_dst_alpha_mode(std::string& source, DstAlphaMode mode) noexcept;
+// The PBR mode's cut bit (512) of GXState::pbrBacklight.w, as the shader decodes it.
+inline bool pbr_cut_mode(const Vec4<float>& backlight) noexcept {
+  return backlight.w() > 0.f && (static_cast<u32>(backlight.w()) & 512u) != 0;
+}
 // Whether the config's shader has the alpha-tested sun shadow caster (shadowPass 2: vs_shadow_cut, fs_shadow).
 bool shader_has_cut_caster(const ShaderConfig& config) noexcept;
-wgpu::ShaderModule build_shader(const ShaderConfig& config) noexcept;
+// dstAlphaMode falls back to None when the shader can't be rewritten for it; build the pipeline with that.
+wgpu::ShaderModule build_shader(const ShaderConfig& config, DstAlphaMode& dstAlphaMode) noexcept;
 // Shader debugging (MP_WGSL_DUMP / MP_WGSL_OVERRIDE, console `shader`). dump_shaders writes every module built so
 // far to dir (and keeps writing new ones) and returns how many files it made; set_shader_override_dir turns the
 // override on (empty = off).
@@ -730,4 +829,7 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept;
 
 u8 comp_type_size(GXAttr attr, GXCompType type) noexcept;
 u8 comp_cnt_count(GXAttr attr, GXCompCnt cnt) noexcept;
+
+// Only RGBA6_Z24 stores alpha: an RGB8 or RGB565 EFB writes none, and it reads (blends, copies) as 1.
+constexpr bool efb_has_alpha(GXPixelFmt format) noexcept { return format == GX_PF_RGBA6_Z24; }
 } // namespace aurora::gx

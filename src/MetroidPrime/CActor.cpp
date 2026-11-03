@@ -21,6 +21,7 @@
 #include "Kyoto/Audio/CSfxManager.hpp"
 #include "Kyoto/CTimeProvider.hpp"
 #include "Kyoto/Graphics/CGraphics.hpp"
+#include "Kyoto/Graphics/CCubeModel.hpp"
 #include "Kyoto/Math/CFrustumPlanes.hpp"
 #include "Kyoto/Math/CMath.hpp"
 
@@ -396,8 +397,12 @@ void CActor::Render(const CStateManager& mgr) const {
         // The smooth-frames clock lag can put the draw just before xbc_time.
         if (timeSince < 0.f && timeSince > -(1.f / 60.f))
           timeSince = 0.f;
-#endif
+        // CTimeProvider holds a `const float&`; a temporary would dangle past this line.
+        const float localTime = CMath::FastFmod(timeSince, 900.f);
+        CTimeProvider tp(localTime);
+#else
         CTimeProvider tp(CMath::FastFmod(timeSince, 900.f));
+#endif
         RenderInternal(mgr);
       }
       if (xe5_31_pointGeneratorParticles) {
@@ -434,7 +439,15 @@ void CActor::RenderInternal(const CStateManager& mgr) const {
       const uchar rgb = CCast::ToUint8((255.f * mulMag) * alpha);
       CColor mulColor(rgb, rgb, rgb, xb4_drawFlags.GetColorRef().GetAlphau8());
       CColor addColor(addMag, addMag, addMag, xb4_drawFlags.GetColorRef().GetAlphau8() / 4);
+#ifdef TARGET_PC
+      // Remastered's hot actors: the override's a = alpha * damage, b = max(damage - 1, -0.1).
+      CCubeModel::PortSetThermalOverride(alpha * xd0_damageMag,
+                                         rstl::max_val< float >(xd0_damageMag - 1.f, -0.1f));
+#endif
       GetModelData()->RenderThermal(x34_transform, mulColor, addColor, xb4_drawFlags);
+#ifdef TARGET_PC
+      CCubeModel::PortClearThermalOverride();
+#endif
       return;
     } else if (mgr.GetThermalColdScale2() > 0.0001f && xb4_drawFlags.GetTrans() == 0) {
       const float scale = rstl::max_val< float >(
@@ -480,7 +493,8 @@ bool CActor::PortRenderShadowCaster(const CStateManager& mgr) const {
     float timeSince = CGraphics::GetSecondsMod900() - xbc_time;
     if (timeSince < 0.f && timeSince > -(1.f / 60.f))
       timeSince = 0.f;
-    CTimeProvider tp(CMath::FastFmod(timeSince, 900.f));
+    const float localTime = CMath::FastFmod(timeSince, 900.f);
+    CTimeProvider tp(localTime);
     RenderInternal(mgr);
   }
   return true;

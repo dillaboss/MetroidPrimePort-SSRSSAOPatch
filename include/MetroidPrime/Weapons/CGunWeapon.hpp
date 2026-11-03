@@ -14,6 +14,9 @@
 #include "Kyoto/Math/CTransform4f.hpp"
 #include "Kyoto/Math/CVector3f.hpp"
 #include "Kyoto/TToken.hpp"
+#ifdef TARGET_PC
+#include "Kyoto/Particles/CPortEffectSet.hpp"
+#endif
 
 #include "Collision/CMaterialList.hpp"
 
@@ -29,16 +32,21 @@ class CElementGen;
 class CRainSplashGenerator;
 class CModelFlags;
 class CActorLights;
-class SWeaponInfo;
+struct SWeaponInfo;
 
 #ifdef TARGET_PC
 namespace NPortChargeFxDetail {
+// Retail effects take the locator's translation only. A converted effect's vectors are already in
+// the port's space (the importer turns Remastered's X left, Y up, Z forward particle space into it,
+// CVEPortBasis), so it takes the full sampled locator: the Power charge disc's EMTR, Remastered
+// (0,0,.15) and port (0,.15,0), lands .30 forward at scale 2, as on native's LBEAM.
 template < typename Generator >
 void SetLocalLocator(Generator& generator, const CTransform4f& locator) {
-  if (generator.PortIsRemastered()) {
-    generator.SetGlobalOrientAndTrans(locator);
-  } else {
+  if (!generator.PortIsRemastered()) {
     generator.SetGlobalTranslation(locator.GetTranslation());
+  } else {
+    // The sampled locator itself, no copy.
+    generator.SetGlobalOrientAndTrans(locator);
   }
 }
 } // namespace NPortChargeFxDetail
@@ -100,6 +108,26 @@ public:
                     const CPlayerState::EChargeStage chargeState, const CTransform4f& xf,
                     CStateManager& mgr, const TUniqueId homingTarget, const float chargeFactor1,
                     const float chargeFactor2);
+#ifdef TARGET_PC
+  // Port (stack_beams): only the projectile(s) a Fire would spawn, no animation, shake,
+  // charge state or sound. Skips when this beam's shot data is not loaded.
+  virtual void PortFireStackedProjectile(const bool underwater, const float dt,
+                                         const CPlayerState::EChargeStage chargeState,
+                                         const CTransform4f& xf, CStateManager& mgr,
+                                         const TUniqueId homingTarget, const float chargeFactor1,
+                                         const float chargeFactor2);
+  // Locks this beam's projectile descriptions independently of Load/Unload (idempotent).
+  void PortLockStackTokens();
+  void PortUnlockStackTokens();
+  bool PortStackTokensLocked() const { return mPortStackWeapons.size() != 0; }
+  // True when the Muzzle PART is Remastered: normal shots then start mPortMuzzleFlash
+  // (CGunWeaponMP1::Fire 0xca2d3c / StartMuzzleFlash 0xca31c4) and muzzle generator 0
+  // is neither updated nor drawn.
+  bool PortRemasteredMuzzle() const;
+  void PortStartMuzzleFlash();
+  // CGunWeaponMP1::UpdateMuzzleFlash 0xca1e74.
+  void PortUpdateMuzzleFlash(float dt, const CVector3f& scale, const CTransform4f& xf);
+#endif
   virtual void EnableFx(const bool enable) {}
   virtual void EnableSecondaryFx(const ESecondaryFxType type) {
     x1cc_enabledSecondaryEffect = type;
@@ -137,6 +165,16 @@ public:
   CElementGen* GetChargeMuzzleFx() const;
   void DrawHologram(const CStateManager& mgr, const CTransform4f& xf,
                     const CModelFlags& flags) const;
+#ifdef TARGET_PC
+  void PortDrawHologramTransition(const CStateManager& mgr, const CTransform4f& xf,
+                                  const CVector3f& normal, const CVector3f& point,
+                                  const CModelFlags& flags, const CActorLights* lights) const;
+  // Performance mode's gun-first pass: the solid gun and suit arm, opaque, for their depth.
+  void PortDrawDepth(const bool drawSuitArm, const CStateManager& mgr,
+                     const CTransform4f& xf) const;
+  CTransform4f PortDreadCannonXf(const CTransform4f& xf) const;
+  CVector3f PortDreadMuzzleShift() const;
+#endif
   void ReturnToDefault(CStateManager& mgr);
   bool ComboFireOver() const;
   void EnterFidget(CStateManager& mgr, SamusGun::EFidgetType type, int parm2);
@@ -218,6 +256,27 @@ protected:
   void UnlockTokens();
 
   static void PointGenerator(void*, const CVector3f*, const CVector3f*, int);
+
+  // The projectile part of Fire, for the shot's `weapon` description.
+  void SpawnProjectile(const TToken< CWeaponDescription >& weapon, bool underwater, float dt,
+                       CPlayerState::EChargeStage chargeState, const CTransform4f& xf,
+                       CStateManager& mgr, TUniqueId homingTarget, float chargeFactor1,
+                       float chargeFactor2);
+#ifdef TARGET_PC
+  // The stacked copy of x144_weapons[chargeState], null unless locked and loaded.
+  const TToken< CWeaponDescription >* PortStackedWeapon(int chargeState);
+
+  // Locked copies of x144_weapons; empty while stacking is off.
+  rstl::reserved_vector< TCachedToken< CWeaponDescription >, 2 > mPortStackWeapons;
+
+  // Remastered's normal-shot muzzle module (CGunWeaponMP1 +0x588, from the Muzzle PART),
+  // used in place of muzzle generator 0 when that PART is Remastered.
+  CPortEffectSet mPortMuzzleFlash;
+
+  // xb0_suitArmModelData holds the Dread cannon (port_dread_samus_mod.h): it is drawn in place
+  // of the gun model, which it carries along with the arm.
+  bool mPortDreadCannon = false;
+#endif
 };
 CHECK_SIZEOF(CGunWeapon, 0x21c)
 

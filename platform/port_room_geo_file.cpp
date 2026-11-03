@@ -12,7 +12,7 @@ namespace PortRoomGeo {
 namespace {
 
 constexpr uint32_t kMagic = 0x4752504D; // 'MPRG'
-constexpr uint32_t kVersion = 12;
+constexpr uint32_t kVersion = 15;
 constexpr size_t kHeaderBytes = 12;
 constexpr size_t kInstanceBytes = 4 + 12 * 4; // version 1; version 2 adds 4 + links
 constexpr size_t kPlatformBytes = 4 + 3 * 4;   // version 3's, after version 2's 4
@@ -47,7 +47,7 @@ bool ReadF32(const uint8_t* p, float& out) {
 }
 
 // The script section at `at`, which is moved past it.
-bool ParseScript(const std::vector<uint8_t>& data, size_t& at, std::vector<Instance>& instances, Script& script,
+bool ParseScript(const std::vector<uint8_t>& data, size_t& at, uint32_t version, std::vector<Instance>& instances, Script& script,
                  std::string& error) {
   if (data.size() - at < 12) {
     error = "truncated script";
@@ -78,7 +78,7 @@ bool ParseScript(const std::vector<uint8_t>& data, size_t& at, std::vector<Insta
         }
       }
     }
-    if (node.kind < kCameraVolume || node.kind > kRelay) {
+    if (node.kind < kCameraVolume || node.kind > (version >= 15 ? kAlphaModulate : kRelay)) {
       error = "unknown script node";
       return false;
     }
@@ -93,8 +93,10 @@ bool ParseScript(const std::vector<uint8_t>& data, size_t& at, std::vector<Insta
     edge.from = ReadLE32(p + 4);
     edge.to = ReadLE32(p + 8);
     const bool toNode = edge.action != kGroupShow && edge.action != kGroupHide && edge.action != kGroupToggle &&
-                        edge.action != kGroupNextClip;
-    if ((!edge.retail && edge.from >= nodes) || edge.action < kIncrement || edge.action > kGroupNextClip ||
+                        edge.action != kGroupNextClip && edge.action != kGroupModulate;
+    if ((!edge.retail && edge.from >= nodes) || edge.action < kIncrement ||
+        edge.action > (version >= 15 ? kGroupModulate : kGroupNextClip) ||
+        (edge.action == kGroupModulate && (edge.retail || edge.from >= nodes || script.nodes[edge.from].kind != kAlphaModulate)) ||
         (toNode && edge.to >= nodes)) {
       error = "bad script edge";
       return false;
@@ -241,7 +243,7 @@ bool ParseAnim(const std::vector<uint8_t>& data, size_t& at, uint32_t version, s
 // The sky section at `at`, which is moved past it.
 bool ParseSky(const std::vector<uint8_t>& data, size_t& at, uint32_t version, std::vector<Instance>& instances,
               std::string& error) {
-  const size_t stride = version >= 7 ? 16 : 4;
+  const size_t stride = version >= 13 ? 20 : version >= 7 ? 16 : 4;
   if (data.size() - at < 8 || ReadLE32(data.data() + at + 4) > (data.size() - at - 8) / stride) {
     error = "truncated sky";
     return false;
@@ -256,10 +258,11 @@ bool ParseSky(const std::vector<uint8_t>& data, size_t& at, uint32_t version, st
     }
     Instance& instance = instances[index];
     instance.sky = true;
-    for (size_t j = 0; j < 3 && stride == 16; ++j) {
+    for (size_t j = 0; j < 3 && stride >= 16; ++j) {
       float v = 0.f;
       instance.skyRadiance[j] = ReadF32(data.data() + at + 4 + 4 * j, v) && v > 0.f ? v : 0.f;
     }
+    instance.worldSky = stride == 20 && (ReadLE32(data.data() + at + 16) & 1) != 0;
   }
   return true;
 }
@@ -418,6 +421,11 @@ bool Parse(const std::vector<uint8_t>& data, std::vector<Instance>& out, std::st
       link.sender = ReadLE32(data.data() + at);
       link.state = data[at + 4];
       link.action = data[at + 5];
+      if (link.action == kActorTransform && (version < 14 || link.sender == 0)) {
+        error = "bad actor transform binding";
+        out.clear();
+        return false;
+      }
       link.delay = float(size_t(data[at + 6]) | size_t(data[at + 7]) << 8) / 100.f;
       at += kLinkBytes;
     }
@@ -428,7 +436,7 @@ bool Parse(const std::vector<uint8_t>& data, std::vector<Instance>& out, std::st
   // with the lightmap lookups.
   bool ok = true;
   if (version >= 3 && data.size() - at >= 4 && ReadLE32(data.data() + at) == kScriptMagic) {
-    ok = ParseScript(data, at, out, parsed, error);
+    ok = ParseScript(data, at, version, out, parsed, error);
   }
   if (ok && version >= 4 && data.size() - at >= 4 && ReadLE32(data.data() + at) == kGlowMagic) {
     ok = ParseGlow(data, at, out, error);
@@ -586,6 +594,7 @@ std::vector<uint8_t> Write(const std::vector<Instance>& instances, const Script*
         for (float v : instances[i].skyRadiance) {
           AppendLEFloat(out, v);
         }
+        AppendLE32(out, instances[i].worldSky ? 1u : 0u);
       }
     }
   }

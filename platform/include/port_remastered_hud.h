@@ -60,6 +60,12 @@ bool HudFrameModel(const uint8_t* guif, size_t size, ModelUuid& model);
 bool HudBeamIconTints(const uint8_t* ldta, size_t size, std::map<std::string, std::array<float, 4>>& out,
                       std::string& error);
 
+// The icy material Remastered draws a frozen enemy with (CPatternedMP1::RenderIcy): the
+// MATI GUID, in the file's byte order, that the render loose data (the LDTA asset
+// RenderLooseDataMP1) holds in property 0xC2347D95 of its root property 0x5F2E374B.
+// False when `ldta` is not a tweak file or holds no such GUID.
+bool RenderIcyMaterial(const uint8_t* ldta, size_t size, ModelUuid& out, std::string& error);
+
 struct HudCounts {
   int widgets = 0;
   int models = 0;
@@ -86,6 +92,11 @@ public:
   using Tint = std::array<float, 4>;
   void SetTints(std::map<std::string, Tint> tints) { m_tints = std::move(tints); }
 
+  // The height of the ink of a capital H in pixels of Remastered's font (the
+  // glyph's box less its padding), which text panes are sized by. Without it
+  // they keep the disc's text.
+  void SetGlyphInk(float ink) { m_glyphInk = ink; }
+
 private:
   uint32_t NewId(uint32_t& next);
   bool LoadMaterial(std::string& error);
@@ -96,6 +107,7 @@ private:
 
   ConvertIO m_io;
   std::map<std::string, Tint> m_tints;
+  float m_glyphInk = 0.f;
   // By pak-order id, tint and whether the alpha is squared; 0 for one that would not open.
   std::map<std::tuple<ModelUuid, Tint, bool>, uint32_t> m_textures;
   std::vector<uint8_t> m_material;           // the disc material the models are drawn with

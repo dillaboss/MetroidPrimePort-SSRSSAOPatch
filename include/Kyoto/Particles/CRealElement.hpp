@@ -80,12 +80,21 @@ public:
 class CREInitialRandom : public CRealElement {
   CRealElement* x4_min;
   CRealElement* x8_max;
+#ifdef TARGET_PC
+  const bool xPortLoadConstant;
+#endif
 
 public:
   CREInitialRandom(CRealElement* min, CRealElement* max);
   ~CREInitialRandom() override;
   bool GetValue(int frame, float& valOut) const override;
-  bool IsConstant() const override { return true; }
+  bool IsConstant() const override {
+#ifdef TARGET_PC
+    return xPortLoadConstant;
+#else
+    return true;
+#endif
+  }
 };
 
 class CRETimeChain : public CRealElement {
@@ -204,6 +213,15 @@ public:
   bool GetValue(int frame, float& valOut) const override;
 };
 
+#ifdef TARGET_PC
+// port-only: Remastered's PAP9, the ninth real variable (ADV9).
+class CREParticleAccessParameter9 : public CRealElement {
+public:
+  ~CREParticleAccessParameter9() override {}
+  bool GetValue(int frame, float& valOut) const override;
+};
+#endif
+
 class CREParticleSizeOrLineLength : public CRealElement {
 public:
   ~CREParticleSizeOrLineLength() override {}
@@ -231,6 +249,61 @@ public:
   bool GetValue(int frame, float& valOut) const override;
   // The blend for a camera depth d and the two child values.
   static float DistanceBlend(float d, float a, float b);
+};
+
+// Port-only KEWS wrapper: evaluates its child (the converted KEYP) at the swoosh node key, the
+// point's place along the live trail (Remastered 0x24f00c), instead of its age over the life.
+// Outside a swoosh point evaluation it is the child unchanged.
+class CREPortSwooshNodeTime : public CRealElement {
+  CRealElement* x4_a;
+
+public:
+  explicit CREPortSwooshNodeTime(CRealElement* a);
+  ~CREPortSwooshNodeTime() override;
+  bool GetValue(int frame, float& valOut) const override;
+};
+
+// Port-only KESP wrapper: Remastered's CREKeyframeParticle (GetValue 0x296430) with time type 3
+// reads time slot 2 (CParticleGlobals::xPortSlot2*) instead of the particle's; its child is the
+// converted percent KEYP, evaluated at that key.
+class CREPortSlot2Time : public CRealElement {
+  CRealElement* x4_a;
+
+public:
+  explicit CREPortSlot2Time(CRealElement* a);
+  ~CREPortSlot2Time() override;
+  bool GetValue(int frame, float& valOut) const override;
+};
+
+// Port-only PGTC (Remastered's real GTCP, CREGetTotalCreatedParticleCount::GetValue 0x297434):
+// the generator's total created particles as a float, 0 with no generator. The converter writes it
+// only in an emitter, where Remastered's total is one less than retail's cumulative count.
+class CREPortTotalCreatedParticleCount : public CRealElement {
+public:
+  bool GetValue(int frame, float& valOut) const override;
+};
+
+// Port-only DIVD (CREDivide::GetValue 0x294e0c): a / b, a plain fdiv with no zero guard.
+class CREPortDivide : public CRealElement {
+  CRealElement* x4_a;
+  CRealElement* x8_b;
+
+public:
+  CREPortDivide(CRealElement* a, CRealElement* b);
+  ~CREPortDivide() override;
+  bool GetValue(int frame, float& valOut) const override;
+};
+
+// Port-only T2S_ (CRETicksToSeconds::GetValue 0x299910): (float)(1/60 * (double)n) for the int
+// child n, the double product narrowed once (not n / 60.f).
+class CIntElement;
+class CREPortTicksToSeconds : public CRealElement {
+  CIntElement* x4_a;
+
+public:
+  explicit CREPortTicksToSeconds(CIntElement* a);
+  ~CREPortTicksToSeconds() override;
+  bool GetValue(int frame, float& valOut) const override;
 };
 #endif
 

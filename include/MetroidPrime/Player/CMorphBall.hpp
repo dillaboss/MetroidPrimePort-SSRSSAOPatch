@@ -130,6 +130,9 @@ public:
   // that type (port_model_variant.h); otherwise `id`. A Remastered import has
   // one model per suit where retail picks a material set of a shared one.
   static CAssetId PortSuitVariant(CAssetId id, FourCC type, int suit);
+  // The ball's glow colour for a suit: retail's, or the one a generated look
+  // (port_ball_looks.h) takes from the suit it is coloured as.
+  static uint PortBallGlowColorIdx(int suit, bool spiderBall);
 #else
   static CModelData* GetMorphBallModel(const rstl::string& name, const float radius);
 #endif
@@ -200,6 +203,8 @@ public:
   void SetDisableSpiderBallTime(float time);
 #ifdef TARGET_PC
   void PortResetTimeSinceBombJump() { xPortTimeSinceBombJump = 0.f; }
+  // Damage keeps the spider ball off its track for this long (Toggle Spider Ball).
+  float PortDamageTimer() const { return x191c_damageTimer; }
 #endif
 
   u32 GetMorphballModelShader() const { return x5c_ballModelShader; } // name?

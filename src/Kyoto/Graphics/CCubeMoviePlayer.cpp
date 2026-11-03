@@ -18,6 +18,7 @@
 
 #ifdef TARGET_PC
 #include "port_debug.h"
+#include "port_disc.h"
 #endif
 
 #include "dolphin/gx/GXGeometry.h"
@@ -408,8 +409,15 @@ void CMoviePlayer::DecodeFromRead(const void* ptr) {
   for (uint i = 0; i < x58_thpComponents.mNumComponents; ++i) {
     const uchar* data = dataStart + offset;
     if (x58_thpComponents.mFrameComp[i] == 0) {
+#ifdef TARGET_PC
+      // Bounded by the component's size and the planes' picture: the decoder
+      // reads ahead of its last bit, and a corrupt frame could claim any size.
+      THPVideoDecodeBounded(data, CBasics::SwapBytes(sizes[0]), texture.Y(), texture.U(), texture.V(),
+                            x6c_videoInfo.mXSize, x6c_videoInfo.mYSize);
+#else
       THPVideoDecode(const_cast< uchar* >(data), texture.Y(), texture.U(), texture.V(),
                      alignedWork);
+#endif
     } else if (x58_thpComponents.mFrameComp[i] == 1) {
       const uint samples =
           THPAudioDecode(static_cast< short* >(texture.Audio()), const_cast< uchar* >(data), 0);
@@ -685,7 +693,11 @@ void CMoviePlayer::PortGetMargins(int vpWidth, int vpHeight, int& xMargin, int& 
   const float view = PortDebug::AspectMode() == PortDebug::kAspect_4_3
                          ? 4.f / 3.f
                          : static_cast< float >(vpWidth) / static_cast< float >(vpHeight);
-  const float movie = static_cast< float >(width) / static_cast< float >(height);
+  // Trilogy's 640x448 movies are anamorphic 16:9 (the Wii front end's and its re-encoded
+  // endings); drawn with square pixels they come out squeezed.
+  const bool anamorphic = width == 640 && height == 448 && PortDisc::IsTrilogy(PortDisc::Current());
+  const float movie =
+      anamorphic ? 16.f / 9.f : static_cast< float >(width) / static_cast< float >(height);
   int drawnWidth = vpWidth;
   int drawnHeight = vpHeight;
   if (movie > view) {

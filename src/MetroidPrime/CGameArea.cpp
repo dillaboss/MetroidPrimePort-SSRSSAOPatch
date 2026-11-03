@@ -1,4 +1,5 @@
 #include "MetroidPrime/CGameArea.hpp"
+#include "port_env.h"
 
 #include "MetroidPrime/CMemoryDrawEnum.hpp"
 
@@ -22,7 +23,11 @@
 #include "WorldFormat/CPVSAreaSet.hpp"
 
 #ifdef TARGET_PC
+#include "port_pipeline_context.h"
 #include "port_randomizer.h"
+#include "port_room_effects.h"
+#include "port_room_geo.h"
+#include "port_savestate.h"
 #include "port_skip_cutscenes.h"
 
 #include <string.h>
@@ -35,7 +40,7 @@
 namespace {
 // MP_LOG_DOORS: when each area started streaming, and how long each load stage took.
 bool PortAreaLogEnabled() {
-  static const bool enabled = std::getenv("MP_LOG_DOORS") != nullptr;
+  static const bool enabled = port::EnvFlag("MP_LOG_DOORS");
   return enabled;
 }
 std::map< int, std::chrono::steady_clock::time_point > sPortAreaLoadStart;
@@ -646,6 +651,13 @@ static void PortDumpInactivePickups(const CGameArea& area, CStateManager& mgr, T
 #endif
 
 void CGameArea::LoadScriptObjects(CStateManager& mgr) {
+#ifdef TARGET_PC
+  // PORT: a save state records the layer bits this area spawns with and rebuilds with them (#161).
+  PortSaveState::NoteAreaSpawnBegin(mgr, x4_selfIdx.Value());
+  // PORT: a mod's Remastered effect actors (port_room_effects.h): the retail objects they
+  // replace are left out, and each active layer's are created after its own.
+  PortRoomEffects::BeginArea(static_cast< uint32_t >(x84_mrea));
+#endif
   rstl::vector< TEditorId > ids;
   const CScriptLayerManager& layers = *mgr.WorldLayerState();
   int count = layers.GetAreaLayerCount(x4_selfIdx);
@@ -655,6 +667,12 @@ void CGameArea::LoadScriptObjects(CStateManager& mgr) {
       rstl::pair< const uchar*, int > buffer = GetLayerScriptBuffer(layer);
       CMemoryInStream stream(buffer.first, buffer.second);
       mgr.LoadScriptObjects(GetId(), stream, ids);
+#ifdef TARGET_PC
+      std::vector< uint32_t > added;
+      PortRoomEffects::LoadLayer(mgr, GetId().Value(), static_cast< uint32_t >(i), added);
+      for (size_t k = 0; k < added.size(); ++k)
+        ids.push_back(TEditorId(added[k]));
+#endif
     }
 #ifdef TARGET_PC
     else if (PortRandomizer::DumpEnabled() && mgr.GetWorld() != nullptr) {
@@ -662,7 +680,13 @@ void CGameArea::LoadScriptObjects(CStateManager& mgr) {
     }
 #endif
   }
+#ifdef TARGET_PC
+  PortRoomEffects::EndArea();
+#endif
   mgr.InitScriptObjects(ids);
+#ifdef TARGET_PC
+  PortSaveState::NoteAreaSpawnEnd(mgr, x4_selfIdx.Value()); // PORT: puts the saved live layer bits back
+#endif
 }
 
 void CGameArea::StartStreamIn(CStateManager& mgr) {
@@ -673,6 +697,19 @@ void CGameArea::StartStreamIn(CStateManager& mgr) {
       sPortAreaLoadStart[x4_selfIdx.Value()] = std::chrono::steady_clock::now();
       std::fprintf(stderr, "MP area %d (MREA %08X) stream start\n", x4_selfIdx.Value(),
                    static_cast< uint >(x84_mrea));
+    }
+    // The Remastered room geometry's file is read and parsed while the area streams in.
+    PortRoomGeo::Prefetch(static_cast< uint32_t >(x84_mrea));
+    // A lazy pipeline cache builds the pipelines this area drew last time, in the background, then
+    // (once per world) every other area's of this world, so a door opened later finds them built.
+    if (const CWorld* world = mgr.GetWorld()) {
+      const uint32_t mlvl = static_cast< uint32_t >(world->IGetWorldAssetId());
+      aurora_pipeline_prefetch(PortPipelineAreaContext(mlvl, x4_selfIdx.Value()));
+      static uint32_t sPrefetchedWorld = 0xFFFFFFFFu;
+      if (mlvl != sPrefetchedWorld) {
+        sPrefetchedWorld = mlvl;
+        aurora_pipeline_prefetch(AURORA_PIPELINE_CONTEXT_WORLD(mlvl));
+      }
     }
 #endif
     VerifyTokenList(mgr);

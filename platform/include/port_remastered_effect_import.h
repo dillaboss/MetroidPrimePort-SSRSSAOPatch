@@ -39,6 +39,9 @@ struct EffectImportIO {
   // Optional: pairings the image itself gives (a projectile's particles, from its WPSM and the
   // disc's WPSC), used after the importer's own table.
   std::vector<EffectPairing> pairings;
+  // Optional: GENPs a room's effect actors use (RoomEffectGenps) that stand for no disc PART:
+  // each is written under RoomEffectId(), for the rooms' .roomfx files to name.
+  std::vector<EffectGuid> roomOnly;
   // A Remastered asset's bytes by type ('GENP', 'MATI', 'TXTR') and id; false
   // when the image has none.
   std::function<bool(uint32_t type, const EffectGuid& id, std::vector<uint8_t>& out, std::string& error)> read;
@@ -49,6 +52,8 @@ struct EffectImportIO {
   // A disc resource's bytes by type and id; false when the disc has none.
   // Optional: without it a converted effect keeps its own light.
   std::function<bool(uint32_t type, uint32_t id, std::vector<uint8_t>& out)> retail;
+  // Optional: whether the disc has a resource of this type and id (any type, unlike `retail`).
+  std::function<bool(uint32_t type, uint32_t id)> retailHas;
   // A new id for a resource of the import, never one the disc or the import
   // already has; `seed` makes it the same in every import.
   std::function<uint32_t(uint32_t seed)> freshId;
@@ -58,6 +63,10 @@ struct EffectImportIO {
   // Whether the texture's bytes are sRGB, which Remastered's VFX shaders see decoded to
   // linear. Optional: without it every texture is taken as data.
   std::function<bool(const EffectGuid& id)> textureSrgb;
+  // Whether the texture has red and green only (BC5), which `texture` and `layers` give as grey
+  // plus alpha while Remastered's VFX shaders read them as .x and .y. Optional: without it every
+  // texture is taken as having all four channels.
+  std::function<bool(const EffectGuid& id)> textureRg;
   // Every layer of a Remastered array texture as RGBA8, layer slowest (a TXFB's
   // frames). Optional: without it a flipbook does not convert.
   std::function<bool(const EffectGuid& id, int& width, int& height, int& layers, std::vector<uint8_t>& rgba,
@@ -70,6 +79,9 @@ struct EffectImportIO {
   // Optional: the VMSH blob of a model `model` converted under `retailId` (empty for any
   // other id), so a model particle with a VMAT carries its mesh.
   std::function<std::vector<uint8_t>(uint32_t retailId)> modelMesh;
+  // Optional: whether the Remastered model `id` has an ANUV program; false when it cannot be
+  // read. Without it a PMPH does not convert.
+  std::function<bool(const EffectGuid& id, bool& animatesUv)> modelAnimatesUv;
   // Stores one output file: "<ID>.PART", "<ID>.TXTR" or "<ID>.CMDL".
   std::function<bool(const std::string& name, const std::vector<uint8_t>& data)> write;
   std::function<void(const std::string& line)> log;  // optional
@@ -94,5 +106,20 @@ bool WantsRemasteredEffects();
 
 EffectImportResult ImportEffects(const EffectImportIO& io);
 
-}  // namespace PortRemastered
+// The synthetic id (port_synthetic_effect.h) of a GENP only room effect actors use: of its id
+// (in a pak's byte order) as it prints, 8-4-4-4-12 in lower case.
+uint32_t RoomEffectId(const EffectGuid& id);
 
+// The Remastered-only GENPs the ELSMs and ELC2s of `io.effects` name as GPSM or EPSM (not an
+// embedded child), in order and once each: the import writes them as it does roomOnly ones.
+std::vector<EffectGuid> ElectricGenps(const EffectImportIO& io);
+
+// Whether `id` (in a pak's byte order) prints as `text` (8-4-4-4-12, lower case).
+bool EffectIdIs(const EffectGuid& id, const char* text);
+
+// All retail PARTs kMatchedEffects pairs with `id` (in a pak's byte order), regardless of
+// pairing method. The rooms step verifies their presence before assigning the source
+// actor's placement and particle variables to a matched retail Effect.
+std::vector<uint32_t> MatchedRetailEffects(const EffectGuid& id);
+
+}  // namespace PortRemastered

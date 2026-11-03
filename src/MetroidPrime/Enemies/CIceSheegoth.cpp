@@ -28,6 +28,11 @@
 #include "MetroidPrime/BodyState/CBodyState.hpp"
 #include "rstl/math.hpp"
 
+#ifdef TARGET_PC
+#include "Kyoto/CResFactory.hpp"
+#include "port_synthetic_effect.h"
+#endif
+
 const int CIceSheegothData::skNumProperties = 37;
 
 const CVector3f CIceSheegoth::skChargingBounds(2.f, 2.f, 2.f);
@@ -1182,14 +1187,14 @@ void CIceSheegoth::AttractProjectiles(CStateManager& mgr) {
     const CAABox projectileBounds((CVector3f(min)), CVector3f(max));
     const CMaterialFilter projectileFilter =
         CMaterialFilter::MakeInclude(CMaterialList(kMT_Projectile));
-    rstl::reserved_vector< TUniqueId, 1024 > projectiles;
+    rstl::reserved_vector< TUniqueId, kMaxObjects > projectiles;
     mgr.BuildNearList(projectiles, projectileBounds, projectileFilter, nullptr);
     if (!projectiles.empty()) {
       const CVector3f attractionPos = GetEnergyAttractionPos(mgr);
       const CAABox characterBounds((CVector3f(min)), CVector3f(max));
       const CMaterialFilter characterFilter =
           CMaterialFilter::MakeInclude(CMaterialList(kMT_Character));
-      rstl::reserved_vector< TUniqueId, 1024 > characters;
+      rstl::reserved_vector< TUniqueId, kMaxObjects > characters;
       mgr.BuildNearList(characters, characterBounds, characterFilter, nullptr);
       for (AUTO(it, projectiles.begin()); it != projectiles.end(); ++it) {
         if (CGameProjectile* const projectile =
@@ -1233,7 +1238,7 @@ void CIceSheegoth::AttractProjectiles(CStateManager& mgr) {
 }
 
 bool CIceSheegoth::IsClosestSheegoth(CStateManager& mgr,
-                                     const rstl::reserved_vector< TUniqueId, 1024 >& nearList,
+                                     const rstl::reserved_vector< TUniqueId, kMaxObjects >& nearList,
                                      const CVector3f& pos) const {
   CVector3f delta = pos - GetTranslation();
   const float distanceSquared = delta.MagSquared();
@@ -1574,6 +1579,18 @@ void CIceSheegoth::CreateFlameThrower(CStateManager& mgr) {
         kMT_CollisionActor, x56c_data.GetFireBreathDamage(), xa80_flameThrowerId,
         GetCurrentAreaId(), GetUniqueId(), CWeapon::kPA_None, x56c_data.GetX1e4(),
         x56c_data.GetX1e8(), x56c_data.GetX1ec());
+#ifdef TARGET_PC
+    const SObjectTag fx('PART', PortRemastered::SyntheticEffectId(PortRemastered::kIceSheegothFlame));
+    if (gpResourceFactory->CanBuild(fx)) {
+      flame->PortSetRemasteredFlame(
+          fx.GetId(), PortRemastered::SyntheticEffectId(PortRemastered::kIceSheegothFlameCollision));
+    }
+    const SObjectTag frozenFx('PART',
+                              PortRemastered::SyntheticEffectId(PortRemastered::kBabygothFrozenFx));
+    if (gpResourceFactory->CanBuild(frozenFx)) {
+      flame->PortSetFrozenFx(frozenFx.GetId());
+    }
+#endif
     mgr.AddObject(*flame);
   }
 }

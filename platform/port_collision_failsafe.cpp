@@ -251,26 +251,20 @@ bool CalculateOffsetToSafeCollisionPoint(const Box& box, const Vec3& pos, float 
   return false;
 }
 
-bool BoxBoxImpacts(const Box& self, const Box& other, std::vector< Impact >& out) {
-  // A = self, B = other; Remastered axes x, y (up), z.
-  R3 aMin, aMax, bMin, bMax;
-  BoxToRem(self, aMin, aMax);
-  BoxToRem(other, bMin, bMax);
+namespace {
+// Selection core of 0xbf61b4 in Remastered axes. `emit(axis, depth, sign)` is the helper
+// 0xbf6650 after its depth > 0 test and returns whether it appended an impact; the
+// fallback runs whenever no helper call appended one.
+template < class Emit >
+bool BoxBoxCore(const R3& aMin, const R3& aMax, const R3& bMin, const R3& bMax, Emit&& emit) {
   // DoBoundsOverlap 0x98234 (inclusive) gates the whole routine.
   for (int k = 0; k < 3; ++k) {
     if (aMax.v[k] < bMin.v[k] || bMax.v[k] < aMin.v[k]) return false;
   }
-  const std::size_t first = out.size();
-  // 0xbf6650: an impact is added only with depth > 0; both halves carry the depth and
-  // their owner's outward face normal: A's +axis*sign, B's -axis*sign.
+  bool any = false;
   auto add = [&](int axis, float depth, float sign) {
     if (!(depth > 0.f)) return;
-    R3 n{{0.f, 0.f, 0.f}};
-    n.v[axis] = -sign; // the other (B) half's normal
-    Impact i;
-    i.depth = depth;
-    i.otherNormal = FromRem(n);
-    out.push_back(i);
+    if (emit(axis, depth, sign)) any = true;
   };
   for (int k = 0; k < 3; ++k) {
     const float extB = bMax.v[k] - bMin.v[k];
@@ -280,8 +274,8 @@ bool BoxBoxImpacts(const Box& self, const Box& other, std::vector< Impact >& out
     if (s0 < extB && s0 < extA) add(k, s0, 1.f);
     if (s8 < extA && s8 < extB) add(k, s8, -1.f);
   }
-  if (out.size() == first) {
-    // No axis partly overlaps: the smallest non-negative difference, earlier axis on ties.
+  if (!any) {
+    // No helper call appended: the smallest non-negative difference, earlier axis on ties.
     const float d[6] = {aMax.v[0] - bMin.v[0], bMax.v[0] - aMin.v[0], aMax.v[1] - bMin.v[1],
                         bMax.v[1] - aMin.v[1], aMax.v[2] - bMin.v[2], bMax.v[2] - aMin.v[2]};
     float best = (d[0] < FLT_MAX && d[0] >= 0.f) ? d[0] : FLT_MAX;
@@ -300,7 +294,89 @@ bool BoxBoxImpacts(const Box& self, const Box& other, std::vector< Impact >& out
       add(axis, n, -1.f);
     }
   }
-  return out.size() != first;
+  return any;
+}
+
+// Outward normal of a half: unit vector on `axis` (Remastered frame) scaled by `s`.
+Vec3 AxisNormal(int axis, float s) {
+  R3 n{{0.f, 0.f, 0.f}};
+  n.v[axis] = s;
+  return FromRem(n);
+}
+
+// Component-wise negation, so the zero signs flip too. 0xbf6650 builds one `n` over
+// CVector3f::skZeroVector (0x1d0c200, three +0.0) with n[axis] = sign, negates all three
+// components (fneg s9/s10/s11 at 0xbf66b8-0xbf66c0) and uses that negated vector both as
+// the per-candidate filter argument and as the other half's normal (0xbf689c-0xbf68a4);
+// the self half keeps the +0.0 zeros. Negating the converted self normal is that same
+// operation (FromRem(-r) == -FromRem(r) component-wise), zeros included.
+Vec3 NegatedNormal(const Vec3& n) { return {-n.x, -n.y, -n.z}; }
+} // namespace
+
+bool BoxBoxImpacts(const Box& self, const Box& other, std::vector< Impact >& out) {
+  // A = self, B = other; both halves carry the depth, A's normal is +axis*sign and B's
+  // (the one kept) -axis*sign. The legacy normal is AxisNormal(axis, -sign) bit for bit,
+  // zero signs included, exactly as before the paired refactor: 0xbf6650's other-half
+  // normal is the component-wise negation instead (see NegatedNormal), but this API's
+  // output must not change.
+  R3 aMin, aMax, bMin, bMax;
+  BoxToRem(self, aMin, aMax);
+  BoxToRem(other, bMin, bMax);
+  return BoxBoxCore(aMin, aMax, bMin, bMax, [&](int axis, float depth, float sign) {
+    Impact i;
+    i.depth = depth;
+    i.otherNormal = AxisNormal(axis, -sign);
+    out.push_back(i);
+    return true;
+  });
+}
+
+bool BoxBoxPairedImpacts(const Box& self, const Box& other, const NormalPredicate& passes,
+                         std::vector< PairedImpact >& out) {
+  R3 aMin, aMax, bMin, bMax;
+  BoxToRem(self, aMin, aMax);
+  BoxToRem(other, bMin, bMax);
+  // 0x98800 intersection: max of the minimums, then min of the maximums. The source's
+  // fcsel keeps SELF on an exact tie of the two minima (fcsel s0,s0,s2,ge at
+  // 0x98814/0x98820/0x98830) and OTHER on a tie of the two maxima (fcsel s4,s6,s4,ge at
+  // 0x9883c/0x98858/0x98864); only zero signs can tell the two answers apart.
+  R3 iMin, iMax;
+  for (int k = 0; k < 3; ++k) {
+    iMin.v[k] = aMin.v[k] >= bMin.v[k] ? aMin.v[k] : bMin.v[k];
+    iMax.v[k] = aMax.v[k] < bMax.v[k] ? aMax.v[k] : bMax.v[k];
+  }
+  static const int kNext[3] = {1, 2, 0}; // 0x1d0b9b4
+  return BoxBoxCore(aMin, aMax, bMin, bMax, [&](int axis, float depth, float sign) {
+    // SurfaceCollisionPasses(other material, -n): the other half's outward normal, the
+    // component-wise negation of the self normal (F1); the predicate gets that value.
+    const Vec3 otherN = NegatedNormal(AxisNormal(axis, sign));
+    if (passes && !passes(otherN)) return false;
+    // 0xbf6650 points: the face is the intersection box on the other two axes, the four
+    // corners summed ((c0 + c1) + c2) + c3 and scaled by 0.25; the axis component is p8
+    // for the self half and p9 for the other (+1: p8 = max, p9 = min; -1: swapped).
+    const int a1 = kNext[axis], a2 = kNext[a1];
+    const R3& p8 = sign > 0.f ? iMax : iMin;
+    const R3& p9 = sign > 0.f ? iMin : iMax;
+    R3 c[4];
+    for (int i = 0; i < 4; ++i) {
+      c[i].v[axis] = p8.v[axis];
+      c[i].v[a1] = (i < 2) ? iMin.v[a1] : iMax.v[a1];
+      c[i].v[a2] = (i == 0 || i == 2) ? iMin.v[a2] : iMax.v[a2];
+    }
+    R3 mid;
+    for (int k = 0; k < 3; ++k) mid.v[k] = (((c[0].v[k] + c[1].v[k]) + c[2].v[k]) + c[3].v[k]) * 0.25f;
+    R3 otherPt = mid;
+    otherPt.v[axis] = p9.v[axis];
+    PairedImpact i;
+    i.selfDepth = depth;
+    i.otherDepth = depth;
+    i.selfNormal = AxisNormal(axis, sign);
+    i.otherNormal = otherN;
+    i.selfPoint = FromRem(mid);
+    i.otherPoint = FromRem(otherPt);
+    out.push_back(i);
+    return true;
+  });
 }
 
 bool BoxSphereImpacts(const Box& self, const Vec3& center, float radius,
@@ -434,23 +510,9 @@ RayHit RayAABox(const Box& box, const Vec3& start, const Vec3& dir, float length
   return hit;
 }
 
-namespace {
-// CMath::SqrtF 0x65f70: v * rsqrt(max(v, 1e-35)), the reciprocal square root being the
-// ARM estimate with TWO frsqrts refinements, and 0 for v <= 0. The guard is a
-// `fcmp/b.le` pair, and AArch64 takes an unordered compare, so the machine rule is
-// `!(v > 0)` and NaN returns 0 like the non-positive inputs. (Unreachable from
-// RaySphere, which only calls this under `0.f < disc`.)
-constexpr float kSqrtFFloor = 1e-35f; // 0x0554ad2e
-float SourceSqrtF(float v) {
-  if (!(v > 0.f)) return 0.f;
-  const float x = std::fmax(v, kSqrtFFloor);
-  const float estimate = ReciprocalSqrtEstimate(x);
-  const float first = estimate * ReciprocalSqrtStep(x, estimate * estimate);
-  const float second = first * ReciprocalSqrtStep(x, first * first);
-  return v * second;
-}
-} // namespace
-
+// CMath::SqrtF 0x65f70 used to be file-local here; it now lives in the contacts module
+// (PortRemasteredGroundContacts::Source::SqrtF, which is where the capsule kernel's
+// 0x699b0 copy can share it). Same instruction sequence, same outputs.
 RayHit RaySphere(const Vec3& center, float radius, const Vec3& start, const Vec3& dir,
                  float length) {
   // 0xbf6ac0 runs in Remastered axes, like the box-sphere producer.
@@ -471,7 +533,7 @@ RayHit RaySphere(const Vec3& center, float radius, const Vec3& start, const Vec3
       // 0xbf6b2c: r2 - (d2 - b*b); 0.0 < disc, so exact tangency misses.
       const float disc = r2 - (d2 - b * b);
       if (0.f < disc) {
-        const float t = b - SourceSqrtF(disc);
+        const float t = b - PortRemasteredGroundContacts::Source::SqrtF(disc);
         if (t < length) {
           // 0xbf6b58-0xbf6b98: hit point = start + t*dir, then CUnitVector3f 0x71164
           // (AsNormalizedOrZero 0x6b6b8) of point - centre, the verified helper.

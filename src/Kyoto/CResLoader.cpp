@@ -8,18 +8,25 @@
 #include "Kyoto/CDvdRequest.hpp"
 #include "port_ap_world.h"
 #include "port_custom_res.h"
+#include "port_disc.h"
+#include "port_log.h"
 #include "port_mods.h"
+#include "port_prompts.h"
 #include "port_skip_cutscenes.h"
 
 #include <dolphin/ar.h>
 #include <dolphin/dvd.h>
 #include <dolphin/os.h>
 
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 #endif
 
@@ -74,11 +81,20 @@ struct PortDiscResource {
   bool compressed;
 };
 
+std::mutex sDiscIndexMutex;
+std::map< uint, PortDiscResource > sDiscIndex;
+bool sDiscIndexBuilt = false;
+
+// Disc reads PortCustomResource keeps for the run (until PortForgetDiscReads).
+std::mutex sCopiesMutex;
+std::map< uint, std::unique_ptr< PortCustomRes::Resource > > sCopies;
+
 // Where each resource sits in the disc's PAKs, loaded or not; built on first use.
 const std::map< uint, PortDiscResource >& PortDiscIndex() {
-  static std::map< uint, PortDiscResource > index;
-  static std::once_flag once;
-  std::call_once(once, [] {
+  std::lock_guard< std::mutex > lock(sDiscIndexMutex);
+  std::map< uint, PortDiscResource >& index = sDiscIndex;
+  if (!sDiscIndexBuilt) {
+    sDiscIndexBuilt = true;
     for (const std::pair< int32_t, std::string >& pak : PortMods::DiscPaks()) {
       DVDFileInfo file;
       if (!DVDFastOpen(pak.first, &file))
@@ -107,8 +123,21 @@ const std::map< uint, PortDiscResource >& PortDiscIndex() {
       }
       DVDClose(&file);
     }
-  });
+  }
   return index;
+}
+
+// The disc's PAKs include the mods' (extra PAKs, resources added to world PAKs), so a mod reload
+// changes them: what was read or indexed before may be gone (a Remastered effect's child, once
+// Remastered is off) or moved.
+void PortForgetDiscReads() {
+  {
+    std::lock_guard< std::mutex > lock(sDiscIndexMutex);
+    sDiscIndex.clear();
+    sDiscIndexBuilt = false;
+  }
+  std::lock_guard< std::mutex > lock(sCopiesMutex);
+  sCopies.clear();
 }
 
 // A resource read straight from its PAK on the disc, decompressed.
@@ -160,9 +189,7 @@ const PortCustomRes::Resource* CResLoader::PortCustomResource(const CAssetId ass
   // has, which retail never asks for but a mod's resource can (an imported Remastered effect's
   // child from another world): it crashed on a null PAK. Kept for the run; a later load of that
   // PAK is found first.
-  static std::mutex sMutex;
-  static std::map< uint, std::unique_ptr< PortCustomRes::Resource > > sCopies;
-  std::lock_guard< std::mutex > lock(sMutex);
+  std::lock_guard< std::mutex > lock(sCopiesMutex);
   std::map< uint, std::unique_ptr< PortCustomRes::Resource > >::iterator found = sCopies.find(asset);
   if (found != sCopies.end())
     return found->second.get();
@@ -196,7 +223,37 @@ void CResLoader::MoveToCorrectLoadedList(const rstl::auto_ptr< CPakFile >& pak) 
   }
 }
 
+#ifdef TARGET_PC
+namespace {
+// Trilogy's RS5.pak, mounted ahead of the rest, holds Wii-remote art under the
+// ids of the GameCube button textures (the PlayerRes tweak and the strings'
+// &image= tags name the same ids). Looking past it for these finds the GC art
+// in Strings/NoARAM/GGuiSys, which port_prompts re-icons for the active input
+// as on a GC disc (#220). RS5's other assets (beam/visor select, scan rings)
+// stay.
+bool PortSkipRS5Button(const CPakFile& pak, const CAssetId asset) {
+  if (!PortPrompts::IsPromptAsset(asset))
+    return false;
+  if (!PortDisc::IsTrilogy(PortDisc::Current()))
+    return false;
+  const char* name = pak.GetDvdFile().GetFilename().data();
+  // "aram:RS5.pak"
+  const char* base = strrchr(name, ':');
+  base = base ? base + 1 : name;
+  constexpr std::string_view rs5 = "RS5.";
+  return std::strlen(base) >= rs5.size() &&
+         std::equal(rs5.begin(), rs5.end(), base, [](char a, char b) {
+           return a == std::toupper(static_cast<unsigned char>(b));
+         });
+}
+} // namespace
+#endif
+
 bool CResLoader::CacheFromPak(const CPakFile& pak, const CAssetId asset) const {
+#ifdef TARGET_PC
+  if (PortSkipRS5Button(pak, asset))
+    return false;
+#endif
   const CPakFile::SResInfo* resInfo = pak.GetResInfo(asset);
   if (!resInfo) {
     return false;
@@ -209,6 +266,10 @@ bool CResLoader::CacheFromPak(const CPakFile& pak, const CAssetId asset) const {
 }
 
 bool CResLoader::CacheFromPakForLoad(CPakFile& pak, const CAssetId asset) {
+#ifdef TARGET_PC
+  if (PortSkipRS5Button(pak, asset))
+    return false;
+#endif
   const CPakFile::SResInfo* resInfo = nullptr;
   if (x54_forwardSeek) {
     resInfo = pak.GetResInfoForLoadPreferForward(asset);
@@ -226,6 +287,21 @@ bool CResLoader::CacheFromPakForLoad(CPakFile& pak, const CAssetId asset) {
 
   return true;
 }
+
+#ifdef TARGET_PC
+// Retail loads only what ResourceExists found, so these never miss there. A
+// miss here (a PAK closed or stashed under the load, an order retail never
+// runs) would read through a null or another asset's SResInfo: stop with the
+// asset named instead, and the crash handler's stack shows who asked.
+static void PortCheckLoad(const CPakFile* pak, const SObjectTag& tag) {
+  if (pak != nullptr)
+    return;
+  const uint type = tag.GetType();
+  PortLog::Write("CResLoader: %c%c%c%c %08X is in no loaded PAK\n", (type >> 24) & 0xff,
+                 (type >> 16) & 0xff, (type >> 8) & 0xff, type & 0xff, static_cast< uint >(tag.GetId()));
+  std::abort();
+}
+#endif
 
 CPakFile* CResLoader::FindResourceForLoad(const SObjectTag& tag) {
   return FindResourceForLoad(tag.GetId());
@@ -274,7 +350,14 @@ bool CResLoader::ResourceExists(CAssetId asset) {
 
 bool CResLoader::PortPakResourceExists(CAssetId asset) {
 #endif
+#ifdef TARGET_PC
+  // Port: ClearCache leaves kInvalidAssetId cached with no info, so an object
+  // without an X-ray model (asset -1) made right after it got a null info back
+  // (issue 179: a resume regenerating Metroid Prime Lair's Metroids).
+  if (x4c_cachedResId == asset && x50_cachedResInfo != nullptr) {
+#else
   if (x4c_cachedResId == asset) {
+#endif
     return true;
   }
 
@@ -322,6 +405,7 @@ void CResLoader::PortReopenPaks(void (*between)()) {
     }
   }
   between();
+  PortForgetDiscReads();
   for (size_t i = 0; i < paks.size(); ++i) {
     CPakFile* pak = rs_new CPakFile(paks[i].name, paks[i].depList, paks[i].worldPak);
     while (!pak->IsCompletelyLoaded()) {
@@ -457,6 +541,9 @@ CDvdRequest* CResLoader::LoadResourceAsync(const SObjectTag& tag, char* extBuf) 
   }
 #endif
   CPakFile* curPak = FindResourceForLoad(tag);
+#ifdef TARGET_PC
+  PortCheckLoad(curPak, tag);
+#endif
   const CPakFile::SResInfo* info = x50_cachedResInfo;
   return curPak->DvdFile().AsyncSeekRead(extBuf, align_size(info->GetSize()), kSO_Begin, info->GetOffset());
 }
@@ -470,6 +557,9 @@ CDvdRequest* CResLoader::LoadResourcePartAsync(const SObjectTag& tag, const int 
   }
 #endif
   CPakFile* curPak = FindResourceForLoad(tag);
+#ifdef TARGET_PC
+  PortCheckLoad(curPak, tag);
+#endif
   const CPakFile::SResInfo* info = x50_cachedResInfo;
   return curPak->DvdFile().AsyncSeekRead(extBuf, length, kSO_Begin, info->GetOffset() + offset);
 }
@@ -485,6 +575,9 @@ CInputStream* CResLoader::LoadNewResourceSync(const SObjectTag& tag, char* extBu
   }
 #endif
   CPakFile* curPak = FindResourceForLoad(tag);
+#ifdef TARGET_PC
+  PortCheckLoad(curPak, tag);
+#endif
   const CPakFile::SResInfo* info = x50_cachedResInfo;
   uint len = align_size(info->GetSize());
   void* dest = extBuf ? extBuf : rs_new char[len];
@@ -510,6 +603,12 @@ CInputStream* CResLoader::LoadResourceFromMemorySync(const SObjectTag& tag, cons
 #endif
   FindResourceForLoad(tag);
   const CPakFile::SResInfo* info = x50_cachedResInfo;
+#ifdef TARGET_PC
+  // A miss here keeps the last lookup's info, as retail does; only none at all
+  // (after ClearCache) is fatal.
+  if (info == nullptr)
+    PortCheckLoad(nullptr, tag);
+#endif
   CInputStream* input = rs_new CMemoryInStream(extBuf, info->GetSize());
 
   if (info->IsCompressed()) {
@@ -531,6 +630,9 @@ void CResLoader::LoadMemResourceSync(const SObjectTag& tag, char** bufOut, int* 
   }
 #endif
   CPakFile* curPak = FindResourceForLoad(tag);
+#ifdef TARGET_PC
+  PortCheckLoad(curPak, tag);
+#endif
   const CPakFile::SResInfo* info = x50_cachedResInfo;
   uint len = align_size(info->GetSize());
   char* buf = rs_new char[len];
@@ -551,6 +653,9 @@ CInputStream* CResLoader::LoadNewResourcePartSync(const SObjectTag& tag, int off
   }
 #endif
   CPakFile* curPak = FindResourceForLoad(tag);
+#ifdef TARGET_PC
+  PortCheckLoad(curPak, tag);
+#endif
   const CPakFile::SResInfo* info = x50_cachedResInfo;
 
   void* dest = extBuf ? extBuf : rs_new char[length];

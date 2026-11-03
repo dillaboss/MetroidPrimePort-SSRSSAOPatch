@@ -10,6 +10,9 @@ class CStateManager;
 namespace PortRandomizer {
 struct PickupModel;
 }
+namespace PortApWorld {
+struct DoorStyle;
+}
 
 // Archipelago client.
 //
@@ -152,6 +155,12 @@ void QueueCheck(const char* locationKey);
 // off too.
 bool OwnsPickup(uint32_t world, uint32_t area, uint32_t entity);
 bool OwnsMemo(uint32_t world, uint32_t area, uint32_t entity);
+// The jingle file for the StreamedAudio `entity` when it is an AP location's
+// pickup jingle and the item placed there is known (scouted), so the pickup
+// plays the placed item's jingle, not the retail item's. Without an AP
+// session, the item an offline seed (PortRandomizer) placed at the location's
+// pickup counts. False: leave it.
+bool PickupJingle(uint32_t world, uint32_t area, uint32_t entity, std::string& out);
 // Records an owned pickup in the game's save, so the check reaches the server
 // on a later connection if this one cannot send it. Call before QueueCheck.
 void RecordPickup(uint32_t world, uint32_t area, uint32_t entity);
@@ -175,6 +184,10 @@ bool PickupScanText(uint32_t world, uint32_t area, uint32_t entity, std::string&
 // The Artifact Temple totem text for an artifact item type (29-40): where the
 // multiworld put it. False when AP is off or not connected.
 bool ArtifactHint(int itemType, std::string& out);
+// The player finished scanning an artifact's totem: asks the server to hint
+// where the artifact is when it is in this slot's own world. Reading the text
+// (ArtifactHint) never does: that runs when the room loads.
+void ArtifactScanned(int itemType);
 
 // A spawn point's Reset message replaced the whole inventory. Any received items
 // the game held are gone, so the next Poll rewinds the session and the server
@@ -236,6 +249,11 @@ bool DoorOps(uint32_t mrea, const uint8_t* scly, size_t size, std::vector< uint8
 // The doors of a map area whose icon the seed changes: editor id and the
 // door colour (0 blue, 1 shield, 2 ice, 3 wave, 4 plasma). False for none.
 bool MapDoors(uint32_t mapa, std::vector< std::pair< uint32_t, int > >& doors);
+// Whether door table index `door` of area `mrea` is a beam door with no blast
+// shield on it, as the seed (or the disc, with none) leaves it.
+bool BeamDoorUnlockable(uint32_t mrea, int door);
+// PortApWorld::LockedDoorStyle for this seed (the disc with none) and the broken shields.
+bool LockedDoorStyle(int door, PortApWorld::DoorStyle& style, std::vector< uint8_t >& vulnerability);
 
 // How many artifacts open the Artifact Temple: the seed's required_artifacts,
 // 12 otherwise.
@@ -251,6 +269,11 @@ bool VariaOnlyHeatProtection();
 // Progressive Bomb, has been received). -1 when no such seed is connected or
 // the seed has Spring Ball off, so the port's own setting applies.
 int SpringBallRule();
+
+// Whether an owned Charge Beam charges `beam` (a CPlayerState::EBeamId). On a seed with
+// progressive_beam_upgrades only the beams whose second upgrade has arrived
+// charge; anything else (AP off, slot_data not yet in, the Phazon Beam) is true.
+bool ChargeBeamRule(int beam);
 
 // The connected seed's pre_scan_elevators: 1 on, 0 off (or AP off), -1 while
 // the client is on but its slot_data has not arrived yet.

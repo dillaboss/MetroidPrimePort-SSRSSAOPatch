@@ -7,6 +7,7 @@
 // number would parse as something else or not at all.
 #include "port_console_physics.h"
 #include "port_json.h"
+#include "port_test.h"
 
 #include <cmath>
 #include <cstdio>
@@ -16,15 +17,6 @@
 #include <string>
 
 namespace {
-
-bool sPassed = true;
-
-void Check(bool condition, const char* message) {
-  if (!condition) {
-    std::fprintf(stderr, "[console-physics-tests] FAILED: %s\n", message);
-    sPassed = false;
-  }
-}
 
 bool Parse(const std::string& text, PortJson::Value& value) {
   size_t offset = 0;
@@ -38,25 +30,25 @@ void CheckFinite(float value, const char* what) {
   const std::string text = PortConsolePhysics::JsonNumber(value);
   char reference[32];
   std::snprintf(reference, sizeof(reference), "%.9g", static_cast< double >(value));
-  Check(text == reference, what);
-  Check(text.find("nan") == std::string::npos && text.find("inf") == std::string::npos,
-        "finite text holds no nan/inf");
+  CHECK_MSG(text == reference, what);
+  CHECK_MSG(text.find("nan") == std::string::npos && text.find("inf") == std::string::npos,
+            "finite text holds no nan/inf");
   char* end = nullptr;
   const float parsed = std::strtof(text.c_str(), &end);
-  Check(end != nullptr && *end == '\0' && parsed == value, "the text parses back to the float");
+  CHECK_MSG(end != nullptr && *end == '\0' && parsed == value, "the text parses back to the float");
   PortJson::Value json;
   // The reader holds a double, so the check narrows it back to the float: the text only
   // has to round-trip to the float, not to the decimal the float widens to.
-  Check(Parse(text, json) && json.IsNumber() &&
-            static_cast< float >(json.AsNumber()) == value,
-        "the strict JSON reader accepts it as that number");
+  CHECK_MSG(Parse(text, json) && json.IsNumber() &&
+                static_cast< float >(json.AsNumber()) == value,
+            "the strict JSON reader accepts it as that number");
 }
 
 void CheckNull(float value, const char* what) {
   const std::string text = PortConsolePhysics::JsonNumber(value);
-  Check(text == "null", what);
+  CHECK_MSG(text == "null", what);
   PortJson::Value json;
-  Check(Parse(text, json) && json.IsNull(), "null is JSON null to the strict reader");
+  CHECK_MSG(Parse(text, json) && json.IsNull(), "null is JSON null to the strict reader");
 }
 
 } // namespace
@@ -92,43 +84,43 @@ int main() {
   // velocity that went non-finite on one axis.
   PortJson::Value parsed;
   const std::string ground = JsonVector(99.2702255f, -48.1011543f, 5.04225063f);
-  Check(ground == "[99.2702255,-48.1011543,5.04225063]", "finite vector text");
-  Check(Parse(ground, parsed) && parsed.IsArray() && parsed.Size() == 3 &&
-            parsed.AsArray()[0].IsNumber() &&
-            static_cast< float >(parsed.AsArray()[0].AsNumber()) == 99.2702255f &&
-            parsed.AsArray()[2].IsNumber(),
-        "the finite vector parses as an array of 3 numbers");
+  CHECK_MSG(ground == "[99.2702255,-48.1011543,5.04225063]", "finite vector text");
+  CHECK_MSG(Parse(ground, parsed) && parsed.IsArray() && parsed.Size() == 3 &&
+                parsed.AsArray()[0].IsNumber() &&
+                static_cast< float >(parsed.AsArray()[0].AsNumber()) == 99.2702255f &&
+                parsed.AsArray()[2].IsNumber(),
+            "the finite vector parses as an array of 3 numbers");
 
   const std::string mixed = JsonVector(1.f, std::numeric_limits< float >::quiet_NaN(),
                                        std::numeric_limits< float >::infinity());
-  Check(mixed == "[1,null,null]", "NaN and Inf components in a vector are null");
-  Check(Parse(mixed, parsed) && parsed.IsArray() && parsed.Size() == 3 &&
-            parsed.AsArray()[0].IsNumber() && parsed.AsArray()[1].IsNull() &&
-            parsed.AsArray()[2].IsNull(),
-        "a mixed vector parses with the null members intact");
-  Check(Parse(JsonVector(std::numeric_limits< float >::quiet_NaN(),
-                         -std::numeric_limits< float >::infinity(),
-                         std::numeric_limits< float >::denorm_min()),
-              parsed) &&
-            parsed.IsArray() && parsed.AsArray()[0].IsNull() && parsed.AsArray()[1].IsNull() &&
-            parsed.AsArray()[2].IsNumber(),
-        "only the non-finite components are null");
+  CHECK_MSG(mixed == "[1,null,null]", "NaN and Inf components in a vector are null");
+  CHECK_MSG(Parse(mixed, parsed) && parsed.IsArray() && parsed.Size() == 3 &&
+                parsed.AsArray()[0].IsNumber() && parsed.AsArray()[1].IsNull() &&
+                parsed.AsArray()[2].IsNull(),
+            "a mixed vector parses with the null members intact");
+  CHECK_MSG(Parse(JsonVector(std::numeric_limits< float >::quiet_NaN(),
+                             -std::numeric_limits< float >::infinity(),
+                             std::numeric_limits< float >::denorm_min()),
+                  parsed) &&
+                parsed.IsArray() && parsed.AsArray()[0].IsNull() && parsed.AsArray()[1].IsNull() &&
+                parsed.AsArray()[2].IsNumber(),
+            "only the non-finite components are null");
 
   // No fixed aggregate buffer: the longest %.9g text (FLT_MAX is 14 characters) comes
   // back whole, and a whole object with a null component stays valid JSON.
-  Check(JsonNumber(std::numeric_limits< float >::max()).size() == std::strlen("3.40282347e+38"),
-        "a long float is not cut off");
+  CHECK_MSG(JsonNumber(std::numeric_limits< float >::max()).size() == std::strlen("3.40282347e+38"),
+            "a long float is not cut off");
   const std::string object = "{\"pos\":" + ground + ",\"vel\":" + mixed + "}";
   const bool objectParses =
       Parse(object, parsed) && parsed.IsObject() && parsed.Size() == 2;
   const PortJson::Value* posMember = objectParses ? parsed.Find("pos") : nullptr;
   const PortJson::Value* velMember = objectParses ? parsed.Find("vel") : nullptr;
-  Check(objectParses && posMember != nullptr && posMember->IsArray() &&
-            velMember != nullptr && velMember->IsArray() &&
-            velMember->AsArray()[1].IsNull(),
-        "a physics-like object with a null component parses as JSON");
+  CHECK_MSG(objectParses && posMember != nullptr && posMember->IsArray() &&
+                velMember != nullptr && velMember->IsArray() &&
+                velMember->AsArray()[1].IsNull(),
+            "a physics-like object with a null component parses as JSON");
 
-  std::printf(sPassed ? "[console-physics-tests] all checks passed\n"
+  std::printf(port_test::Failures() == 0 ? "[console-physics-tests] all checks passed\n"
                       : "[console-physics-tests] FAILURES\n");
-  return sPassed ? 0 : 1;
+  return PORT_TEST_RESULT();
 }

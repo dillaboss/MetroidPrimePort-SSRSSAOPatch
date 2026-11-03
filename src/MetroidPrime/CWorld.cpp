@@ -1,4 +1,8 @@
 #include "MetroidPrime/CWorld.hpp"
+#include "port_env.h"
+#ifdef TARGET_PC
+#include "port_room_geometry_handedness.h"
+#endif
 
 #include "MetroidPrime/CScriptLayerManager.hpp"
 
@@ -373,7 +377,7 @@ void CWorld::TravelToArea(const TAreaId& aid, CStateManager& mgr, EAreaTravelTyp
 
 #ifdef TARGET_PC
   // MP_LOG_DOORS: ticks the next area could not stream while others deallocated.
-  static const bool logAreas = std::getenv("MP_LOG_DOORS") != nullptr;
+  static const bool logAreas = port::EnvFlag("MP_LOG_DOORS");
   static int blockedTicks = 0;
   if (logAreas && otherLoadArea != nullptr) {
     if (toStreamCount != 0 || x70_25_loadPaused) {
@@ -722,7 +726,7 @@ void CWorld::PortKeepWorldSky() {
     return;
   }
   // MP_LOG_DOORS: how long the world sky took to load after it was (re)requested.
-  static const bool logSky = std::getenv("MP_LOG_DOORS") != nullptr;
+  static const bool logSky = port::EnvFlag("MP_LOG_DOORS");
   static std::chrono::steady_clock::time_point skyRequested;
   static bool modelBuilt = false;
   if (logSky && !x94_skyboxWorld->IsLocked()) {
@@ -793,6 +797,21 @@ void CWorld::DrawSky(const CTransform4f& xf) const {
       }
     }
   }
+  // Where retail draws the world's sky (and no script has swapped it), Remastered's world
+  // sky stands in for it: the master room's Skybox, which rooms with none of their own carry.
+  if (count == 0 && x70_27_skyboxVisible && !xb4_skyboxOverride) {
+    if (x68_curAreaId != kInvalidAreaId) {
+      const CGameArea* current = GetArea(x68_curAreaId);
+      if (current->IsPostConstructed() && (count = PortRoomGeo::Skies(*current, layers, true)) != 0) {
+        skyArea = current;
+      }
+    }
+    for (CGameArea::CConstChainIterator it = GetChainHead(kC_Alive); count == 0 && it != skGlobalEnd; ++it) {
+      if (it->DoesAreaNeedSkyNow() && (count = PortRoomGeo::Skies(*it, layers, true)) != 0) {
+        skyArea = &*it;
+      }
+    }
+  }
   if (count != 0) {
     PortRoomGeo::sSkyDrawnFor = skyArea->GetAreaAssetId();
     // Remastered draws a sky unlit, its base map times the Skybox's colour and intensity in
@@ -811,7 +830,9 @@ void CWorld::DrawSky(const CTransform4f& xf) const {
       const f32* radiance = layers[i].radiance;
       const bool lit = gain > 0.f && (radiance[0] > 0.f || radiance[1] > 0.f || radiance[2] > 0.f);
       const f32 skyGain[3] = {radiance[0] * gain, radiance[1] * gain, radiance[2] * gain};
-      gpRender->SetModelMatrix(xf * layers[i].orient);
+      const CTransform4f modelXf = xf * layers[i].orient;
+      const PortRoomGeometryHandedness::CullScope cull(PortRoomGeometryHandedness::Mirrored(modelXf));
+      gpRender->SetModelMatrix(modelXf);
       CCubeModel::PortSetSky(lit ? skyGain : nullptr);
       layers[i].model->Draw(CModelFlags::Normal().DepthCompareUpdate(true, false));
     }
@@ -936,6 +957,21 @@ TAreaId CWorld::GetAreaIdForSaveId(uint saveId) const {
 }
 
 void CWorld::SetLoadPauseState(bool paused) {
+#ifdef TARGET_PC
+  // Issue #170: retail resumes only the areas loading now. An area paused while
+  // loading that left the loading chain before the resume (its load withdrawn
+  // during a scan freeze, which keeps scripts and TravelToArea running) kept its
+  // pause, and every later load of it stalled at StartStreamIn: the door into it
+  // waited forever, until a pause screen paused and resumed it again. Resume
+  // every area.
+  if (!paused) {
+    for (int i = 0; i < x18_areas.size(); ++i) {
+      x18_areas[i]->SetLoadPauseState(false);
+    }
+    x70_25_loadPaused = false;
+    return;
+  }
+#endif
   for (CGameArea::CConstChainIterator it = GetChainHead(kC_Loading); skGlobalEnd != it; ++it) {
     const_cast< CGameArea& >(*it).SetLoadPauseState(paused);
   }

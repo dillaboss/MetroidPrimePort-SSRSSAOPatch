@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pipeline_cache.hpp"
+#include "resources.hpp"
 #include "types.hpp"
 #include "tex_copy_conv.hpp"
 #include "tex_palette_conv.hpp"
@@ -10,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -28,7 +30,8 @@ struct StagingHighWater {
 // A copy into a shared buffer's resident region (queue_resident_upload).
 struct BufferUpload {
   wgpu::Buffer src;
-  wgpu::Buffer dst;
+  // Which buffer is looked up when it is encoded, as a frame can grow it (grow_frame_buffer).
+  ResidentBuffer dst = ResidentBuffer::Vertex;
   uint64_t dstOffset = 0;
   uint64_t size = 0;
 };
@@ -200,6 +203,21 @@ struct FrameOp {
 
 using RenderPassList = std::deque<RenderPass>;
 
+// Where a frame's vertex, uniform, index or storage data goes once its staging buffer is full:
+// memory allocated at the first overflow (address-space only until written), laid out after
+// the staging part so offsets stay contiguous, and copied to the device buffer through a
+// transient buffer. The ByteBuffer then reads as full (size() == capacity()).
+struct SpillBuffer {
+  std::unique_ptr<uint8_t[]> data;
+  size_t capacity = 0;
+  size_t length = 0;
+};
+
+// Bytes a frame has written to a kind of buffer, staging and spill together.
+inline size_t logical_size(const ByteBuffer& staging, const SpillBuffer& spill) noexcept {
+  return staging.size() + spill.length;
+}
+
 struct FramePacket {
   RenderPassList renderPasses;
   std::deque<TextureCopy> textureCopies;
@@ -215,6 +233,10 @@ struct FramePacket {
   ByteBuffer indices;
   ByteBuffer storage;
   ByteBuffer textureUpload;
+  SpillBuffer spillVerts;
+  SpillBuffer spillUniforms;
+  SpillBuffer spillIndices;
+  SpillBuffer spillStorage;
   wgpu::CommandEncoder encoder;
   std::vector<AfterSubmitCallback> afterSubmitCallbacks;
   uint64_t frameId = 0;

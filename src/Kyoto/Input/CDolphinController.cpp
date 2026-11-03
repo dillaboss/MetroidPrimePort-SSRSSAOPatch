@@ -2,6 +2,7 @@
 #include "port_console.h"
 #include "port_debug.h"
 #include "port_freecam.h"
+#include "port_input_gate.h"
 #include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_keyboard.h>
 #include <SDL3/SDL_mouse.h>
@@ -20,6 +21,8 @@
 #include "port_input_map.h"
 #endif
 
+#include <algorithm>
+#include <cmath>
 #include <string.h>
 
 namespace {
@@ -124,6 +127,10 @@ void CDolphinController::ReadDevices() {
       status[i].err = error;
     }
   }
+  // Pad 0 reads neutral while the F1 overlay is open (zeroed above); on closing, whatever is still
+  // held (a menu key, a walk key, a stick or trigger) stays masked until released, so it fires nothing.
+  static PortInputGate::Gate< PADStatus > sPad0Gate;
+  sPad0Gate.Apply(PortDebug::Visible(), status[0]);
   memcpy(x4_status, status, sizeof(status));
 
   // Twin-stick: feed the right stick into the first-person aim and consume it,
@@ -140,10 +147,43 @@ void CDolphinController::ReadDevices() {
     if (keyboard.cStick) {
       PortDebug::SetTwinStickRightY(0.f);
     } else {
-      const float sx = static_cast< float >(x4_status[0].substickX) / 127.f;
-      const float sy = static_cast< float >(x4_status[0].substickY) / 127.f;
+      // PADClamp has cut the C-stick to the GameCube's octagonal gate: 59 on an
+      // axis and 31 on each axis at a diagonal. Map that gate back to the unit
+      // circle, so full tilt turns at the full stick aim speed in any direction.
+      const float cx = static_cast< float >(x4_status[0].substickX);
+      const float cy = static_cast< float >(x4_status[0].substickY);
+      float sx = 0.f;
+      float sy = 0.f;
+      if (cx != 0.f || cy != 0.f) {
+        constexpr float kGateMax = 59.f;
+        constexpr float kGateXY = 31.f;
+        const float major = std::max(std::fabs(cx), std::fabs(cy));
+        const float minor = std::min(std::fabs(cx), std::fabs(cy));
+        const float tilt =
+            std::min((kGateXY * major + (kGateMax - kGateXY) * minor) / (kGateXY * kGateMax), 1.f);
+        const float length = std::sqrt(cx * cx + cy * cy);
+        sx = cx / length * tilt;
+        sy = cy / length * tilt;
+      }
+      // Flick stick turns by the stick's angle, which PADClamp's dead zone per
+      // axis pulls onto the nearest axis (a snap every 90 degrees while
+      // circling): it reads the stick from before it. Its tilt runs from the
+      // inner deadzone to the outer one, so a pad that doesn't reach its edge
+      // still flicks.
+      const float rawLength = std::sqrt(devices.cStickX * devices.cStickX + devices.cStickY * devices.cStickY);
+      if (PortDebug::FlickStick() && (cx != 0.f || cy != 0.f) && rawLength > 0.f) {
+        const PADDeadZones* zones = PADGetDeadZones(0);
+        const float inner = zones != nullptr && zones->useDeadzones
+                                ? static_cast< float >(zones->substickDeadZone) / 32767.f
+                                : 0.f;
+        const float span = std::max(1.f - PortDebug::FlickOuterDeadZone() - inner, 0.05f);
+        const float scale = std::clamp((rawLength - inner) / span, 0.f, 1.f) / rawLength;
+        sx = devices.cStickX * scale;
+        sy = devices.cStickY * scale;
+      }
       PortDebug::AddStickAim(sx, sy, PortDebug::TickPeriod());
-      PortDebug::SetTwinStickRightY(sy);
+      // The spring ball's flick threshold was tuned on the clamped scale.
+      PortDebug::SetTwinStickRightY(cy / 127.f);
       x4_status[0].substickX = 0;
       x4_status[0].substickY = 0;
     }

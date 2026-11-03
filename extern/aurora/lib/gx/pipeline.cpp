@@ -1,6 +1,7 @@
 #include "pipeline.hpp"
 
 #include "../gfx/encoding.hpp"
+#include "../gfx/overdraw.hpp"
 #include "../gfx/resources.hpp"
 #include "../gfx/pipeline_cache.hpp"
 #include "../gfx/resource_cache.hpp"
@@ -18,17 +19,20 @@ namespace aurora::gx {
 
 wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   if (!pipeline_config_compatible(config, webgpu::g_lightmapBinding)) {
-    Log.error("Refusing GX pipeline with PBR lightmap attribute {}: lightmap binding is unsupported",
-              config.shaderConfig.pbrLightmapAttr);
+    Log.error("Refusing GX pipeline: shadow pass {} (shader shadow {}), PBR lightmap attribute {} (lightmap "
+              "binding {})",
+              config.shadowPass, static_cast<int>(config.shaderConfig.shadow), config.shaderConfig.pbrLightmapAttr,
+              webgpu::g_lightmapBinding);
     return {};
   }
 
   ZoneScoped;
-  const auto shader = build_shader(config.shaderConfig);
+  auto dstAlphaMode = dst_alpha_mode(config);
+  const auto shader = build_shader(config.shaderConfig, dstAlphaMode);
   const auto label =
       fmt::format("GX Pipeline {:x} shader {:x}", xxh3_hash(config, static_cast<HashType>(gfx::ShaderType::GX)),
                   xxh3_hash(config.shaderConfig));
-  return build_pipeline(config, {}, shader, label.c_str());
+  return build_pipeline(config, {}, shader, label.c_str(), dstAlphaMode);
 }
 
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
@@ -56,11 +60,13 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     const wgpu::Color color{0.f, 0.f, 0.f, data.dstAlpha / 255.f};
     pass.SetBlendConstant(&color);
   }
+  const uint32_t query = gfx::overdraw::draw_begin(data.pipeline, pass);
   if (data.indexCount == 0) {
     pass.Draw(data.vtxCount, data.instanceCount);
   } else {
     pass.DrawIndexed(data.indexCount, data.instanceCount);
   }
+  gfx::overdraw::draw_end(query, pass);
 }
 
 } // namespace aurora::gx

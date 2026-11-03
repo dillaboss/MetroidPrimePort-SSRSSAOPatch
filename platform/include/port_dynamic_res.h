@@ -2,7 +2,7 @@
 
 // Dynamic resolution: picks the EFB scale once a second so the frame rate holds
 // its target. Kept apart from the overlay so it can be tested on recorded or
-// made-up seconds (tests/port_dynamic_res.cpp); platform/debug_ui/options.inc
+// made-up seconds (tests/port_dynamic_res.cpp); platform/debug_ui/options.cpp
 // feeds it and applies what it returns.
 //
 // With the GPU's own time per frame (timestamp queries, Aurora's gpu_prof) it
@@ -28,6 +28,9 @@ struct Sample {
   // passes; when those are most of it, the span is not the GPU's busy time.
   double gpuPassMs = -1.0;
   double targetFps = 60.0;
+  // Pipelines were queued or building: their compiles stall the CPU (under GL they
+  // hold the one context the frame needs), so the frame rate says nothing about pixels.
+  bool compiling = false;
   float top = 1.f;        // the configured scale: the most it draws at
   float bottom = 1.f;     // the lowest scale allowed
 };
@@ -45,6 +48,7 @@ enum class Reason {
   RaiseFailed,  // a raise turned out too slow and was undone
   NoGain,       // a lowering gained nothing and was undone
   NoGpuTimes,   // GPU times never arrived, or proved wrong: following the frame rate
+  Compiling,    // following the frame rate while pipelines compile: held
 };
 const char* ReasonText(Reason reason);
 

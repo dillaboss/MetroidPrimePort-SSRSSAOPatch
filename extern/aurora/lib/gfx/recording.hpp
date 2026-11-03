@@ -70,7 +70,7 @@ RenderTargetLayout get_render_target_layout() noexcept;
 // allocated (webgpu::ensure_scene_hdr_target).
 // Debug/test plumbing only: GX pipelines, EFB copies, pass snapshots, post passes and present still
 // assume the display format, so no game draw, copy or snapshot may run while it is on (stage 2).
-bool set_scene_hdr(bool on);
+bool set_scene_hdr(bool on, bool pause = false);
 bool scene_hdr_active() noexcept;
 // Whether the pass being recorded is the HDR scene's own (scene_hdr_active, and not offscreen or a
 // begin_color_pass pass on another target): what GX and VFX pipelines take their colour format from.
@@ -162,9 +162,26 @@ struct ResolveHdr {
 };
 // In an HDR scene pass the copy is HdrDisplay (hdr, or no tone data: the plain sRGB encode) or
 // Linear (hdr->linear), and clearColorValue, a display colour, clears the scene as hdr::exposed of it.
+// opaqueAlpha: the source has no alpha (an RGB8 EFB), so a converted copy reads it as 1.
 void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
                        Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat = GX_TF_RGBA8,
-                       int probeFace = -1, bool resolveMips = false, const ResolveHdr* hdr = nullptr);
+                       int probeFace = -1, bool resolveMips = false, const ResolveHdr* hdr = nullptr,
+                       bool opaqueAlpha = false);
+// The scene copy point (vfx::capture_scene): one break of the EFB pass that resolves its colour into
+// color (the whole target, scaled to color's size, its mips built; hdr as for resolve_pass_into) and,
+// where the device can, snapshots its raw depth (R32Float, this frame slot's pool) into depth. The
+// EFB continues on a pass that loads both. False, with nothing recorded, outside an on-screen EFB pass.
+bool resolve_scene_copy(TextureHandle color, const ResolveHdr* hdr, wgpu::TextureView& depth);
+// The visor copy (vfx::begin_visor_effects): one break of the on-screen display EFB pass (not the
+// HDR scene pass) that resolves its colour, sRGB-decoded, into the RGBA16F color, scaled to its size.
+bool resolve_display_linear_copy(TextureHandle color);
+namespace vfx {
+// This frame's scene copy (capture_scene) of the target being drawn, when it was taken in the scene
+// pass of the same kind (hdr); else null.
+wgpu::TextureView scene_copy_view(bool hdr) noexcept;
+} // namespace vfx
+// The frame slot being recorded: its pool entries stay alive until the render worker has encoded it.
+size_t current_frame_slot() noexcept;
 uint32_t align_uniform(uint32_t value);
 Vec2<uint32_t> get_render_target_size() noexcept;
 void set_viewport(const Viewport& viewport) noexcept;

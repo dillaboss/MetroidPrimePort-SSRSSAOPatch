@@ -25,8 +25,6 @@
 #define SAL_SAMPLES_PER_SUBFRAME (SAL_SAMPLES_PER_FRAME / SAL_SUBFRAMES)
 #define SAL_STEREO_SAMPLES (SAL_SAMPLES_PER_FRAME * 2)
 #define SAL_BUFFER_BYTES (SAL_STEREO_SAMPLES * sizeof(s16))
-#define SAL_PREFILL_FRAMES 8
-#define SAL_MAX_QUEUED_FRAMES 12
 #define SRC_STAGING_SIZE 256
 #define POLYPHASE_PHASES 128
 #define POLYPHASE_TAPS 4
@@ -61,6 +59,12 @@ static int salStatsPeak;
 // engine's timing is unchanged; only the pushed output is silenced.
 static SDL_AtomicInt salMuted;
 void salSetMuted(int muted) { SDL_SetAtomicInt(&salMuted, muted != 0); }
+
+// The port's volume boost (F1 > Game > Audio above 100 percent, `music_boost`/`sfx_boost`): a
+// linear factor on the decoded voice, 1.0 for the game's own maximum. The mix thread reads it once
+// per voice, so a change lands between voices; a plain float is enough for that.
+static float salVolumeBoostMusic = 1.0f;
+static float salVolumeBoostSfx = 1.0f;
 
 static SND_SOME_CALLBACK userCallback = NULL;
 
@@ -122,7 +126,19 @@ void MusyxPortSetSampleMuted(unsigned smpId, int muted) {
   }
 }
 
-void MusyxPortClearSampleMutes(void) { sMutedSampleCount = 0; }
+// Also drops MP_MUTE_SMP's ids for good: marking the list initialised keeps a later
+// lookup from reading them back in.
+void MusyxPortClearSampleMutes(void) {
+  sMuteListInitialized = 1;
+  sMutedSampleCount = 0;
+}
+
+// The port's two volume boosts: sequenced music voices and the sound effects voices. 1.0 is no
+// boost, so the default mix stays exactly the game's.
+void MusyxPortSetVolumeBoost(float music, float sfx) {
+  salVolumeBoostMusic = music > 0.0f ? music : 1.0f;
+  salVolumeBoostSfx = sfx > 0.0f ? sfx : 1.0f;
+}
 
 int MusyxPortGetMutedSamples(unsigned* out, int maxIds) {
   salInitMuteList();
@@ -416,8 +432,9 @@ static int decodeSourceSamples(DSPvoice* vp, u32 voiceIdx, s32* out, int maxSamp
 
   for (; count < maxSamples; ++count) {
     if (state->srcPosHi >= end) {
-      if (smp->loopLength > 0 && smp->loop < end && smp->loopLength <= end - smp->loop) {
-        state->srcPosHi = smp->loop + ((state->srcPosHi - end) % smp->loopLength);
+      if (smp->loopLength > 0 && smp->loop < end && end - smp->loop <= smp->loopLength &&
+          smp->loopLength <= end - smp->loop + 1) {
+        state->srcPosHi = smp->loop + ((state->srcPosHi - end) % (end - smp->loop));
         resetVoiceLoopState(smp, voiceIdx);
       } else {
         *hitEnd = 1;
@@ -588,6 +605,24 @@ static int renderVoiceSegment(DSPvoice* vp, s32* mainL, s32* mainR, s32* mainS, 
     filterState[voiceIdx] = yn;
   }
 #endif
+
+  /* The port's volume boost above the game's own maximum: scale this voice, music (a voice the
+   * sequencer allocated, fxFlag clear: synth.c picks the music fader the same way) or a sound
+   * effect, and saturate to the decode buffer's 16-bit range. The hardware voice is the synth
+   * voice of the same index. No boost means no multiply at all, so the default output stays
+   * bit-identical. */
+  {
+    const int music = synthVoice != NULL && voiceIdx < synthInfo.voiceNum &&
+                      synthVoice[voiceIdx].fxFlag == 0;
+    const float boost = music ? salVolumeBoostMusic : salVolumeBoostSfx;
+    if (boost != 1.0f) {
+      for (int i = 0; i < nSamples; ++i) {
+        const float scaled = (float)voiceDecodeBuf[i] * boost;
+        voiceDecodeBuf[i] =
+            scaled >= 32767.0f ? 32767 : scaled <= -32768.0f ? -32768 : (s32)scaled;
+      }
+    }
+  }
 
   mixRampChannel(mainL ? mainL + frameOffset : NULL, voiceDecodeBuf, nSamples,
                  (s16)vp->lastVolL + dVolL * frameOffset, dVolL, (s16)adsrStart, adsrDelta);
@@ -963,53 +998,57 @@ void salCtrlDsp(s16* dest) {
   }
 }
 
+// Render one 5 ms frame and, with a device, queue it.
+static void salRenderFrame(SDL_AudioStream* stream, int queuedBytes) {
+  if (userCallback) {
+    userCallback();
+  }
+
+  s16* buf = salOutputBuffers[salOutputIndex];
+  if (salTraceAudio) {
+    ++salStatsFrames;
+    for (int i = 0; i < SAL_STEREO_SAMPLES; ++i) {
+      const int magnitude = abs((int)buf[i]);
+      if (magnitude > salStatsPeak) salStatsPeak = magnitude;
+      if (magnitude >= 32767) ++salStatsClipped;
+    }
+    const u64 now = SDL_GetTicksNS();
+    if (now - salStatsStart >= 1000000000ull) {
+      const double seconds = (double)(now - salStatsStart) / 1000000000.0;
+      fprintf(stderr, "[musyx] rate=%.0f samples/s queued=%.1f ms peak=%d clipped=%.3f%%\n",
+              salStatsFrames * SAL_SAMPLES_PER_FRAME / seconds,
+              queuedBytes > 0 ? queuedBytes * 1000.0 / (32000 * 4) : 0.0,
+              salStatsPeak, 100.0 * salStatsClipped / (salStatsFrames * SAL_STEREO_SAMPLES));
+      salStatsStart = now;
+      salStatsFrames = salStatsClipped = 0;
+      salStatsPeak = 0;
+    }
+  }
+  if (stream != NULL) {
+    if (SDL_GetAtomicInt(&salMuted)) {
+      memset(buf, 0, SAL_BUFFER_BYTES);
+    }
+    SDL_PutAudioStreamData(stream, buf, SAL_BUFFER_BYTES);
+  }
+}
+
+// The device pulls: render only what it asks for, so a new sound waits one device period rather
+// than a producer-side queue (that queue held up to 60 ms and made rapid fire audibly late).
+static void SDLCALL salStreamCallback(void* userdata, SDL_AudioStream* stream, int additional,
+                                      int total) {
+  (void)userdata;
+  (void)total;
+  for (int left = additional; left > 0; left -= SAL_BUFFER_BYTES) {
+    salRenderFrame(stream, salTraceAudio ? SDL_GetAudioStreamQueued(stream) : 0);
+  }
+}
+
+// Without a device, keep the synth running in real time.
 static int salAudioThreadFunc(void* data) {
   (void)data;
-  SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH);
   while (SDL_GetAtomicInt(&salAudioThreadRunning)) {
-    const int queuedBytes = salAudioStream != NULL ? SDL_GetAudioStreamQueued(salAudioStream) : 0;
-    if (salAudioStream != NULL && queuedBytes >= SAL_BUFFER_BYTES * SAL_MAX_QUEUED_FRAMES) {
-      /* Full: the device takes a frame (160 samples at 32 kHz, 5 ms) at a time, so wait
-       * most of one rather than waking every millisecond to look. The queue still holds
-       * the other frames' worth, far more than this wait. */
-      SDL_Delay(4);
-      continue;
-    }
-
-    if (userCallback) {
-      userCallback();
-    }
-
-    /* Push rendered buffer to SDL audio stream */
-    s16* buf = salOutputBuffers[salOutputIndex];
-    if (salTraceAudio) {
-      ++salStatsFrames;
-      for (int i = 0; i < SAL_STEREO_SAMPLES; ++i) {
-        const int magnitude = abs((int)buf[i]);
-        if (magnitude > salStatsPeak) salStatsPeak = magnitude;
-        if (magnitude >= 32767) ++salStatsClipped;
-      }
-      const u64 now = SDL_GetTicksNS();
-      if (now - salStatsStart >= 1000000000ull) {
-        const double seconds = (double)(now - salStatsStart) / 1000000000.0;
-        fprintf(stderr, "[musyx] rate=%.0f samples/s queued=%.1f ms peak=%d clipped=%.3f%%\n",
-                salStatsFrames * SAL_SAMPLES_PER_FRAME / seconds,
-                queuedBytes > 0 ? queuedBytes * 1000.0 / (32000 * 4) : 0.0,
-                salStatsPeak, 100.0 * salStatsClipped / (salStatsFrames * SAL_STEREO_SAMPLES));
-        salStatsStart = now;
-        salStatsFrames = salStatsClipped = 0;
-        salStatsPeak = 0;
-      }
-    }
-    if (salAudioStream) {
-      if (SDL_GetAtomicInt(&salMuted)) {
-        memset(buf, 0, SAL_BUFFER_BYTES);
-      }
-      SDL_PutAudioStreamData(salAudioStream, buf, SAL_BUFFER_BYTES);
-    }
-
-    if (salAudioStream == NULL || queuedBytes < 0)
-      SDL_Delay(5); // one 160-sample frame at 32 kHz in silent/device-loss mode
+    salRenderFrame(NULL, 0);
+    SDL_Delay(5); // one 160-sample frame at 32 kHz
   }
   return 0;
 }
@@ -1039,7 +1078,8 @@ bool salInitAi(SND_SOME_CALLBACK callback, u32 flags, u32* outFreq) {
       .freq = *outFreq,
   };
   if (salAudioSubsystemInitialized) {
-    salAudioStream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    salAudioStream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec,
+                                               salStreamCallback, NULL);
   }
   if (salAudioStream == NULL) {
     fprintf(stderr, "MusyX: audio device unavailable, running silently: %s\n", SDL_GetError());
@@ -1051,12 +1091,8 @@ bool salInitAi(SND_SOME_CALLBACK callback, u32 flags, u32* outFreq) {
 }
 
 bool salStartAi() {
-  for (u32 i = 0; i < SAL_PREFILL_FRAMES; ++i) {
-    if (userCallback)
-      userCallback();
-    if (salAudioStream != NULL)
-      SDL_PutAudioStreamData(salAudioStream, salOutputBuffers[salOutputIndex], SAL_BUFFER_BYTES);
-  }
+  if (salAudioStream != NULL)
+    return SDL_ResumeAudioStreamDevice(salAudioStream);
 
   SDL_SetAtomicInt(&salAudioThreadRunning, 1);
   salAudioThread = SDL_CreateThread(salAudioThreadFunc, "MusyX Audio", NULL);
@@ -1064,20 +1100,18 @@ bool salStartAi() {
     SDL_SetAtomicInt(&salAudioThreadRunning, 0);
     return false;
   }
-  if (salAudioStream != NULL)
-    SDL_ResumeAudioStreamDevice(salAudioStream);
   return true;
 }
 
 bool salExitAi() {
+  if (salAudioStream) {
+    SDL_DestroyAudioStream(salAudioStream);
+    salAudioStream = NULL;
+  }
   if (salAudioThread) {
     SDL_SetAtomicInt(&salAudioThreadRunning, 0);
     SDL_WaitThread(salAudioThread, NULL);
     salAudioThread = NULL;
-  }
-  if (salAudioStream) {
-    SDL_DestroyAudioStream(salAudioStream);
-    salAudioStream = NULL;
   }
   if (salAudioSubsystemInitialized) {
     SDL_QuitSubSystem(SDL_INIT_AUDIO);

@@ -313,6 +313,11 @@ public:
   static void SetClearColor(const CColor& color);
   static void SetDepthRange(float near, float far);
   static void FlushProjection();
+#ifdef TARGET_PC
+  // Port: reload the projection with Remastered's particle depth bias (PortParticleMath::DepthBiasedProjM22);
+  // bias 0 reloads it unbiased.
+  static void PortSetProjectionDepthBias(float bias, float depth, float rangeSpan);
+#endif
   static void SetDefaultVtxAttrFmt();
   static CMatrix4f GetPerspectiveProjectionMatrix();
   static CMatrix4f CalculatePerspectiveMatrix(float fovy, float aspect, float znear, float zfar);
@@ -323,7 +328,7 @@ public:
                                       void* data, GXTexMapID texId);
   // Advances the animation clock by simulation ticks (not rendered frames), so
   // animations stay real-time when the frame rate is uncapped.
-  static void TickRenderTimings(uint ticks = 1);
+  static void TickRenderTimings(uint ticks = 1, float tickSeconds = 1.f / 60.f);
   // Port: Remastered's scene simulation clock (CScene::GetModularSimulationTime). It advances with
   // the game's updates only (it stands still on the pause screen) and wraps at 15120 s.
   static void TickSimTime(float dt);
@@ -347,6 +352,8 @@ public:
   static const GXRenderModeObj& GetRenderMode() { return mRenderModeObj; }
   // Port: resize the internal framebuffer and viewport (dynamic aspect ratio).
   static void PortResizeFrameBuffer(u16 fbWidth);
+  // Port: re-send the copy clear colour and depth, after something else (the GPU self-test) set its own.
+  static void PortResendCopyClear();
   static float GetDepthNear() { return mDepthNear; }
   static float GetDepthFar() { return mDepthFar; }
 
@@ -399,6 +406,11 @@ public:
   static void DisableAllLights();
 
   static void SetAmbientColor(const CColor&);
+#ifdef TARGET_PC
+  // The last ambient colour the game set (GX channel 0's), which is the port's analogue of Remastered's
+  // AMBS (the flat ambient light colour a clustered-lit particle material adds to its probes and lights).
+  static CColor GetAmbientColor();
+#endif
   static void SetFog(ERglFogMode mode, float startz, float endz, const CColor& color);
 
   static void SetModelMatrix(const CTransform4f& xf);
@@ -408,6 +420,9 @@ public:
   static void SetBlendMode(ERglBlendMode mode, ERglBlendFactor src, ERglBlendFactor dst,
                            ERglLogicOp op);
   static void SetCullMode(ERglCullMode cullMode);
+#ifdef TARGET_PC
+  static ERglCullMode GetCullMode() { return mCullMode; }
+#endif
   static void SetTevStates(uchar);
 
   static void SetUseVideoFilter(const bool b);

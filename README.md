@@ -1,10 +1,21 @@
-# Metroid Prime — native port
+# Metroid Prime Unbound - native port
 
-A native build of **Metroid Prime** for Linux, Windows and Android (plus an
-experimental, untested-on-hardware macOS build), compiled
+> **Disclaimer:** this is an independent project, not affiliated with or endorsed
+> by [PrimeDecomp](https://github.com/PrimeDecomp/prime). It builds on their
+> decompilation, but they don't maintain or support this port: please report
+> problems here, not to them.
+
+**Looking for the sequel? See the [Metroid Prime 2: Echoes native port](https://github.com/Odrannnn/MetroidPrime2Port).**
+
+**Make sure to check out the F1 (Or start+back on controller) menu for all the additional features and QoL!**
+
+**You can load prime remastered models and textures in the game (check F1 > mods), you must provide your
+personal Metroid Prime Remastered dumped image, no assets are provided in this repo**
+
+A native build of **Metroid Prime** for Linux, Windows, Android, macOS and iPhone/iPad, compiled
 from the [PrimeDecomp](https://github.com/PrimeDecomp/prime) decompilation and
 rendered through Aurora (SDL3/WebGPU). There's no emulator involved. Supported
-discs: USA 1.00, 1.01 and 1.02, and PAL.
+discs: USA 1.00, 1.01 and 1.02, PAL and Trilogy, both USA and PAL.
 
 **No game content is included.** You need your own copy of the game: the port
 reads it from a disc image and never ships any of its assets. This repository
@@ -12,29 +23,36 @@ ships no disc image, and neither does any package or release built from it.
 
 ## What it adds over the console release
 
-- **Remastered assets:** — (Experimental) import models and effects from your own Metroid Prime
+- **Modern controls:** Mouse & Keyboard, Dual stick camera, Gyro controls, Native touch controls for mobile!
+- **Remastered assets:**  (Experimental) import models, effects and lighting from your own Metroid Prime
   Remastered dump (F1 > Remastered)
+- **Metroid Prime Trilogy:** run Trilogy's Metroid Prime from a Wii disc, with Trilogy's HUD,
+  scan visor and radial beam and visor menus
+- **Metroid Dread Samus:** import Samus's suits from your own Metroid Dread dump, first-person
+  arm cannon included
+- **Third-person camera** with an aiming cannon arm, and **suit colour customisation**
 - **Widescreen:** with an edge-to-edge HUD, and **uncapped frame rate**
-- **Graphics:** FOV, MSAA, anisotropic filtering, HUD scale, arm cannon offset,
-  and toggles to hide the helmet and visor effects
-- **Controls:** mouse and twin-stick aim, gyro, full rebinding and presets
-- **Optional tweaks:** Fast Morph, Spring Ball, Toggle
-  Lock-On, Sticky Charge...
+- **Graphics:** FOV, MSAA, anisotropic filtering, resolution scale and dynamic
+  resolution, HUD scale, arm cannon offset, toggles to hide the helmet and visor
+  effects, and a choice of renderer, OpenGL included
+- **Controls:** mouse and twin-stick aim, gyro, lock-on free aim, full rebinding
+  and presets, separate Morph Ball binds
+- **Optional tweaks:** Fast Morph, Spring Ball, Toggle Lock-On, Sticky Charge... And so many more!
 - **Skippable cutscenes**
 - **Save states** and **quick resume** after quitting
 - **Saves:** import from and export to USA/PAL GameCube, Wii Trilogy and Dolphin
 - **Photo mode** with free-cam and high-resolution capture
 - **Map and tracker:** reveal the map, plus item, scan and room tracking
 - **Dolphin texture packs**, including HD texture replacements
-- **Discord Rich Presence** on desktop, and a **touch overlay** on Android
-- The **F1 overlay** has every setting, with search; the common ones are also in
-  pause > Options
+- **Mods:** drop-in mod folders that replace disc data, plus [community mods](docs/MODS.md)
+- **Discord Rich Presence** on desktop, and a **touch overlay** with a layout editor on Android and iOS
+- The **F1 overlay** has every setting
 - And more..!
 
 ## Randomizer and Archipelago Multiworld
 
-- **Randomizer** — Generate your own randomizer games
-- **Archipelago multiworld** — Generate a game in archipelago with the [Metroid Prime APWorld](https://github.com/UltiNaruto/MetroidAPrime) and host it. Open F1 > Archipelago, enter the server (`host:port`), your
+- **Randomizer** - Generate your own randomizer games
+- **Archipelago multiworld** - Generate a game in archipelago with the [Metroid Prime APWorld](https://github.com/UltiNaruto/MetroidAPrime) and host it. Open F1 > Archipelago, enter the server (`host:port`), your
   slot name and the password if any, and connect; no seed file is needed. Each seed and slot gets its own separate save, checks made
   offline are sent on the next connect, chat with command support, DeathLink.
   
@@ -44,44 +62,21 @@ Releases are published on the
 [GitHub releases page](https://github.com/Odrannnn/MetroidPrimePort/releases).
 Every build needs your own disc image; none of them contains one.
 
-**Quick start:** download the build for your platform (Windows zip, Linux
-AppImage or tarball, Android APK), start it, and pick your disc image when it
-asks. It remembers the choice. Supported discs are the GameCube USA 1.00, 1.01
-and 1.02 (`GM8E01`) and PAL (`GM8P01`) releases, as `.iso`, `.gcm`, `.rvz`,
-`.wbfs`, `.ciso` or `.nkit`. The Japanese and Korean releases, the Wii Trilogy and
-Remastered are not run as the base game. Press **F1** for every setting.
+**Quick start:** download the build for your platform, start it, and pick your disc image when it
+asks. Supported discs are the GameCube USA 1.00, 1.01
+and 1.02 (`GM8E01`), PAL (`GM8P01`) and Trilogy (USA `R3ME01` and PAL `R3MP01`), as `.iso`, `.gcm`,
+`.rvz`, `.wbfs`, `.ciso` or `.nkit`. 
+
+Press **F1** for every setting.
 
 ## Building
 
-Needs CMake 3.25+, Ninja and a C++20 toolchain. Aurora and MusyX are vendored, so
-a normal clone is enough; Aurora fetches its pinned dependencies on the first
-configure.
-
-```sh
-cmake -S . -B build/native -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DAURORA_ENABLE_TESTS=OFF -DMP_BUILD_TESTS=ON
-cmake --build build/native -j 4
-ctest --test-dir build/native -L port --output-on-failure
-```
-
-On Windows, run from an MSVC developer shell and add
-`-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl`. CI builds and tests
-Linux (GCC 14 and Clang 18) on each push to `port` and each pull request; Windows (clang-cl) and macOS (arm64,
-experimental) run weekly and can be started by hand from the Actions tab. See `.github/workflows/`.
-CI configures with `-DAURORA_ENABLE_TESTS=ON`, which adds Aurora's GPU-free
-FIFO/GX tests; turn it on to run the same suite locally.
-
-Configure downloads about a dozen pinned dependencies (checked by SHA-256). On
-a machine without access to GitHub, clone them yourself and point CMake at the
-copies with `-DFETCHCONTENT_SOURCE_DIR_<NAME>=<dir>`, the way
-`flatpak/io.github.odrannnn.metroidprimeport.yml` does.
-
-### Android
-
-```sh
-tools/make_android_keystore.sh          # once; writes android/keystore.properties
-tools/android_apk.sh :app:assembleRelease
-```
+CMake 3.25+, Ninja and a C++20 toolchain; a normal clone is enough. The
+requirements, the configure, build and test commands for Linux, Windows and
+macOS, the CMake options and what CI runs are in
+[`docs/NATIVE_PORT.md`](docs/NATIVE_PORT.md#build); the Android build is in
+[`docs/ANDROID.md`](docs/ANDROID.md). Before changing the game code, read
+[where port code goes](docs/NATIVE_PORT.md#where-port-code-goes).
 
 ## Running
 
@@ -93,29 +88,63 @@ tools/android_apk.sh :app:assembleRelease
 
 - **Where are the logs?** `metroid_prime_port.log` in the user folder (F1 >
   System shows its path); the previous run's is `metroid_prime_port.old.log`. On
-  Android a copy goes to `Documents/MetroidPrime/`. Attach it to a bug report.
+  Android a copy goes to `Documents/MetroidPrime/`; on iOS it is in Files > On
+  My iPhone (or iPad) > Metroid Prime. Attach it to a bug report.
 - **"unsupported disc"**: the image is not one of the revisions above (see the
   log for the disc id it found). Re-dump it, or check you picked the GameCube disc.
-- **Stuck at startup on a GNOME Wayland session**: run with
-  `SDL_VIDEODRIVER=x11`. The port does this itself when `DISPLAY` is set; see
-  `docs/NATIVE_PORT.md`.
 - **Settings in a bad state**: F1 > System > Settings > **Reset configuration...**
   backs up and resets every setting and mapping; saves are not touched.
 
-## Packaging
+## Credits
 
-`tools/make_appimage.sh` builds a self-contained AppImage and
-`tools/make_flatpak.sh` a Flatpak. Neither bundles the disc. See
-`docs/NATIVE_PORT.md` for what each one expects from the host.
+This port would not exist without the work of these projects. Thank you.
 
-## Credits and licensing
+**Foundation**
 
-This is a fork of the [PrimeDecomp/prime](https://github.com/PrimeDecomp/prime)
-decompilation, which the game logic is built from. Aurora (`extern/aurora`) and
-MusyX (`extern/musyx`) are MIT-licensed vendored snapshots, and the button
-prompt icons come from Kenney's Input Prompts pack (CC0), vendored under
-`tools/prompt_icons`. Their licences are kept alongside them and are copied into
-release packages.
+- [PrimeDecomp](https://github.com/PrimeDecomp/prime): the decompilation the game
+  code is built from, and the decompiled Dolphin SDK.
+- [Aurora](https://github.com/encounter/aurora): the GameCube graphics, input and
+  platform layer over SDL3 and WebGPU.
+- [MusyX](https://github.com/AxioDL/musyx): the audio mixer.
+- [nod](https://github.com/encounter/nod): the disc image reader.
+
+**Randomizer and Archipelago**
+
+- [randomprime](https://github.com/aprilwade/randomprime): the room patches for
+  skippable cutscenes and Archipelago pickups, the room and elevator tables, and
+  the custom pickup and door assets are generated from it.
+- The [Metroid Prime APWorld](https://github.com/UltiNaruto/MetroidAPrime): the
+  door table, and the game this client connects to.
+- The Metroid Prime AP PopTracker pack: the Archipelago logic rules.
+- [Archipelago](https://archipelago.gg): the multiworld itself.
+
+**Remastered import**
+
+- [astc-encoder](https://github.com/ARM-software/astc-encoder): the ASTC texture encoder.
+- tegra_swizzle, bcdec_rs and astc-decode, ported to C++ for the texture importer.
+
+**Platform and input**
+
+- [libadrenotools](https://github.com/bylaws/libadrenotools): custom Vulkan drivers on Android.
+- [GamepadMotionHelpers](https://github.com/JibbSmart/GamepadMotionHelpers): gyro
+  calibration and aiming spaces.
+- [Kenney Input Prompts](https://kenney.nl/assets/input-prompts) (CC0): the
+  controller button icons.
+- [Dolphin](https://dolphin-emu.org): the texture pack and save formats the port reads and writes.
+
+**Libraries**
+
+[SDL3](https://libsdl.org), [Dawn](https://dawn.googlesource.com/dawn),
+[Dear ImGui](https://github.com/ocornut/imgui), [RmlUi](https://github.com/mikke89/RmlUi),
+[fmt](https://github.com/fmtlib/fmt), [Abseil](https://abseil.io), [FreeType](https://freetype.org),
+libpng, zlib-ng, [zstd](https://github.com/facebook/zstd), [xxHash](https://github.com/Cyan4973/xxHash),
+[SQLite](https://sqlite.org) and OpenSSL.
+
+## Licensing
+
+Every third-party component keeps its own licence; the full list, with where each
+licence text lives, is in [`NOTICE`](NOTICE), and the texts are copied into every
+release package.
 
 `LICENSE` covers this project's own work — the platform layer, the build and
 packaging scripts, and the Android and Flatpak integration. It does **not** cover
@@ -132,15 +161,19 @@ Nintendo and Retro Studios, and ships no game data.
 | `docs/SETTINGS.md` | Every control, setting and environment variable |
 | `docs/NATIVE_PORT.md` | The detailed reference: build options, smoke-test hooks, platform notes |
 | `docs/MODS.md` | HD texture packs and the mods folder |
+| `docs/MOD_FORMATS.md` | Mod file formats, for mod authors |
+| `docs/DREAD_SAMUS.md` | The Metroid Dread Samus model import |
 | `docs/RANDOMIZER.md` | The built-in randomizer |
 | `docs/ARCHIPELAGO.md` | The Archipelago multiworld client |
 | `docs/CONSOLE.md` | The debug console (`MP_CONSOLE`) |
 | `docs/DEBUGGING.md` | Headless debugging with `tools/mprig.py` |
+| `tools/README.md` | What each script in `tools/` does and what runs it |
 | `docs/RELEASING.md` | What a release contains and must carry |
-| `docs/ANDROID_BUILD_PROBE.md` | The Android port's status and build |
+| `docs/ANDROID.md` | The Android port's status and build |
+| `docs/IOS.md` | The experimental iPhone/iPad build: sideloading, the disc, where files are |
 | `docs/REMASTERED_EFFECTS.md` | Importing Remastered particle effects |
 | `docs/FRAME_INTERPOLATION.md`, `docs/HIGH_FPS_AUDIT.md` | High frame rate design notes |
-| `docs/decomp/` | Notes inherited from the decompilation project |
+| `decomp/` | The original decompilation's GameCube build and notes (not used by the port) |
 | `PORT_NOTES.md` | Open follow-ups and non-obvious facts |
 
 ## AI assistance

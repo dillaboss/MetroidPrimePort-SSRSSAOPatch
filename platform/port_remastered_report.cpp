@@ -35,24 +35,13 @@ std::string Join(const std::vector<std::string>& items) {
   return out;
 }
 
-std::vector<std::string> Split(const std::string& line, char sep) {
-  std::vector<std::string> out;
-  size_t start = 0;
-  for (;;) {
-    const size_t at = line.find(sep, start);
-    if (at == std::string::npos) {
-      out.push_back(line.substr(start));
-      return out;
-    }
-    out.push_back(line.substr(start, at - start));
-    start = at + 1;
-  }
-}
+using port::Split;
 
 const char* const kMaterialColumns[] = {"cmdl",   "mat",      "source",    "srcmat",   "shader",  "role",
                                         "flags",  "tag",      "kind",      "mode",     "path",    "pathReason",
                                         "kindReason", "emissive", "backlight", "strength", "p0",   "p1",
-                                        "p2",     "p3",       "cube",     "retail"};
+                                        "p2",     "p3",       "cube",     "retail",  "class",  "blend",
+                                        "classBlend", "uv"};
 const char* const kEffectColumns[] = {"genp",    "retail",  "result",  "method",      "reason",
                                       "kinds",   "dropped", "droppedList", "approximated"};
 
@@ -103,7 +92,9 @@ std::string FormatMaterialRow(const MaterialDecision& r) {
                                       Num(r.backlight),   Num(r.strength),
                                       Num(r.p[0]),        Num(r.p[1]),
                                       Num(r.p[2]),        Num(r.p[3]),
-                                      Clean(r.cube),      Clean(r.retail)};
+                                      Clean(r.cube),      Clean(r.retail),
+                                      Clean(r.meshClass), Clean(r.blend),
+                                      Clean(r.classBlend), Clean(r.uv)};
   std::string out;
   for (size_t i = 0; i < f.size(); ++i) {
     out += (i ? "\t" : "") + f[i];

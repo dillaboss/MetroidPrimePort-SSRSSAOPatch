@@ -1,10 +1,13 @@
 #include "Kyoto/Particles/CParticleGlobals.hpp"
 
 #ifdef TARGET_PC
+#include "Kyoto/Graphics/CGraphics.hpp"
 #include "Kyoto/Particles/CPortParticleVars.hpp"
 #include "Kyoto/Streams/CInputStream.hpp"
 
 const CPortVarMemory* CPortVarGlobals::sCurrent = nullptr;
+SPortKeep* CPortKeepGlobals::sCurrent = nullptr;
+std::vector< const CREPortKeep* >* CPortKeepGlobals::sCollect = nullptr;
 
 CPortVarTable* PortReadVarTable(CInputStream& in) {
   const u32 count = in.ReadLong();
@@ -43,6 +46,57 @@ CParticleGlobals::SParticleSystem* CParticleGlobals::mCurrentParticleSystem = nu
 CElementGen::CParticle* CParticleGlobals::xPortUVParticle = nullptr;
 const CElementGen::CParticle* CParticleGlobals::xPortIrndParticle = nullptr;
 const CParticleGlobals::SPortSwooshEval* CParticleGlobals::xPortSwooshEval = nullptr;
+float CParticleGlobals::xPortSystemTween = 0.f;
+int CParticleGlobals::xPortSlot2Percentage = 0;
+float CParticleGlobals::xPortSlot2Remainder = 0.f;
+
+namespace {
+CTransform4f sPortCameraTransform(1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f);
+bool sPortCameraTransformSet = false;
+} // namespace
+
+void CParticleGlobals::PortSetCameraTransform(const CTransform4f* xf) {
+  sPortCameraTransformSet = xf != nullptr;
+  if (xf != nullptr) {
+    sPortCameraTransform = *xf;
+  }
+}
+
+const CTransform4f& CParticleGlobals::PortCameraTransform() {
+  return sPortCameraTransformSet ? sPortCameraTransform : CGraphics::GetViewMatrix();
+}
+
+namespace {
+// UpdateLifetimeTweenValues 0x24ef38 (+0x10): only the 0x1000000 cap (PSLT is min(0x1000000, ..),
+// the no-PSLT default) gives 0; every other lifetime, 0x7FFFFF included, is divided through. The
+// reciprocal of the lifetime is FRECPE refined by two FRECPS steps (InverseScale), frame * that,
+// then the two fcsel clamps (0 - t >= 0 gives 0, t - 1 >= 0 gives 1; a NaN fails both and stays).
+float PortLifetimeTween(int frame, int lifetime) {
+  if (lifetime >= 0x1000000) {
+    return 0.f;
+  }
+  const float lifeF = lifetime != 0 ? static_cast< float >(lifetime) : 1.f;
+  float tween = static_cast< float >(frame) * PortParticleMath::InverseScale(lifeF);
+  if (0.f - tween >= 0.f) {
+    tween = 0.f;
+  }
+  if (tween + -1.f >= 0.f) {
+    tween = 1.f;
+  }
+  return tween;
+}
+} // namespace
+
+void CParticleGlobals::PortSetSystemTime(int frame, int lifetime) {
+  xPortSystemTween = PortLifetimeTween(frame, lifetime);
+}
+
+// 0x24ef38 +0xc/+0x14: the key index is (int)(tween * 100), the remainder what the cast drops.
+void CParticleGlobals::PortSetSlot2Time(int frame, int lifetime) {
+  const float real = PortLifetimeTween(frame, lifetime) * 100.f;
+  xPortSlot2Percentage = static_cast< int >(real);
+  xPortSlot2Remainder = real - static_cast< float >(xPortSlot2Percentage);
+}
 
 // splitmix64 of (seed, element address): the same pair always gives the same bits.
 u32 CParticleGlobals::PortIrndBits(const CElementGen::CParticle* particle, const void* element) {

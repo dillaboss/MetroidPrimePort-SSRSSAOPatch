@@ -1,6 +1,8 @@
 #ifndef _CPARTICLEGLOBALS
 #define _CPARTICLEGLOBALS
 
+#include <cstring>
+
 #include "types.h"
 
 #include "Kyoto/SObjectTag.hpp"
@@ -12,14 +14,29 @@ public:
     FourCC x0_type;
     CElementGen* x4_system;
     SParticleSystem* x8_prev;
+#ifdef TARGET_PC
+    // Remastered keeps the lifetime tween (UpdateLifetimeTweenValues 0x24ef38) in the system's own
+    // context; the port's global is saved here so a child generator that updates or renders
+    // inside this system leaves it as it was.
+    float xPortSavedTween;
+#endif
 
     SParticleSystem(FourCC type, CElementGen* system)
     : x0_type(type)
     , x4_system(system)
-    , x8_prev(mCurrentParticleSystem) {
+    , x8_prev(mCurrentParticleSystem)
+#ifdef TARGET_PC
+    , xPortSavedTween(xPortSystemTween)
+#endif
+    {
       mCurrentParticleSystem = this;
     }
-    ~SParticleSystem() { mCurrentParticleSystem = x8_prev; }
+    ~SParticleSystem() {
+      mCurrentParticleSystem = x8_prev;
+#ifdef TARGET_PC
+      xPortSystemTween = xPortSavedTween;
+#endif
+    }
   };
 
   static void SetEmitterTime(int time);
@@ -39,8 +56,18 @@ public:
 #ifdef TARGET_PC
   // GC reads address 0 harmlessly when no ADV values are bound; read zeros instead.
   static float* GetParticleAccessParameters() {
-    static float sZeros[8] = {};
+    static float sZeros[13] = {};
     return mParticleAccessParameters != nullptr ? mParticleAccessParameters : sZeros;
+  }
+  // port-only: Remastered's per-particle int variables IAV0..3 (PAP0..3), stored as their bits in
+  // the four floats after ADV1..9 (CElementGen::CAdvancedValues).
+  static int GetParticleAccessInt(int n) {
+    int v;
+    std::memcpy(&v, &GetParticleAccessParameters()[9 + n], sizeof(v));
+    return v;
+  }
+  static void SetParticleAccessInt(float* params, int n, int v) {
+    std::memcpy(&params[9 + n], &v, sizeof(v));
   }
 #else
   static float* GetParticleAccessParameters() { return mParticleAccessParameters; }
@@ -74,8 +101,29 @@ public:
     CTransform4f worldFromLocal;
     CVector3f systemLocal;
     const CVector3f* segmentPos;
+    // The point's swoosh node key (KEWS, Remastered 0x24f00c), when the point has one.
+    bool hasNode = false;
+    int nodePercentage = 0;
+    float nodeRemainder = 0.f;
   };
   static const SPortSwooshEval* xPortSwooshEval;
+  // port-only: the system tween Remastered keeps at ctx+0x60 (UpdateLifetimeTweenValues 0x24ef38 on
+  // time slot 0, written by every system tick): clamp(system frame / system lifetime, 0, 1). A
+  // lifetime of 0 reads as 1, and the infinite one (the port's PSLT default 0x7FFFFF, retail's
+  // 0x1000000) gives 0. The reciprocal is a plain 1 / lifetime; the original's estimate is within
+  // an ulp of it.
+  static float xPortSystemTween;
+  static void PortSetSystemTime(int frame, int lifetime);
+  // port-only: Remastered's time slot 2 (ctx+0x80), which only CParticleElectric2::UpdateBolt
+  // 0xb77638 writes (node i over node count - 1, the same tween as above); the context ctor
+  // 0x24f06c zeroes it, so it reads 0 everywhere else. KESP keyframes read it.
+  static int xPortSlot2Percentage;
+  static float xPortSlot2Remainder;
+  static void PortSetSlot2Time(int frame, int lifetime);
+  static void PortClearSlot2Time() {
+    xPortSlot2Percentage = 0;
+    xPortSlot2Remainder = 0.f;
+  }
   struct PortSwooshEvalScope {
     const SPortSwooshEval* prev;
     explicit PortSwooshEvalScope(const SPortSwooshEval* eval) : prev(xPortSwooshEval) {
@@ -87,6 +135,13 @@ public:
   // raw 32-bit hash it comes from.
   static u32 PortIrndBits(const CElementGen::CParticle* particle, const void* element);
   static float PortIrndUnit(const CElementGen::CParticle* particle, const void* element);
+  // port-only: Remastered's GetCameraTransform 0x27b304, the game camera (camera-to-world).
+  // CDisplayManager::Update 0xafded0 writes once per frame and the camera elements (DFCS/DFCP,
+  // CMPS, CPSS, CMRT) read at update and draw alike. The view matrix is no stand-in at update: it
+  // holds whatever the last draw left (a HUD or gun view). With no world (front end) it is unset
+  // and they read the view matrix.
+  static void PortSetCameraTransform(const CTransform4f* xf);
+  static const CTransform4f& PortCameraTransform();
 #endif
 };
 

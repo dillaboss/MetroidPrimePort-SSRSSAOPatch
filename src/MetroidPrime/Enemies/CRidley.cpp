@@ -24,6 +24,11 @@
 #include "rstl/math.hpp"
 #include <math.h>
 
+#ifdef TARGET_PC
+#include "Kyoto/CResFactory.hpp"
+#include "port_synthetic_effect.h"
+#endif
+
 const int CRidley::skNumProperties = 47;
 
 static const float skMinFlightScale = 0.3f;
@@ -1025,6 +1030,14 @@ void CRidley::ActivateBeam(CStateManager& mgr) {
         kMT_Character, xb68_.GetDamage(), mgr.AllocateUniqueId(), GetCurrentAreaId(), GetUniqueId(),
         CWeaponAssetInfo(), false, CWeapon::kPA_KeepInCinematic);
     if (projectile) {
+#ifdef TARGET_PC
+      // Remastered's Ridley beam info adds an ELC2 (c5588467) run along the beam; the import
+      // writes it under a synthetic id when the Remastered effects are installed.
+      const SObjectTag electricTag('ELSC', PortRemastered::SyntheticEffectId(PortRemastered::kRidleyBeamElectric));
+      if (gpResourceFactory->CanBuild(electricTag)) {
+        projectile->PortSetBeamElectric(electricTag.GetId());
+      }
+#endif
       mgr.AddObject(*projectile);
       xb64_plasmaProjectile = projectile->GetUniqueId();
     }
@@ -2073,5 +2086,13 @@ EWeaponCollisionResponseTypes CRidley::GetCollisionResponseType(const CVector3f&
 }
 
 float CRidley::GetGravityConstant() const { return 50.f; }
+
+#ifdef TARGET_PC
+void CRidley::PortStage3WingEffects(CStateManager& mgr) {
+  for (uint i = 0; i < 24; ++i) {
+    ModelData()->AnimationData()->SetParticleEffectState(skWingEffects[i], true, mgr);
+  }
+}
+#endif
 
 CRidley::~CRidley() {}

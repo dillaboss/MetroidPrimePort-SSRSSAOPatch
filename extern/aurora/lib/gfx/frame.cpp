@@ -1,4 +1,5 @@
 #include "frame.hpp"
+#include "overdraw.hpp"
 
 #include "depth_peek.hpp"
 #include "pipeline_cache.hpp"
@@ -9,7 +10,9 @@
 #include "screenspace.hpp"
 #include "thermal.hpp"
 #include "xray.hpp"
+#include <bit>
 #include <aurora/vfx.hpp>
+#include <aurora/envfx.hpp>
 #include <aurora/water.hpp>
 #include "probe.hpp"
 #include "recording.hpp"
@@ -46,6 +49,10 @@ using webgpu::g_device;
 using webgpu::g_instance;
 using webgpu::g_queue;
 
+// Set once when the device is created (webgpu::initialize); see resources.hpp.
+bool g_noCompute = false;
+bool g_vertexFetchTexture = false;
+
 namespace {
 constexpr Module Log{"aurora::gfx"};
 
@@ -58,7 +65,11 @@ enum class BufferMapState {
 };
 
 FrameBufferSizes g_bufferSizes;
-std::atomic<bool> g_storageGrowthRequested{false};
+std::array<std::atomic<uint64_t>, 4> g_stagingGrowthWant{};
+// aurora_reserve_frame_buffers() asked for the held limits; begin_frame takes them.
+std::atomic<bool> g_reserveHeldFrameBuffers{false};
+// They were taken: a re-initialisation (device loss) keeps them.
+bool g_heldFrameBuffersTaken = false;
 constexpr uint32_t StorageGrowthCapScale = 6;
 std::array<wgpu::Buffer, StagingBufferCount> g_stagingBuffers;
 std::array<std::atomic<BufferMapState>, StagingBufferCount> g_mappingStates;
@@ -68,6 +79,109 @@ std::array<FramePacket, FrameSlotCount> g_framePackets;
 uint64_t g_nextFrameId = 1;
 render_worker::FrameSlotPool g_frameSlots{FrameSlotCount};
 render_worker::FrameSlotPool g_stagingSlots{StagingBufferCount};
+
+// The uniform buffer is bound as a MaxUniformSize window, and some passes bind more of it.
+constexpr uint64_t MinDeviceUniformSize = 64u << 10;
+
+struct SharedBuffer {
+  StagingKind kind;
+  wgpu::Buffer Resources::*member;
+  wgpu::BufferUsage usage;
+  const char* label;
+  const char* name;
+};
+const std::array<SharedBuffer, 4> SharedBuffers{{
+    {StagingKind::Vertex, &Resources::vertexBuffer,
+     wgpu::BufferUsage::Storage | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::CopySrc,
+     "Shared Vertex Buffer", "vertex"},
+    {StagingKind::Uniform, &Resources::uniformBuffer,
+     wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::CopySrc, "Shared Uniform Buffer",
+     "uniform"},
+    {StagingKind::Index, &Resources::indexBuffer,
+     wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::CopySrc, "Shared Index Buffer",
+     "index"},
+    {StagingKind::Storage, &Resources::storageBuffer,
+     wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::CopySrc, "Shared Storage Buffer",
+     "storage"},
+}};
+
+// Texture vertex fetch: one fetch texture row is 4096 R32Uint texels (16 KiB), so a buffer's
+// bytes are its size / 16 KiB rows of the texture the shaders read it through.
+constexpr uint32_t FetchTextureWidth = 4096;
+
+// The allocation size a shared buffer needs: whole fetch texture rows for the kinds the shaders
+// read as textures, so its texture covers it exactly.
+uint64_t fetch_aligned_buffer_size(StagingKind kind, uint64_t bytes) noexcept {
+  if (!g_vertexFetchTexture || (kind != StagingKind::Vertex && kind != StagingKind::Storage)) {
+    return bytes;
+  }
+  return AURORA_ALIGN(bytes, FetchTextureRowBytes);
+}
+
+// Creates the fetch texture mirroring `kind`'s device buffer of `bytes` bytes.
+void create_fetch_texture(StagingKind kind, uint64_t bytes) {
+  const bool vertex = kind == StagingKind::Vertex;
+  wgpu::Texture& texture = vertex ? g_resources.vertexFetchTexture : g_resources.storageFetchTexture;
+  wgpu::TextureView& view = vertex ? g_resources.vertexFetchTextureView : g_resources.storageFetchTextureView;
+  const char* label = vertex ? "Vertex fetch texture" : "Storage fetch texture";
+  const uint64_t rows = AURORA_ALIGN(bytes, FetchTextureRowBytes) / FetchTextureRowBytes;
+  const uint32_t maxRows = g_resources.limits.maxTextureDimension2D;
+  if (maxRows != 0 && rows > maxRows) {
+    // The shaders address the data by row, so it cannot go in a smaller texture.
+    FATAL("{} needs {} rows of {} bytes, more than this device's maxTextureDimension2D of {}; "
+          "lower frameBufferScale or leave AURORA_VERTEX_FETCH_TEXTURE unset",
+          label, rows, FetchTextureRowBytes, maxRows);
+  }
+  const wgpu::TextureDescriptor descriptor{
+      .label = label,
+      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+      .dimension = wgpu::TextureDimension::e2D,
+      .size = {FetchTextureWidth, static_cast<uint32_t>(rows), 1},
+      .format = wgpu::TextureFormat::R32Uint,
+      .mipLevelCount = 1,
+      .sampleCount = 1,
+  };
+  texture = g_device.CreateTexture(&descriptor);
+  view = texture.CreateView();
+}
+
+void create_static_bind_group() {
+  std::array<wgpu::BindGroupEntry, 2> entries{};
+  for (size_t i = 0; i < entries.size(); ++i) {
+    entries[i].binding = static_cast<uint32_t>(i);
+  }
+  if (g_vertexFetchTexture) {
+    entries[0].textureView = g_resources.vertexFetchTextureView;
+    entries[1].textureView = g_resources.storageFetchTextureView;
+  } else {
+    entries[0].buffer = g_resources.vertexBuffer;
+    entries[1].buffer = g_resources.storageBuffer;
+  }
+  const wgpu::BindGroupDescriptor bindGroupDescriptor{
+      .label = "Static bind group",
+      .layout = g_resources.staticBindGroupLayout,
+      .entryCount = entries.size(),
+      .entries = entries.data(),
+  };
+  g_resources.staticBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
+}
+
+void create_uniform_bind_group() {
+  const std::array entries{
+      wgpu::BindGroupEntry{
+          .binding = 0,
+          .buffer = g_resources.uniformBuffer,
+          .size = gx::MaxUniformSize,
+      },
+  };
+  const wgpu::BindGroupDescriptor bindGroupDescriptor{
+      .label = "Uniform bind group",
+      .layout = g_resources.uniformBindGroupLayout,
+      .entryCount = entries.size(),
+      .entries = entries.data(),
+  };
+  g_resources.uniformBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
+}
 
 struct RuntimeDrawType {
   std::string label;
@@ -259,11 +373,11 @@ const FrameBufferSizes& frame_buffer_sizes() noexcept { return g_bufferSizes; }
 Range resident_region(ResidentBuffer kind) noexcept {
   switch (kind) {
   case ResidentBuffer::Vertex:
-    return {uint32_t(g_bufferSizes.vertex), uint32_t(g_bufferSizes.residentVertex)};
+    return {0, uint32_t(g_bufferSizes.residentVertex)};
   case ResidentBuffer::Index:
-    return {uint32_t(g_bufferSizes.index), uint32_t(g_bufferSizes.residentIndex)};
+    return {0, uint32_t(g_bufferSizes.residentIndex)};
   case ResidentBuffer::Storage:
-    return {uint32_t(g_bufferSizes.storageReserve), uint32_t(g_bufferSizes.residentStorage)};
+    return {0, uint32_t(g_bufferSizes.residentStorage)};
   }
   return {};
 }
@@ -294,6 +408,43 @@ std::optional<RegisteredEncoderTaskType> find_runtime_encoder_task_type(EncoderT
       .userdata = slot->userdata,
       .afterSubmit = slot->afterSubmit,
   };
+}
+
+void upload_fetch_texture_rows(const wgpu::CommandEncoder& encoder, StagingKind kind, uint64_t lo, uint64_t hi) {
+  if (!g_vertexFetchTexture || hi <= lo || (kind != StagingKind::Vertex && kind != StagingKind::Storage)) {
+    return;
+  }
+  const bool vertex = kind == StagingKind::Vertex;
+  const wgpu::Texture& texture = vertex ? g_resources.vertexFetchTexture : g_resources.storageFetchTexture;
+  if (!texture) {
+    return;
+  }
+  const uint64_t firstRow = lo / FetchTextureRowBytes;
+  const uint64_t lastRow = (hi + FetchTextureRowBytes - 1) / FetchTextureRowBytes;
+  const wgpu::TexelCopyBufferInfo source{
+      .layout =
+          wgpu::TexelCopyBufferLayout{
+              .offset = firstRow * FetchTextureRowBytes,
+              .bytesPerRow = FetchTextureRowBytes,
+              .rowsPerImage = static_cast<uint32_t>(lastRow - firstRow),
+          },
+      .buffer = vertex ? g_resources.vertexBuffer : g_resources.storageBuffer,
+  };
+  const wgpu::TexelCopyTextureInfo destination{
+      .texture = texture,
+      .origin =
+          wgpu::Origin3D{
+              .x = 0,
+              .y = static_cast<uint32_t>(firstRow),
+              .z = 0,
+          },
+  };
+  const wgpu::Extent3D size{
+      .width = FetchTextureWidth,
+      .height = static_cast<uint32_t>(lastRow - firstRow),
+      .depthOrArrayLayers = 1,
+  };
+  encoder.CopyBufferToTexture(&source, &destination, &size);
 }
 
 } // namespace detail
@@ -495,7 +646,24 @@ void initialize() {
         g_bufferSizes.storageReserve = g_bufferSizes.storageCap;
       }
     }
-    g_storageGrowthRequested.store(false, std::memory_order_release);
+    // The vertices likewise: a frame drawing skinned models twice more (the Remastered suit
+    // shell) went past 2x with the room geometry kept resident. Only the limit moves; the
+    // device and staging buffers still grow to it when a frame needs more.
+    uint64_t vertexReserve = g_bufferSizes.vertex;
+    if (g_config.frameStorageScale == 0 && g_config.residentGeometryMiB != 0) {
+      for (uint32_t capScale = StorageGrowthCapScale; capScale > scale; --capScale) {
+        FrameBufferSizes probe = g_bufferSizes;
+        probe.vertex = VertexBufferSize * capScale;
+        probe.storage = g_bufferSizes.storageReserve;
+        if (probe.vertex <= maxBinding && probe.staging() <= maxBuffer) {
+          vertexReserve = probe.vertex;
+          break;
+        }
+      }
+    }
+    for (auto& want : g_stagingGrowthWant) {
+      want.store(0, std::memory_order_release);
+    }
     // The resident regions follow a frame's data in the device buffers, which are bound
     // whole, so they take what the device leaves after it: two fifths each to vertices and
     // arrays, a fifth to indices.
@@ -507,13 +675,102 @@ void initialize() {
         return std::min({want, room, uint64_t(UINT32_MAX) - frame}) & ~uint64_t(255);
       };
       const uint64_t bound = std::min(maxBinding, maxBuffer);
-      g_bufferSizes.residentVertex = fit(resident / 5 * 2, g_bufferSizes.vertex, bound);
+      g_bufferSizes.residentVertex = fit(resident / 5 * 2, vertexReserve, bound);
       g_bufferSizes.residentStorage = fit(resident / 5 * 2, g_bufferSizes.storageReserve, bound);
       g_bufferSizes.residentIndex = fit(resident / 5, g_bufferSizes.index, maxBuffer);
       Log.info("Resident geometry: {} MiB of vertices, {} MiB of arrays, {} MiB of indices",
                g_bufferSizes.residentVertex >> 20, g_bufferSizes.residentStorage >> 20,
                g_bufferSizes.residentIndex >> 20);
     }
+    // What a frame can hold is what is sized above (the device buffers' per-frame part). The
+    // staging buffers, which there are StagingBufferCount of, start smaller unless the scale
+    // was pinned: a frame that needs more spills (see SpillBuffer), and the arrays' staging
+    // storage grows after an overflow where it can.
+    g_bufferSizes.maxVertex = vertexReserve;
+    g_bufferSizes.maxUniform = g_bufferSizes.uniform;
+    g_bufferSizes.maxIndex = g_bufferSizes.index;
+    g_bufferSizes.maxStorage = g_bufferSizes.storageReserve;
+    g_bufferSizes.scaledStorage = g_bufferSizes.storage;
+    g_bufferSizes.scaledVertex = g_bufferSizes.vertex;
+    g_bufferSizes.textureUpload = TextureUploadSize;
+    if (!g_config.frameBuffersPinned) {
+      g_bufferSizes.vertex = std::min(g_bufferSizes.vertex, StartVertexSize);
+      g_bufferSizes.uniform = std::min(g_bufferSizes.uniform, StartUniformSize);
+      g_bufferSizes.index = std::min(g_bufferSizes.index, StartIndexSize);
+      g_bufferSizes.storage = std::min(g_bufferSizes.storage, StartStorageSize);
+      g_bufferSizes.textureUpload = StartTextureUploadSize;
+    }
+    // Test hook: AURORA_STAGING_START_KIB=<n> sets the vertex, uniform, index and storage
+    // staging buffers to n KiB (at most their frame limit) to force the spill path.
+    if (const char* kib = std::getenv("AURORA_STAGING_START_KIB")) {
+      const uint64_t size = std::max<uint64_t>(256, (std::strtoull(kib, nullptr, 10) << 10) & ~uint64_t(255));
+      const char* maskEnv = std::getenv("AURORA_STAGING_START_MASK"); // bits: 1 vertex, 2 uniform, 4 index, 8 storage
+      const unsigned mask = maskEnv != nullptr ? unsigned(std::strtoul(maskEnv, nullptr, 0)) : 0xFu;
+      if (mask & 1u) g_bufferSizes.vertex = std::min(g_bufferSizes.maxVertex, size);
+      if (mask & 2u) g_bufferSizes.uniform = std::min(g_bufferSizes.maxUniform, size);
+      if (mask & 4u) g_bufferSizes.index = std::min(g_bufferSizes.maxIndex, size);
+      if (mask & 8u) g_bufferSizes.storage = std::min(g_bufferSizes.maxStorage, size);
+    }
+    // The growable cap is relative to the staging size, so it keeps its meaning; but a cap the
+    // staging storage already has is no cap.
+    if (g_bufferSizes.storageCap != 0 && g_bufferSizes.storageCap <= g_bufferSizes.storage) {
+      g_bufferSizes.storageCap = 0;
+    }
+    // The device buffers' per-frame part starts where staging does, unless the scale was pinned,
+    // and grows like it when a frame needs more (grow_frame_buffer). The uniform one holds at
+    // least the bound window. Android takes the full frame limit up front: a mid-frame grow
+    // there was followed by a device loss on an Adreno 618 (issue #165), and with robustness
+    // off nothing catches a bad access.
+    // AURORA_FULL_DEVICE_BUFFERS=1 takes the Android path elsewhere, to test it.
+#if defined(__ANDROID__)
+    const bool fullDeviceBuffers = true;
+#else
+    const bool fullDeviceBuffers = std::getenv("AURORA_FULL_DEVICE_BUFFERS") != nullptr;
+#endif
+    // Taking those limits whole costs memory a game without room geometry never uses, so
+    // frameBuffersDeferred runs at what a scale of 1 takes until aurora_reserve_frame_buffers()
+    // (reserve_held_frame_buffers, between two frames, never mid-frame). Once taken they stay
+    // taken over a device loss.
+    if (fullDeviceBuffers && g_config.frameBuffersDeferred && !g_config.frameBuffersPinned &&
+        !g_heldFrameBuffersTaken && g_config.residentGeometryMiB == 0 &&
+        std::getenv("AURORA_STAGING_START_KIB") == nullptr) {
+      auto& s = g_bufferSizes;
+      if (s.maxVertex > VertexBufferSize || s.maxUniform > UniformBufferSize || s.maxIndex > IndexBufferSize ||
+          s.maxStorage > StorageBufferSize) {
+        s.heldVertex = s.maxVertex;
+        s.heldUniform = s.maxUniform;
+        s.heldIndex = s.maxIndex;
+        s.heldStorage = s.maxStorage;
+        s.maxVertex = std::min(s.maxVertex, VertexBufferSize);
+        s.maxUniform = std::min(s.maxUniform, UniformBufferSize);
+        s.maxIndex = std::min(s.maxIndex, IndexBufferSize);
+        s.maxStorage = std::min(s.maxStorage, StorageBufferSize);
+        s.vertex = std::min(s.vertex, s.maxVertex);
+        s.uniform = std::min(s.uniform, s.maxUniform);
+        s.index = std::min(s.index, s.maxIndex);
+        s.storage = std::min(s.storage, s.maxStorage);
+        Log.info("Frame buffers: scaled limits held back until room geometry asks for them");
+      }
+    }
+    if (g_config.frameBuffersPinned || (fullDeviceBuffers && std::getenv("AURORA_STAGING_START_KIB") == nullptr)) {
+      g_bufferSizes.deviceVertex = g_bufferSizes.maxVertex;
+      g_bufferSizes.deviceUniform = g_bufferSizes.maxUniform;
+      g_bufferSizes.deviceIndex = g_bufferSizes.maxIndex;
+      g_bufferSizes.deviceStorage = g_bufferSizes.maxStorage;
+    } else {
+      g_bufferSizes.deviceVertex = g_bufferSizes.vertex;
+      g_bufferSizes.deviceUniform =
+          std::min(g_bufferSizes.maxUniform, std::max<uint64_t>(g_bufferSizes.uniform, MinDeviceUniformSize));
+      g_bufferSizes.deviceIndex = g_bufferSizes.index;
+      g_bufferSizes.deviceStorage = g_bufferSizes.storage;
+    }
+    Log.info("Frame buffers: staging {}/{}/{}/{}+{} MiB (vertex/uniform/index/storage+textures), device {}/{}/{}/{} "
+             "KiB, frame limit {}/{}/{}/{} MiB",
+             g_bufferSizes.vertex >> 20, g_bufferSizes.uniform >> 20, g_bufferSizes.index >> 20,
+             g_bufferSizes.storage >> 20, g_bufferSizes.textureUpload >> 20, g_bufferSizes.deviceVertex >> 10,
+             g_bufferSizes.deviceUniform >> 10, g_bufferSizes.deviceIndex >> 10, g_bufferSizes.deviceStorage >> 10,
+             g_bufferSizes.maxVertex >> 20, g_bufferSizes.maxUniform >> 20, g_bufferSizes.maxIndex >> 20,
+             g_bufferSizes.maxStorage >> 20);
   }
 
   const auto createBuffer = [](wgpu::Buffer& out, wgpu::BufferUsage usage, uint64_t size, const char* label) {
@@ -527,16 +784,30 @@ void initialize() {
     };
     out = g_device.CreateBuffer(&descriptor);
   };
-  createBuffer(g_resources.uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, g_bufferSizes.uniform,
-               "Shared Uniform Buffer");
-  createBuffer(g_resources.vertexBuffer,
-               wgpu::BufferUsage::Storage | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst,
-               g_bufferSizes.vertex + g_bufferSizes.residentVertex, "Shared Vertex Buffer");
-  createBuffer(g_resources.indexBuffer, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst,
-               g_bufferSizes.index + g_bufferSizes.residentIndex,
-               "Shared Index Buffer");
-  createBuffer(g_resources.storageBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
-               g_bufferSizes.storageReserve + g_bufferSizes.residentStorage, "Shared Storage Buffer");
+  for (const auto& buffer : SharedBuffers) {
+    createBuffer(g_resources.*buffer.member, buffer.usage,
+                 fetch_aligned_buffer_size(buffer.kind,
+                                           g_bufferSizes.base(buffer.kind) + g_bufferSizes.device(buffer.kind)),
+                 buffer.label);
+  }
+  if (g_vertexFetchTexture) {
+    const uint64_t vertexBytes = g_bufferSizes.base(StagingKind::Vertex) + g_bufferSizes.deviceVertex;
+    const uint64_t storageBytes = g_bufferSizes.base(StagingKind::Storage) + g_bufferSizes.deviceStorage;
+    create_fetch_texture(StagingKind::Vertex, vertexBytes);
+    create_fetch_texture(StagingKind::Storage, storageBytes);
+    // The new buffers are zeroed, and a read past the data has to see that (the storage buffers
+    // read 0 there), so the textures start as their copies rather than as undefined content.
+    const wgpu::CommandEncoderDescriptor encoderDescriptor{
+        .label = "Vertex fetch textures",
+    };
+    auto encoder = g_device.CreateCommandEncoder(&encoderDescriptor);
+    upload_fetch_texture_rows(encoder, StagingKind::Vertex, 0, vertexBytes);
+    upload_fetch_texture_rows(encoder, StagingKind::Storage, 0, storageBytes);
+    auto commands = encoder.Finish();
+    g_queue.Submit(1, &commands);
+    Log.info("Texture vertex fetch: {} rows of vertices, {} rows of arrays", vertexBytes / FetchTextureRowBytes,
+             storageBytes / FetchTextureRowBytes);
+  }
   for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
     const auto label = fmt::format("Staging Buffer {}", i);
     createBuffer(g_stagingBuffers[i], wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc, g_bufferSizes.staging(),
@@ -550,49 +821,37 @@ void initialize() {
   }
 
   {
-    constexpr std::array layoutEntries{
-        // Vertex data buffer
-        wgpu::BindGroupLayoutEntry{
-            .binding = 0,
-            .visibility = wgpu::ShaderStage::Vertex,
-            .buffer =
-                wgpu::BufferBindingLayout{
-                    .type = wgpu::BufferBindingType::ReadOnlyStorage,
-                },
-        },
-        // Storage data buffer
-        wgpu::BindGroupLayoutEntry{
-            .binding = 1,
-            .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
-            .buffer =
-                wgpu::BufferBindingLayout{
-                    .type = wgpu::BufferBindingType::ReadOnlyStorage,
-                },
-        },
+    // The vertex and storage data as either whole read-only storage buffers or, in texture vertex
+    // fetch mode, textures the shaders textureLoad words from (resources.hpp).
+    const auto makeEntry = [](uint32_t binding, wgpu::ShaderStage visibility) {
+      wgpu::BindGroupLayoutEntry entry{
+          .binding = binding,
+          .visibility = visibility,
+      };
+      if (g_vertexFetchTexture) {
+        entry.texture =
+            wgpu::TextureBindingLayout{
+                .sampleType = wgpu::TextureSampleType::Uint,
+                .viewDimension = wgpu::TextureViewDimension::e2D,
+            };
+      } else {
+        entry.buffer =
+            wgpu::BufferBindingLayout{
+                .type = wgpu::BufferBindingType::ReadOnlyStorage,
+            };
+      }
+      return entry;
     };
+    // Vertex data, then storage data.
+    const std::array layoutEntries{makeEntry(0, wgpu::ShaderStage::Vertex),
+                                   makeEntry(1, wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment)};
     const wgpu::BindGroupLayoutDescriptor layoutDesc{
         .label = "Static bind group layout",
         .entryCount = layoutEntries.size(),
         .entries = layoutEntries.data(),
     };
     g_resources.staticBindGroupLayout = g_device.CreateBindGroupLayout(&layoutDesc);
-    const std::array entries{
-        wgpu::BindGroupEntry{
-            .binding = 0,
-            .buffer = g_resources.vertexBuffer,
-        },
-        wgpu::BindGroupEntry{
-            .binding = 1,
-            .buffer = g_resources.storageBuffer,
-        },
-    };
-    const wgpu::BindGroupDescriptor bindGroupDescriptor{
-        .label = "Static bind group",
-        .layout = g_resources.staticBindGroupLayout,
-        .entryCount = entries.size(),
-        .entries = entries.data(),
-    };
-    g_resources.staticBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
+    create_static_bind_group();
   }
 
   {
@@ -614,20 +873,7 @@ void initialize() {
         .entries = layoutEntries.data(),
     };
     g_resources.uniformBindGroupLayout = g_device.CreateBindGroupLayout(&layoutDesc);
-    const std::array entries{
-        wgpu::BindGroupEntry{
-            .binding = 0,
-            .buffer = g_resources.uniformBuffer,
-            .size = gx::MaxUniformSize,
-        },
-    };
-    const wgpu::BindGroupDescriptor bindGroupDescriptor{
-        .label = "Uniform bind group",
-        .layout = g_resources.uniformBindGroupLayout,
-        .entryCount = entries.size(),
-        .entries = entries.data(),
-    };
-    g_resources.uniformBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
+    create_uniform_bind_group();
   }
 
   gx::initialize();
@@ -662,6 +908,7 @@ void shutdown() {
   actor_shadow::shutdown();
   vfx::shutdown();
   water::shutdown();
+  envfx::shutdown();
   tex_palette_conv::shutdown();
   texture_replacement::shutdown();
   gx::shutdown();
@@ -681,6 +928,10 @@ void shutdown() {
   g_resources.uniformBuffer = {};
   g_resources.indexBuffer = {};
   g_resources.storageBuffer = {};
+  g_resources.vertexFetchTexture = {};
+  g_resources.vertexFetchTextureView = {};
+  g_resources.storageFetchTexture = {};
+  g_resources.storageFetchTextureView = {};
   g_stagingBuffers.fill({});
   for (auto& packet : g_framePackets) {
     packet = {};
@@ -741,16 +992,63 @@ std::optional<size_t> acquire_mapped_staging_buffer() {
   }
 }
 
-void request_storage_growth() noexcept {
-  if (g_bufferSizes.storageCap > g_bufferSizes.storage) {
-    g_storageGrowthRequested.store(true, std::memory_order_release);
+void request_staging_growth(StagingKind kind, uint64_t peak) noexcept {
+  auto& want = g_stagingGrowthWant[static_cast<size_t>(kind)];
+  uint64_t seen = want.load(std::memory_order_relaxed);
+  while (peak > seen && !want.compare_exchange_weak(seen, peak, std::memory_order_acq_rel)) {
   }
 }
 
+void grow_frame_buffer(StagingKind kind, uint64_t need, const wgpu::CommandEncoder& encoder) {
+  ZoneScopedN("Grow frame buffer");
+  // On the render worker, after everything queued before: what this frame encoded so far reads
+  // the old buffer, then the copy makes the new one hold all of it (resident region included,
+  // which stays at the same offsets) before anything encoded later reads or writes it.
+  render_worker::enqueue_work([kind, need, &encoder] {
+    const auto& shared = SharedBuffers[static_cast<size_t>(kind)];
+    uint64_t& device = kind == StagingKind::Vertex    ? g_bufferSizes.deviceVertex
+                       : kind == StagingKind::Uniform ? g_bufferSizes.deviceUniform
+                       : kind == StagingKind::Index   ? g_bufferSizes.deviceIndex
+                                                      : g_bufferSizes.deviceStorage;
+    if (need <= device) {
+      return;
+    }
+    const uint64_t base = g_bufferSizes.base(kind);
+    const uint64_t grown = std::min(std::bit_ceil(need), g_bufferSizes.limit(kind));
+    const wgpu::BufferDescriptor descriptor{
+        .label = shared.label,
+        .usage = shared.usage,
+        .size = fetch_aligned_buffer_size(kind, base + grown),
+    };
+    wgpu::Buffer buffer = g_device.CreateBuffer(&descriptor);
+    wgpu::Buffer& current = g_resources.*shared.member;
+    encoder.CopyBufferToBuffer(current, 0, buffer, 0, base + device);
+    Log.info("frame {} device buffer grown from {} to {} KiB during frame {} (needed {} KiB)", shared.name,
+             device >> 10, grown >> 10, g_frameIndex, need >> 10);
+    current = std::move(buffer);
+    device = grown;
+    if (g_vertexFetchTexture && (kind == StagingKind::Vertex || kind == StagingKind::Storage)) {
+      // The fetch texture is the new buffer, so it is the size of the buffer rather than of the
+      // part in use; the buffer copy above already put the old contents at the same offsets.
+      create_fetch_texture(kind, base + grown);
+      upload_fetch_texture_rows(encoder, kind, 0, base + grown);
+    }
+    if (kind == StagingKind::Uniform) {
+      create_uniform_bind_group();
+    } else if (kind != StagingKind::Index) {
+      create_static_bind_group();
+    }
+    // Cached bind groups that hold the old buffer are no longer looked up; drop them soon so
+    // the old buffer goes too.
+    expire_unused_bind_groups_soon();
+  });
+  render_worker::synchronize();
+}
+
 namespace {
-// Doubles the staging storage once every frame in flight is done with the staging buffers.
-void grow_storage() {
-  ZoneScopedN("Grow storage");
+// Grows the staging buffers a frame spilled out of, once every frame in flight is done with them.
+void grow_staging(const std::array<uint64_t, 4>& want) {
+  ZoneScopedN("Grow staging");
   render_worker::synchronize();
   // Holding every staging slot means no frame or pending map uses a buffer.
   for (size_t n = 0; n < StagingBufferCount; ++n) {
@@ -762,7 +1060,26 @@ void grow_storage() {
       wait_for_gpu_progress(std::chrono::microseconds{100});
     }
   }
-  g_bufferSizes.storage = std::min(g_bufferSizes.storage * 2, g_bufferSizes.storageCap);
+  struct Kind {
+    const char* name;
+    uint64_t& size;
+    uint64_t limit;
+  };
+  const Kind kinds[] = {
+      {"vertex", g_bufferSizes.vertex, g_bufferSizes.maxVertex},
+      {"uniform", g_bufferSizes.uniform, g_bufferSizes.maxUniform},
+      {"index", g_bufferSizes.index, g_bufferSizes.maxIndex},
+      {"storage", g_bufferSizes.storage, g_bufferSizes.maxStorage},
+  };
+  for (size_t k = 0; k < 4; ++k) {
+    if (want[k] <= kinds[k].size) {
+      continue;
+    }
+    const uint64_t grown = std::min(std::bit_ceil(want[k]), kinds[k].limit);
+    Log.info("frame {} staging buffers grown from {} to {} KiB after a frame spilled out of them (peak {} KiB)",
+             kinds[k].name, kinds[k].size >> 10, grown >> 10, want[k] >> 10);
+    kinds[k].size = grown;
+  }
   for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
     // A buffer still mapping completes with an error; wait it out before replacing it.
     while (g_mappingStates[i].load(std::memory_order_acquire) == BufferMapState::Mapping) {
@@ -782,15 +1099,87 @@ void grow_storage() {
   for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
     g_stagingSlots.release(i);
   }
-  Log.info("storage buffer grown to {} MiB after an overflow", g_bufferSizes.storage >> 20);
+}
+
+// Takes the limits frameBuffersDeferred held back. With every staging slot held no frame is in
+// flight, so the device buffers are replaced whole at the new limits between two frames, with
+// nothing of any frame to copy: the mid-frame grow lost an Adreno 618's device (issue #165).
+void reserve_held_frame_buffers() {
+  ZoneScopedN("Reserve frame buffers");
+  auto& s = g_bufferSizes;
+  if (s.heldVertex == 0) {
+    return;
+  }
+  render_worker::synchronize();
+  for (size_t n = 0; n < StagingBufferCount; ++n) {
+    while (true) {
+      if (const auto slot = g_stagingSlots.try_acquire()) {
+        (void)slot;
+        break;
+      }
+      wait_for_gpu_progress(std::chrono::microseconds{100});
+    }
+  }
+  s.maxVertex = s.deviceVertex = s.heldVertex;
+  s.maxUniform = s.deviceUniform = s.heldUniform;
+  s.maxIndex = s.deviceIndex = s.heldIndex;
+  s.maxStorage = s.deviceStorage = s.heldStorage;
+  s.heldVertex = s.heldUniform = s.heldIndex = s.heldStorage = 0;
+  g_heldFrameBuffersTaken = true;
+  render_worker::enqueue_work([] {
+    for (const auto& buffer : SharedBuffers) {
+      const wgpu::BufferDescriptor descriptor{
+          .label = buffer.label,
+          .usage = buffer.usage,
+          .size = fetch_aligned_buffer_size(buffer.kind,
+                                            g_bufferSizes.base(buffer.kind) + g_bufferSizes.device(buffer.kind)),
+      };
+      g_resources.*buffer.member = g_device.CreateBuffer(&descriptor);
+    }
+    if (g_vertexFetchTexture) {
+      const uint64_t vertexBytes = g_bufferSizes.base(StagingKind::Vertex) + g_bufferSizes.deviceVertex;
+      const uint64_t storageBytes = g_bufferSizes.base(StagingKind::Storage) + g_bufferSizes.deviceStorage;
+      create_fetch_texture(StagingKind::Vertex, vertexBytes);
+      create_fetch_texture(StagingKind::Storage, storageBytes);
+      const wgpu::CommandEncoderDescriptor encoderDescriptor{
+          .label = "Vertex fetch textures",
+      };
+      auto encoder = g_device.CreateCommandEncoder(&encoderDescriptor);
+      upload_fetch_texture_rows(encoder, StagingKind::Vertex, 0, vertexBytes);
+      upload_fetch_texture_rows(encoder, StagingKind::Storage, 0, storageBytes);
+      auto commands = encoder.Finish();
+      g_queue.Submit(1, &commands);
+    }
+    create_uniform_bind_group();
+    create_static_bind_group();
+    // Cached bind groups that hold the old buffers are no longer looked up.
+    expire_unused_bind_groups_soon();
+  });
+  render_worker::synchronize();
+  for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
+    g_stagingSlots.release(i);
+  }
+  Log.info("Frame buffers: took the held limits, device {}/{}/{}/{} MiB (vertex/uniform/index/storage)",
+           s.deviceVertex >> 20, s.deviceUniform >> 20, s.deviceIndex >> 20, s.deviceStorage >> 20);
 }
 } // namespace
 
 bool begin_frame() {
   ZoneScoped;
-  if (g_storageGrowthRequested.exchange(false, std::memory_order_acq_rel) &&
-      g_bufferSizes.storage < g_bufferSizes.storageCap) {
-    grow_storage();
+  {
+    std::array<uint64_t, 4> want{};
+    bool grow = false;
+    const uint64_t sizes[] = {g_bufferSizes.vertex, g_bufferSizes.uniform, g_bufferSizes.index, g_bufferSizes.storage};
+    for (size_t k = 0; k < 4; ++k) {
+      want[k] = g_stagingGrowthWant[k].exchange(0, std::memory_order_acq_rel);
+      grow = grow || want[k] > sizes[k];
+    }
+    if (grow) {
+      grow_staging(want);
+    }
+  }
+  if (g_reserveHeldFrameBuffers.exchange(false, std::memory_order_acq_rel)) {
+    reserve_held_frame_buffers();
   }
   // pace_frame_start();
   const size_t frameSlot = acquire_frame_slot();
@@ -819,7 +1208,7 @@ bool begin_frame() {
   mapBuffer(frame.indices, g_bufferSizes.index);
   mapBuffer(frame.storage, g_bufferSizes.storage);
   if constexpr (UseTextureBuffer) {
-    mapBuffer(frame.textureUpload, TextureUploadSize);
+    mapBuffer(frame.textureUpload, g_bufferSizes.textureUpload);
   }
 
   begin_recording(frame, frameSlot);
@@ -828,6 +1217,7 @@ bool begin_frame() {
     constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "Redraw encoder"};
     g_framePackets[frameSlot].encoder = g_device.CreateCommandEncoder(&EncoderDescriptor);
     webgpu::gpu_prof::frame_begin(g_framePackets[frameSlot].encoder);
+    overdraw::frame_begin();
   });
   g_cpuFrameStart = PresentClock::now();
   return true;
@@ -920,10 +1310,13 @@ float calculate_fps() noexcept {
 const AuroraStats* aurora_get_stats() { return &aurora::gfx::detail::resources().stats; }
 
 uint32_t aurora_get_frame_buffer_scale() {
-  return static_cast<uint32_t>(aurora::gfx::frame_buffer_sizes().vertex / aurora::gfx::VertexBufferSize);
+  return static_cast<uint32_t>(aurora::gfx::frame_buffer_sizes().scaledVertex / aurora::gfx::VertexBufferSize);
+}
+void aurora_reserve_frame_buffers() {
+  aurora::gfx::g_reserveHeldFrameBuffers.store(true, std::memory_order_release);
 }
 uint32_t aurora_get_frame_storage_scale() {
-  return static_cast<uint32_t>(aurora::gfx::frame_buffer_sizes().storage / aurora::gfx::StorageBufferSize);
+  return static_cast<uint32_t>(aurora::gfx::frame_buffer_sizes().scaledStorage / aurora::gfx::StorageBufferSize);
 }
 uint32_t aurora_get_resident_geometry_mib() {
   const auto& sizes = aurora::gfx::frame_buffer_sizes();

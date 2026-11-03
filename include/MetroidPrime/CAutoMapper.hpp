@@ -32,7 +32,7 @@ class CStringTable;
 class CTexture;
 class CUnitVector3f;
 class IWorld;
-struct CFinalInput;
+class CFinalInput;
 
 class CAutoMapper {
 public:
@@ -169,6 +169,9 @@ public:
   void PortPointerInput(CFinalInput& input, const CStateManager& mgr);
   void PortRecordPointerHits(const CStateManager& mgr, const CTransform4f& planeXf,
                              const CTransform4f& mapXf) const;
+  // Port: the map screen, with the player in control and no area hint up, is
+  // when the "X Mark room" prompt takes the disc's hint pane.
+  bool PortShowsMarkPrompt();
 #endif
   static CQuaternion GetMiniMapCameraOrientation(const CStateManager& stateMgr);
   CVector3f GetAreaPointOfInterest(const CStateManager& mgr, int aid) const;

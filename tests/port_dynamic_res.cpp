@@ -3,6 +3,7 @@
 // squared, the CPU's is constant, and a frame takes the longer of the two (they
 // overlap), capped at the frame limit.
 #include "port_dynamic_res.h"
+#include "port_test.h"
 
 #include <algorithm>
 #include <cmath>
@@ -10,13 +11,6 @@
 #include <cstdlib>
 
 namespace {
-int sFailures = 0;
-void Check(bool ok, const char* what) {
-  if (!ok) {
-    std::fprintf(stderr, "FAIL: %s\n", what);
-    ++sFailures;
-  }
-}
 
 using PortDynamicRes::Controller;
 using PortDynamicRes::Reason;
@@ -32,6 +26,7 @@ struct Scene {
   double gapMs = 0.0;
   double passShare = 1.0;
   bool publishes = true;    // false: GPU times supported but never published
+  bool compiling = false;   // pipelines building in the background
   double Gpu(float scale) const { return fixedMs + perPixelMs * double(scale) * scale; }
   double Span(float scale) const { return Gpu(scale) + gapMs; }
   double Passes(float scale) const { return Gpu(scale) * passShare; }
@@ -77,6 +72,7 @@ struct Run {
       s.gpuMs = !gpuTimes ? -1.0 : scene.publishes ? published : 0.0;
       s.gpuPassMs = gpuTimes && scene.publishes ? publishedPasses : -1.0;
       s.targetFps = target;
+      s.compiling = scene.compiling;
       s.top = top;
       s.bottom = bottom;
       if (controller.Update(s).changed) {
@@ -99,11 +95,11 @@ int main() {
     Run run;
     Scene heavy;
     run.Seconds(heavy, 20);
-    Check(run.changes >= 1 && run.changes <= 3, "GPU-bound: settles in at most three changes");
-    Check(run.controller.Scale() <= 1.31f && run.controller.Scale() >= 1.15f,
-          "GPU-bound: lands at the scale that fits the budget");
-    Check(heavy.Fps(run.controller.Scale()) >= 59.9, "GPU-bound: the target is reached");
-    Check(run.Seconds(heavy, 120) == 0, "GPU-bound: no change once settled");
+    CHECK_MSG(run.changes >= 1 && run.changes <= 3, "GPU-bound: settles in at most three changes");
+    CHECK_MSG(run.controller.Scale() <= 1.31f && run.controller.Scale() >= 1.15f,
+              "GPU-bound: lands at the scale that fits the budget");
+    CHECK_MSG(heavy.Fps(run.controller.Scale()) >= 59.9, "GPU-bound: the target is reached");
+    CHECK_MSG(run.Seconds(heavy, 120) == 0, "GPU-bound: no change once settled");
   }
   // The fixed part is learnt once two scales have been measured.
   {
@@ -111,8 +107,8 @@ int main() {
     Scene heavy;
     heavy.fixedMs = 3.0;
     run.Seconds(heavy, 30);
-    Check(run.controller.FixedGpuMs() > 2.5 && run.controller.FixedGpuMs() < 3.5,
-          "learns the fixed part of the GPU time");
+    CHECK_MSG(run.controller.FixedGpuMs() > 2.5 && run.controller.FixedGpuMs() < 3.5,
+              "learns the fixed part of the GPU time");
   }
   // CPU-bound: 25 ms on the CPU, the GPU idle half the frame. Fewer pixels would not
   // help, so it never lowers.
@@ -121,8 +117,20 @@ int main() {
     Scene cpu;
     cpu.cpuMs = 25.0;
     cpu.perPixelMs = 2.0;
-    Check(run.Seconds(cpu, 60) == 0 && Near(run.controller.Scale(), 2.f), "CPU-bound: never lowers");
-    Check(run.controller.LastReason() == Reason::NotGpuBound, "CPU-bound: says why");
+    CHECK_MSG(run.Seconds(cpu, 60) == 0 && Near(run.controller.Scale(), 2.f), "CPU-bound: never lowers");
+    CHECK_MSG(run.controller.LastReason() == Reason::NotGpuBound, "CPU-bound: says why");
+  }
+  // Without GPU times, slow seconds while pipelines compile are the compiles, not the
+  // pixels: held at the top until they finish, then followed as usual.
+  {
+    Run run;
+    run.gpuTimes = false;
+    Scene heavy;
+    heavy.compiling = true;
+    CHECK_MSG(run.Seconds(heavy, 30) == 0 && Near(run.controller.Scale(), 2.f), "compiling: never lowers");
+    CHECK_MSG(run.controller.LastReason() == Reason::Compiling, "compiling: says why");
+    heavy.compiling = false;
+    CHECK_MSG(run.Seconds(heavy, 30) >= 1 && run.controller.Scale() < 2.f, "compiling done: lowers again");
   }
   // One slow second (a hitch) costs nothing.
   {
@@ -133,7 +141,7 @@ int main() {
     run.Seconds(light, 10);
     run.Seconds(spike, 1);
     run.Seconds(light, 10);
-    Check(run.changes == 0 && Near(run.controller.Scale(), 2.f), "a single slow second changes nothing");
+    CHECK_MSG(run.changes == 0 && Near(run.controller.Scale(), 2.f), "a single slow second changes nothing");
   }
   // A heavy room, then a light one: down, then back up to the top, without stepping
   // past what fits on the way.
@@ -144,10 +152,10 @@ int main() {
     light.perPixelMs = 2.0;
     run.Seconds(heavy, 20);
     const float low = run.controller.Scale();
-    Check(low < 1.5f, "heavy room lowers the scale");
+    CHECK_MSG(low < 1.5f, "heavy room lowers the scale");
     run.Seconds(light, 60);
-    Check(Near(run.controller.Scale(), 2.f), "light room raises it back to the top");
-    Check(run.changes <= 5, "down and up again in a handful of changes");
+    CHECK_MSG(Near(run.controller.Scale(), 2.f), "light room raises it back to the top");
+    CHECK_MSG(run.changes <= 5, "down and up again in a handful of changes");
   }
   // A scene at the edge, where the old stepping went back and forth: GPU time just over
   // the budget at 1.25x and well under at 1x. It must not oscillate.
@@ -156,8 +164,8 @@ int main() {
     Scene edge;
     edge.perPixelMs = 10.0;  // 1 + 10 s^2: 16.6 ms at 1.25x, 11 ms at 1x
     run.Seconds(edge, 30);
-    Check(run.Seconds(edge, 300) <= 1, "no oscillation at the edge");
-    Check(edge.Fps(run.controller.Scale()) >= 59.9, "the edge scene holds the target");
+    CHECK_MSG(run.Seconds(edge, 300) <= 1, "no oscillation at the edge");
+    CHECK_MSG(edge.Fps(run.controller.Scale()) >= 59.9, "the edge scene holds the target");
   }
   // A slow GPU (20 fps at 2x): the published times lag behind a
   // change, which must not make it drop past what fits.
@@ -166,11 +174,11 @@ int main() {
     Scene slow;
     slow.perPixelMs = 12.0;  // 1 + 12 s^2: 49 ms at 2x; fits 14.17 ms at 1.05x
     run.Seconds(slow, 40);
-    Check(run.controller.Scale() >= 1.0f, "a lagging reading does not overshoot");
-    Check(slow.Fps(run.controller.Scale()) >= 59.9, "the slow GPU reaches the target");
-    Check(run.changes <= 3, "the slow GPU settles in a few changes");
-    Check(run.controller.Scale() < 2.f * 0.6f + 0.01f || run.changes >= 2,
-          "one lowering goes no further than 0.6x of the scale");
+    CHECK_MSG(run.controller.Scale() >= 1.0f, "a lagging reading does not overshoot");
+    CHECK_MSG(slow.Fps(run.controller.Scale()) >= 59.9, "the slow GPU reaches the target");
+    CHECK_MSG(run.changes <= 3, "the slow GPU settles in a few changes");
+    CHECK_MSG(run.controller.Scale() < 2.f * 0.6f + 0.01f || run.changes >= 2,
+              "one lowering goes no further than 0.6x of the scale");
   }
   // Uncapped, aiming at 120 fps.
   {
@@ -181,8 +189,8 @@ int main() {
     heavy.cpuMs = 3.0;
     heavy.perPixelMs = 4.0;  // 1 + 4 s^2: 17 ms at 2x; 0.85 * 8.33 = 7.08 ms -> 1.20x
     run.Seconds(heavy, 30);
-    Check(heavy.Fps(run.controller.Scale()) >= 0.97 * 120.0, "uncapped: reaches 120 fps");
-    Check(run.controller.Scale() >= 1.15f, "uncapped: no lower than it needs");
+    CHECK_MSG(heavy.Fps(run.controller.Scale()) >= 0.97 * 120.0, "uncapped: reaches 120 fps");
+    CHECK_MSG(run.controller.Scale() >= 1.15f, "uncapped: no lower than it needs");
   }
   // Never below the lowest scale, even when even that is too slow; and a GPU so
   // overloaded that it draws under 10 frames a second is not taken for a pause.
@@ -191,15 +199,15 @@ int main() {
     Scene hopeless;
     hopeless.perPixelMs = 200.0;
     run.Seconds(hopeless, 30);
-    Check(Near(run.controller.Scale(), 0.5f), "stops at the lowest scale");
-    Check(run.controller.LastReason() == Reason::AtLowest, "at the lowest scale: says why");
+    CHECK_MSG(Near(run.controller.Scale(), 0.5f), "stops at the lowest scale");
+    CHECK_MSG(run.controller.LastReason() == Reason::AtLowest, "at the lowest scale: says why");
   }
   // No range (the lowest scale is the top): nothing moves.
   {
     Run run;
     run.bottom = 2.f;
     Scene heavy;
-    Check(run.Seconds(heavy, 30) == 0 && Near(run.controller.Scale(), 2.f), "no range, no change");
+    CHECK_MSG(run.Seconds(heavy, 30) == 0 && Near(run.controller.Scale(), 2.f), "no range, no change");
   }
   // The render scale lowered under it: it follows at once.
   {
@@ -209,7 +217,7 @@ int main() {
     run.Seconds(light, 5);
     run.top = 1.5f;
     run.Seconds(light, 1);
-    Check(run.controller.Scale() <= 1.5f, "follows a lowered render scale");
+    CHECK_MSG(run.controller.Scale() <= 1.5f, "follows a lowered render scale");
   }
   // Without GPU times: the old frame-rate stepping, a quarter step after two slow seconds.
   {
@@ -217,10 +225,10 @@ int main() {
     run.gpuTimes = false;
     Scene heavy;
     run.Seconds(heavy, 2);
-    Check(Near(run.controller.Scale(), 1.75f), "frame rate only: a quarter step after two slow seconds");
+    CHECK_MSG(Near(run.controller.Scale(), 1.75f), "frame rate only: a quarter step after two slow seconds");
     run.Seconds(heavy, 30);
-    Check(heavy.Fps(run.controller.Scale()) >= 59.9 || Near(run.controller.Scale(), 0.5f),
-          "frame rate only: still reaches the target");
+    CHECK_MSG(heavy.Fps(run.controller.Scale()) >= 59.9 || Near(run.controller.Scale(), 0.5f),
+              "frame rate only: still reaches the target");
   }
   // Paused or loading: too few frames, nothing learnt or changed.
   {
@@ -233,9 +241,9 @@ int main() {
     s.top = 2.f;
     s.bottom = 0.5f;
     for (int i = 0; i < 10; ++i) {
-      Check(!c.Update(s).changed, "paused: no change");
+      CHECK_MSG(!c.Update(s).changed, "paused: no change");
     }
-    Check(c.LastReason() == Reason::Paused, "paused: says why");
+    CHECK_MSG(c.LastReason() == Reason::Paused, "paused: says why");
   }
 
   // CPU-bound, but the GPU waits inside its span, so the span alone reads as busy. The
@@ -246,8 +254,8 @@ int main() {
     gappy.cpuMs = 25.0;
     gappy.perPixelMs = 1.0;  // 5 ms of work at 2x
     gappy.gapMs = 15.0;      // span 20 ms, over the 13.3 ms "busy" line
-    Check(run.Seconds(gappy, 120) == 0 && Near(run.controller.Scale(), 2.f),
-          "gaps in the span: the passes' sum shows it is not GPU-bound");
+    CHECK_MSG(run.Seconds(gappy, 120) == 0 && Near(run.controller.Scale(), 2.f),
+              "gaps in the span: the passes' sum shows it is not GPU-bound");
   }
   // The same, with gaps the passes do not give away: the lowering is checked against the
   // frame rate, undone when it gains nothing, and after twice the GPU times are dropped.
@@ -258,9 +266,9 @@ int main() {
     gappy.perPixelMs = 2.0;  // 9 ms of work at 2x
     gappy.gapMs = 7.0;       // span 16 ms: passes are over half of it
     run.Seconds(gappy, 300);
-    Check(Near(run.controller.Scale(), 2.f), "a lowering that gained nothing is undone");
-    Check(run.controller.GpuTimesDropped(), "twice wrong: the GPU times are no longer used");
-    Check(run.changes <= 10, "and it stops trying soon");
+    CHECK_MSG(Near(run.controller.Scale(), 2.f), "a lowering that gained nothing is undone");
+    CHECK_MSG(run.controller.GpuTimesDropped(), "twice wrong: the GPU times are no longer used");
+    CHECK_MSG(run.changes <= 10, "and it stops trying soon");
   }
   // GPU times reported as supported but never published: after a few seconds it follows
   // the frame rate instead of waiting for ever.
@@ -269,10 +277,10 @@ int main() {
     Scene broken;
     broken.publishes = false;
     run.Seconds(broken, 4);
-    Check(run.controller.LastReason() == Reason::Collecting && run.changes == 0, "waits a little");
+    CHECK_MSG(run.controller.LastReason() == Reason::Collecting && run.changes == 0, "waits a little");
     run.Seconds(broken, 60);
-    Check(run.controller.GpuTimesDropped(), "then gives up on GPU times");
-    Check(run.controller.Scale() < 2.f, "and lowers on the frame rate");
+    CHECK_MSG(run.controller.GpuTimesDropped(), "then gives up on GPU times");
+    CHECK_MSG(run.controller.Scale() < 2.f, "and lowers on the frame rate");
   }
   // A long load at a crawl publishes no GPU time for many seconds; those seconds are a
   // pause, not a driver that never publishes, so the GPU times are still used after it.
@@ -288,12 +296,12 @@ int main() {
     for (int i = 0; i < 20; ++i) {
       c.Update(load);
     }
-    Check(!c.GpuTimesDropped() && c.LastReason() == Reason::Paused, "a long load does not drop the GPU times");
+    CHECK_MSG(!c.GpuTimesDropped() && c.LastReason() == Reason::Paused, "a long load does not drop the GPU times");
     Run run;
     run.controller = c;
     Scene heavy;
     run.Seconds(heavy, 20);
-    Check(!run.controller.GpuTimesDropped() && run.controller.Scale() < 1.5f, "and they are used once it ends");
+    CHECK_MSG(!run.controller.GpuTimesDropped() && run.controller.Scale() < 1.5f, "and they are used once it ends");
   }
   // The fixed part is forgotten a minute after it was measured.
   {
@@ -301,13 +309,13 @@ int main() {
     Scene heavy;
     heavy.fixedMs = 3.0;
     run.Seconds(heavy, 20);
-    Check(run.controller.FixedGpuMs() >= 0.0, "fixed part learnt");
+    CHECK_MSG(run.controller.FixedGpuMs() >= 0.0, "fixed part learnt");
     run.Seconds(heavy, 70);
-    Check(run.controller.FixedGpuMs() < 0.0, "and forgotten once it is old");
+    CHECK_MSG(run.controller.FixedGpuMs() < 0.0, "and forgotten once it is old");
   }
 
-  if (sFailures == 0) {
+  if (port_test::Failures() == 0) {
     std::puts("dynamic resolution tests passed");
   }
-  return sFailures == 0 ? 0 : 1;
+  return PORT_TEST_RESULT();
 }

@@ -102,6 +102,7 @@ private:
 CHECK_SIZEOF(CElitePirateData, 0x120)
 
 class CElitePirate : public CPatterned {
+  friend struct PortEntitySchema; // save-state field schema (platform/include/port_entity_schema.h)
 public:
   CElitePirate(TUniqueId uid, const rstl::string& name, const CEntityInfo& info,
                const CTransform4f& xf, const CModelData& mData, const CPatternedInfo& pInfo,
@@ -211,7 +212,7 @@ protected:
   void UpdateGrenadeLauncher(CStateManager& mgr, TUniqueId& uid, const rstl::string& locator) const;
   void ReDirectDamage(CStateManager& mgr, TUniqueId uid);
   bool IsClosestEnergyAttractor(CStateManager& mgr,
-                                const rstl::reserved_vector< TUniqueId, 1024 >& nearList,
+                                const rstl::reserved_vector< TUniqueId, kMaxObjects >& nearList,
                                 const CVector3f& pos) const;
   void StartAbsorbEnergyEffects(CStateManager& mgr, const CTransform4f& xf);
   void UpdateBlockPose(float dt, CStateManager& mgr);

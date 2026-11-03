@@ -4,9 +4,12 @@
 
 #ifdef AURORA_ENABLE_GX
 #include "gfx/resources.hpp"
+#include "gfx/overdraw.hpp"
+#include "gfx/vis_query.hpp"
 #include "gfx/frame.hpp"
 #include "gfx/pipeline_cache.hpp"
 #include "gfx/recording.hpp"
+#include "gfx/texture.hpp"
 #include "gfx/render_worker.hpp"
 #include "gx/command_processor.hpp"
 #include "gx/fifo.hpp"
@@ -206,9 +209,11 @@ constexpr std::array PreferredBackendOrder{
 #ifdef DAWN_ENABLE_BACKEND_D3D11
     BACKEND_D3D11,
 #endif
-// #ifdef DAWN_ENABLE_BACKEND_DESKTOP_GL
-//     BACKEND_OPENGL,
-// #endif
+// Desktop GL last among the GPU backends: for GPUs whose D3D and Vulkan drivers all fail (OpenGL 3.3
+// hardware), before the software adapters of the second pass.
+#ifdef DAWN_ENABLE_BACKEND_DESKTOP_GL
+    BACKEND_OPENGL,
+#endif
 #ifdef DAWN_ENABLE_BACKEND_OPENGLES
     BACKEND_OPENGLES,
 #endif
@@ -496,9 +501,21 @@ void end_frame() noexcept {
     wgpu::TextureView currentView;
     auto surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::Error;
     bool acquireAttempted = false;
+    // Port: AURORA_PRESENT_EVERY=<n> presents one frame in n (test runs on Xvfb, where each present
+    // is a CPU copy under MESA_VK_WSI_DEBUG=sw). The frame is still rendered; screenshots read the EFB.
+    static const uint32_t presentEvery = [] {
+      const char* env = std::getenv("AURORA_PRESENT_EVERY");
+      const long n = env != nullptr ? std::strtol(env, nullptr, 10) : 1;
+      return n > 1 ? static_cast<uint32_t>(n) : 1u;
+    }();
+    static uint32_t presentCounter = 0;
+    const bool skipPresent = presentEvery > 1 && (presentCounter++ % presentEvery) != 0;
+    if (skipPresent) {
+      gfx::after_present();
+    }
     {
       window::SurfaceLock surfaceLock;
-      if (window::is_presentable() && g_surface) {
+      if (!skipPresent && window::is_presentable() && g_surface) {
         ZoneScopedN("Acquire texture");
         phase::set(phase::Render, "surface GetCurrentTexture");
         wgpu::SurfaceTexture surfaceTexture;
@@ -556,10 +573,12 @@ void end_frame() noexcept {
         imgui::render(pass, imguiDrawData);
         pass.End();
       }
-    } else {
+    } else if (!skipPresent) {
       Log.info("Skipping present; window not presentable");
     }
     webgpu::gpu_prof::frame_end(encoder);
+    gfx::overdraw::frame_end(encoder);
+    gfx::vis_query::detail::frame_end(encoder);
     const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
     const auto buffer = encoder.Finish(&cmdBufDescriptor);
     {
@@ -567,8 +586,11 @@ void end_frame() noexcept {
       phase::set(phase::Render, "queue submit");
       g_queue.Submit(1, &buffer);
     }
+    gfx::sample_dawn_memory();
     phase::set(phase::Render, "after submit");
     webgpu::gpu_prof::after_submit();
+    gfx::overdraw::after_submit();
+    gfx::vis_query::detail::after_submit();
     if (canPresent && g_surface) {
       ZoneScopedN("Present");
       wgpu::ConvertibleStatus status = wgpu::Status::Error;

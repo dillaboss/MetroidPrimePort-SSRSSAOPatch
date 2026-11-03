@@ -109,6 +109,34 @@ bool CalculateOffsetToSafeCollisionPoint(const Box& box, const Vec3& pos, float 
 // along them). Returns false when the boxes do not overlap.
 bool BoxBoxImpacts(const Box& self, const Box& other, std::vector< Impact >& out);
 
+// Full AABox_AABox geometry (0xbf61b4 wrapper + 0xbf6650 helper), port frame. Both
+// halves of a source impact: each carries its owner's OUTWARD face normal, the same depth
+// and one face-centre point; no secondary normal. Materials and ids are the caller's.
+struct PairedImpact {
+  float selfDepth = 0.f;  // self half's depth
+  float otherDepth = 0.f; // other half's depth (== selfDepth in source)
+  Vec3 selfNormal;        // self's outward face normal
+  Vec3 otherNormal;       // other's: component-wise negation of selfNormal (zero signs too)
+  Vec3 selfPoint;         // centroid of the intersection face, axis at self's face plane
+  Vec3 otherPoint;        // same, axis at other's face plane
+};
+// SurfaceCollisionPasses on the OTHER's material with the other half's normal (port
+// frame), asked once per candidate impact. An empty function accepts everything.
+using NormalPredicate = std::function< bool(const Vec3& otherNormal) >;
+// Appends the impacts of `self` against `other` in source order (Remastered axes x, y(up),
+// z; +1 side before -1) and returns true when any were appended. Every impact one call
+// appends belongs to the SAME pair contact: the append is flat and carries no end marker,
+// so the caller must snapshot out.size() before the call (or hand in a fresh contact's
+// vector) and group exactly the appended range as one contact, as port_remastered_movers.cpp does
+// for the legacy API below. A candidate rejected by the depth > 0 test or by `passes` is
+// dropped; when every primary candidate was dropped the minimum-difference fallback
+// candidate is tried (also gated by `passes`). Returns false (appending nothing) when the
+// boxes do not overlap (inclusive) or nothing passed. The entry Passes(otherMaterial)
+// check is the caller's, as is hoisting `passes` out of the tick loop. Preconditions: all
+// coordinates finite and min <= max on every axis; no epsilon is applied.
+bool BoxBoxPairedImpacts(const Box& self, const Box& other, const NormalPredicate& passes,
+                         std::vector< PairedImpact >& out);
+
 // 0xc02cec dispatcher / 0xc02d70 CCollidableSphere::AABox_Sphere: impacts of `self`
 // against a sphere at `center` with `radius`, normal the sphere half's (push self
 // along it) and depth the box half's (both halves carry the same depth in source).

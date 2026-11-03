@@ -1,4 +1,5 @@
 #include "port_disc.h"
+#include "port_bytes.h"
 
 #include <dolphin/dvd.h>
 #include <algorithm>
@@ -7,21 +8,13 @@
 #include <zlib.h>
 
 namespace {
-uint32_t ReadBig32(const uint8_t* data) {
-  return (uint32_t(data[0]) << 24) | (uint32_t(data[1]) << 16) |
-         (uint32_t(data[2]) << 8) | uint32_t(data[3]);
-}
-
-}
-
-namespace {
 // The resource at its section address, or false if no DOL section holds it.
 bool ReadDolAt(const uint8_t* dol, s32 dolSize, uint32_t address, uint32_t length,
                std::vector<uint8_t>& out) {
   for (uint32_t i = 0; i < 18; ++i) {
-    const uint32_t sectionOffset = ReadBig32(dol + i * 4);
-    const uint32_t sectionAddress = ReadBig32(dol + 0x48 + i * 4);
-    const uint32_t sectionSize = ReadBig32(dol + 0x90 + i * 4);
+    const uint32_t sectionOffset = port::ReadBE32(dol + i * 4);
+    const uint32_t sectionAddress = port::ReadBE32(dol + 0x48 + i * 4);
+    const uint32_t sectionSize = port::ReadBE32(dol + 0x90 + i * 4);
     if (address < sectionAddress || address - sectionAddress > sectionSize ||
         length > sectionSize - (address - sectionAddress))
       continue;
@@ -110,10 +103,10 @@ bool PortFindDolFont(uint32_t textureId, std::vector<uint8_t>& font, std::vector
     if (used == 0 || std::memcmp(head, "FONT", 4) != 0)
       continue;
     // FONT header: version, 4 ints (v2+), 2 bools, 2 ints, name, texture id.
-    const uint32_t version = ReadBig32(head + 4);
+    const uint32_t version = port::ReadBE32(head + 4);
     size_t pos = 8 + (version >= 2 ? 16 : version >= 1 ? 12 : 8) + 10;
     const uint8_t* name = static_cast<const uint8_t*>(std::memchr(head + pos, 0, sizeof(head) - pos));
-    if (name == nullptr || size_t(name - head) + 5 > sizeof(head) || ReadBig32(name + 1) != textureId)
+    if (name == nullptr || size_t(name - head) + 5 > sizeof(head) || port::ReadBE32(name + 1) != textureId)
       continue;
     // Its texture is the next stream (word aligned).
     const uint8_t* const next = std::search(at + used, std::min(end, at + used + 32), kZlib, kZlib + 2);
@@ -143,6 +136,10 @@ Version Identify(const char* id6, unsigned diskNumber, unsigned revision) {
   }
   if (std::memcmp(id6, "GM8P01", 6) == 0 && revision == 0)
     return Version::Pal;
+  if (std::memcmp(id6, "R3ME01", 6) == 0 && revision == 0)
+    return Version::Trilogy;
+  if (std::memcmp(id6, "R3MP01", 6) == 0 && revision == 0)
+    return Version::TrilogyPal;
   return Version::Unknown;
 }
 
@@ -162,6 +159,8 @@ const char* Name(Version version) {
   case Version::Usa101: return "USA 1.01";
   case Version::Usa102: return "USA 1.02";
   case Version::Pal: return "PAL";
+  case Version::Trilogy: return "Trilogy (USA)";
+  case Version::TrilogyPal: return "Trilogy (PAL)";
   case Version::Unknown: break;
   }
   return "unknown";
@@ -169,7 +168,9 @@ const char* Name(Version version) {
 
 bool IsAccepted(Version version) {
   return version == Version::Usa100 || version == Version::Usa101 || version == Version::Usa102 ||
-         version == Version::Pal;
+         version == Version::Pal || IsTrilogy(version);
 }
+
+bool HasPalData(Version version) { return version == Version::Pal || IsTrilogy(version); }
 
 } // namespace PortDisc

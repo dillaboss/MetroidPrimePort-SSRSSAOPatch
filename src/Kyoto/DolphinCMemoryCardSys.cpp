@@ -5,7 +5,9 @@
 #include "dolphin/os/OSCache.h"
 
 #include <SDL3/SDL_filesystem.h>
+#include <SDL3/SDL_messagebox.h>
 #include <SDL3/SDL_stdinc.h>
+#include <SDL3/SDL_video.h>
 #if defined(__ANDROID__)
 #include <SDL3/SDL_system.h>
 #endif
@@ -13,13 +15,16 @@
 #include "Kyoto/MemoryCopy.hpp"
 #include "Kyoto/Basics/CBasics.hpp"
 #include "MetroidPrime/PortSaveFormat.hpp"
+#include "port_env.h"
 #include "port_gci.h"
 #include "port_log.h"
 #include "port_paths.h"
 
 #include <aurora/card.h>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 bool CMemoryCardSys::mIsInitialized;
 bool CMemoryCardSys::mIsCardSysExists;
@@ -31,6 +36,13 @@ namespace {
 // card, or that one).
 std::string sDefaultCardBase;
 std::string sCardBase;
+// Port: the game id and maker the card's files are created with, as CARDInit
+// was given them ("GM8E01"), for the map side files' key.
+std::string sCardIdMaker;
+// Port: the channel the port's save driver uses: CSaveGameScreen builds its
+// CMemoryCardDriver with kCS_SlotA, and nothing here mounts a second card.
+constexpr int kCardChannel = CMemoryCardSys::kCS_SlotA;
+constexpr const char* kCardMaker = "01";
 
 // Port: move a pre-native PAL save ("MetroidPrime A/B") into the PAL disc's own
 // format once the card folder is known.
@@ -38,6 +50,60 @@ void MigrateLegacyPalSave() {
   const PortGci::Report migrated = PortGci::MigrateMountedLegacyPal();
   if (migrated.copied > 0 || !migrated.errors.empty()) {
     PortLog::Write("memory card: %s\n", migrated.Summary("Migrated").c_str());
+  }
+}
+
+// Port: each release keeps its own saves, so after switching discs (USA to
+// PAL, GameCube to Trilogy) the card looks empty. Offer, once, to copy the
+// newest other release's save over, converted. The overlay's Memory card
+// section has the same choice for later (and for the older releases). Asked
+// for the default card at boot and for each seed's card as it mounts; seeds
+// are version-neutral, so their saves convert like any other.
+void OfferRestoreFromOtherRelease() {
+  if (port::EnvFlag("MP_NO_DISC_DIALOG") || std::getenv("MP_CONSOLE") != nullptr) {
+    return; // scripted runs: nobody to answer
+  }
+  const std::vector<PortGci::OtherRelease> others = PortGci::RestoreToOffer();
+  if (others.empty()) {
+    return;
+  }
+  int windowCount = 0;
+  SDL_Window** windows = SDL_GetWindows(&windowCount);
+  SDL_Window* window = windows != nullptr && windowCount > 0 ? windows[0] : nullptr;
+  SDL_free(windows);
+  if (window == nullptr) {
+    return;
+  }
+  const PortGci::OtherRelease& newest = others.front();
+  const std::string message = "This card has no saves for this disc yet, but there are\nsaves from " + newest.label +
+                              ".\n\nCopy them over? They are converted for this disc;\nthe originals stay "
+                              "where they are.\n\nYou can also do it later: overlay, System tab,\nMemory card.";
+  enum { kSkip, kCopy };
+  const SDL_MessageBoxButtonData buttons[] = {
+      {SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, kCopy, "Copy saves"},
+      {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, kSkip, "Start fresh"},
+  };
+  SDL_MessageBoxData data{};
+  data.flags = SDL_MESSAGEBOX_INFORMATION;
+  data.window = window;
+  data.title = "Metroid Prime: saves from another version";
+  data.message = message.c_str();
+  data.numbuttons = 2;
+  data.buttons = buttons;
+  int answer = -1;
+  if (!SDL_ShowMessageBox(&data, &answer)) {
+    PortLog::Write("memory card: could not offer the other release's saves: %s\n", SDL_GetError());
+    return;
+  }
+  PortGci::MarkRestoreOffered();
+  if (answer != kCopy) {
+    return;
+  }
+  const PortGci::Report report = PortGci::RestoreFrom(newest);
+  PortLog::Write("memory card: from %s: %s\n", newest.label.c_str(), report.Summary("Restored").c_str());
+  if (report.copied == 0) {
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "Metroid Prime: saves not copied",
+                             report.Summary("Restored").c_str(), window);
   }
 }
 } // namespace
@@ -109,7 +175,10 @@ ECardResult SMemoryCardFileInfo::FileRead() {
       x24_saveFileData = rstl::vector< uchar, rstl::aligned_allocator >();
       return result;
     }
-    if (offset > size) {
+    // A file with a valid CRC can still be too short for the body
+    // CMemoryCardDriver::ReadFinished reads (a hand-made or truncated GCI).
+    if (offset > size || size - offset < static_cast< uint >(PortSaveFormat::BodyBytes())) {
+      x24_saveFileData = rstl::vector< uchar, rstl::aligned_allocator >();
       return kCR_BROKEN;
     }
     const uint saveSize = size - offset;
@@ -370,7 +439,8 @@ void CMemoryCardSys::Initialize() {
     PortLog::Write("memory card: storing under %s\n", base);
     // Aurora's CARDInit takes the game id and maker code: the disc's (GM8P on
     // PAL, whose card aurora keeps under EUR).
-    CARDInit(PortGci::GameCode(), "01");
+    CARDInit(PortGci::GameCode(), kCardMaker);
+    sCardIdMaker = std::string(PortGci::GameCode()) + kCardMaker;
     mIsInitialized = true;
     MigrateLegacyPalSave();
     // Sharing the emulator's card: quick resume and boot-to-game save there too.
@@ -378,8 +448,29 @@ void CMemoryCardSys::Initialize() {
     if (!shared.empty()) {
       PortSwitchCard(shared.c_str());
     }
+    OfferRestoreFromOtherRelease();
   }
 }
+
+const char* CMemoryCardSys::PortCardResolvedDirectory() {
+  if (!mIsInitialized) {
+    return "";
+  }
+  // The channel's active path when its card is mounted, else the one it would
+  // get under the current base (both are the identity to key on; a card switch
+  // changes it).
+  static std::string sResolved;
+  char buffer[1024];
+  const int channel = PortCardChannel();
+  const size_t size = aurora_card_get_path(PortGci::GameCode(), aurora_card_get_type(channel),
+                                           channel, buffer, sizeof(buffer));
+  sResolved = size != 0 && size <= sizeof(buffer) ? std::string(buffer) : std::string();
+  return sResolved.c_str();
+}
+
+const char* CMemoryCardSys::PortCardIdMaker() { return sCardIdMaker.c_str(); }
+
+int CMemoryCardSys::PortCardChannel() { return kCardChannel; }
 
 bool CMemoryCardSys::PortSwitchCard(const char* directory) {
   if (!mIsInitialized || sDefaultCardBase.empty())
@@ -396,9 +487,16 @@ bool CMemoryCardSys::PortSwitchCard(const char* directory) {
   sCardBase = target;
   PortLog::Write("memory card: switched to %s%s\n", target.c_str(),
                  mounted ? "" : " (no card could be mounted there)");
-  if (mounted)
+  if (mounted) {
     MigrateLegacyPalSave();
+    // A randomizer or Archipelago seed's card has its own per-release saves.
+    OfferRestoreFromOtherRelease();
+  }
   return true;
+}
+
+bool CMemoryCardSys::PortOnDefaultCard() {
+  return mIsInitialized && !sDefaultCardBase.empty() && sCardBase == sDefaultCardBase;
 }
 
 CMemoryCardSys::~CMemoryCardSys() {

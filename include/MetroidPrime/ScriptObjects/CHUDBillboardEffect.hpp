@@ -8,6 +8,7 @@ class CElectricDescription;
 class CParticleGen;
 
 class CHUDBillboardEffect : public CEffect {
+  friend struct PortEntitySchema; // save-state field schema (platform/include/port_entity_schema.h)
 public:
   CHUDBillboardEffect(const rstl::optional_object< TToken< CGenDescription > >& particle,
                       const rstl::optional_object< TToken< CElectricDescription > >& electric,
@@ -23,10 +24,29 @@ public:
   void Render(const CStateManager& mgr) const override;
   bool IsElementGen() const { return x104_26_isElementGen; }
   void SetRunIndefinitely(bool b) { x104_27_runIndefinitely = b; }
+#ifdef TARGET_PC
+  void PortSetFaceUncounted() { xPortFaceUncounted = true; }
+#endif
   CParticleGen* GetParticleGen() const { return xe8_generator.get(); }
 
   static float GetNearClipDistance(const CStateManager& mgr);
   static const CVector3f& GetScaleForPOV(const CStateManager& mgr);
+#ifdef TARGET_PC
+  void AcceptScriptMsg(EScriptObjectMessage msg, TUniqueId uid, CStateManager& mgr) override;
+  // Remastered's visor goo splat manager (CVisorEffectManagerMP1, managed effect type 4).
+  // HasActiveManagedEffect(4) / SetManagedEffect(4, id) / AddVisorGooSplat 0xd1078c.
+  static bool PortHasVisorGoo(CStateManager& mgr);
+  static void PortSetVisorGoo(CStateManager& mgr, TUniqueId uid, float dt);
+  static void PortAddVisorGooSplat(CStateManager& mgr);
+  // CVisorEffectManagerMP1::Update over the billboards whose PART has visor effect data.
+  static void PortUpdateVisorOverrides(CStateManager& mgr, float dt);
+  // CHUDBillboardEffectMP1::EScaleType, the CreateHUDBillboardEffect argument (0xd7e67c): 1 at
+  // every caller but SetMorphBallState's unmorph runoff (0), whose effect stays in HUD units.
+  void PortSetScaleType(int type) { xPortScaleType = type; }
+  // A Remastered visor effect (GetVisorEffectCommands): drawn by RenderVisorEffects 0xfa0b30 over
+  // the post output, not in the world (CStateManager::PortDrawVisorEffects).
+  bool PortIsVisorEffect() const { return xPortManagedType == 4 || PortIsRemasteredHUD(); }
+#endif
 
 private:
   rstl::single_ptr< CParticleGen > xe8_generator;
@@ -37,6 +57,30 @@ private:
   bool x104_26_isElementGen : 1l; // = false;
   bool x104_27_runIndefinitely : 1l; // = false;
   float x108_timeoutTimer; // = 0.f;
+#ifdef TARGET_PC
+  // Remastered's managed effect type: 4 = the visor goo manager's billboard, -1 none.
+  int xPortManagedType = -1;
+  // Added to the visor effect override list (AddBillboardEffect).
+  bool xPortVisorOverride = false;
+  // Counted by the face reflection, which every billboard fades out (AddBillboardEffect).
+  bool xPortFaceCounted = false;
+  // Not counted on registration: the rain-splash billboard, which CEnvFxManager counts itself.
+  bool xPortFaceUncounted = false;
+  void PortRemoveFromFaceReflection(CStateManager& mgr);
+  // The spread last given to the generator, which passes it down to its children.
+  CVector3f xPortSpawnSpread{1.f, 1.f, 1.f};
+  int xPortScaleType = 1;
+  // The HUD camera's visor plane depth (FRME_BaseHud basewidget_visorFX), aspect and
+  // tan(fov / 2) (camera_default, fov 65).
+  static constexpr float kPortHUDDepth = 2.2311f;
+  static constexpr float kPortHUDAspect = 16.f / 9.f;
+  static constexpr float kPortHUDTanHalfFov = 0.637070f;
+  // The HUD camera's near plane (CGuiCamera ctor 0xbd4e60, hard-coded).
+  static constexpr float kPortHUDNear = 1.f;
+  bool PortIsRemasteredHUD() const;
+  void PortUpdateSpawnSpread(const CStateManager& mgr);
+  void PortApplySpawnSpread(const CVector3f& spread);
+#endif
 
   static int g_IndirectTexturedBillboardCount;
   static int g_BillboardCount;

@@ -21,6 +21,7 @@
 // The port's retained Remastered physics object state (platform seam): see
 // RetainedResult in port_remastered_ground_policy.h for the source contract.
 #include "port_remastered_ground_policy.h"
+#include "port_remastered_ground_rider.h"
 #endif
 
 class CPlayerGun;
@@ -39,6 +40,7 @@ enum EPlayerMovementState {
 };
 
 class CPlayer : public CPhysicsActor, public TOneStatic< CPlayer > {
+  friend struct PortEntitySchema; // save-state field schema (platform/include/port_entity_schema.h)
   friend class CMorphBall;
 
   struct CVisorSteam {
@@ -267,7 +269,12 @@ public:
   EOrbitValidationResult ValidateOrbitTargetId(TUniqueId target, CStateManager& mgr) const;
   void DoSfxEffects(CSfxHandle sfx);
   bool GetFrozenState() const;
-  void SetFrozenState(CStateManager& stateMgr, CAssetId steamTxtr, ushort sfx, CAssetId iceTxtr);
+  void SetFrozenState(CStateManager& stateMgr, CAssetId steamTxtr, ushort sfx, CAssetId iceTxtr
+#ifdef TARGET_PC
+                      ,
+                      CAssetId portFrozenFx = kInvalidAssetId
+#endif
+  );
   void BreakFrozenState(CStateManager& mgr);
   void SetFrozenTimeoutBias(float bias) { x758_frozenTimeoutBias = bias; }
   void UpdateCinematicState(CStateManager& mgr);
@@ -329,6 +336,46 @@ public:
   // morph-ball, dyn-fallback or paused ticks, and it must never be used as a clock.
   uint32_t PortGroundMoverRuns() const { return xa38_groundMoverRuns; }
   void PortNoteGroundMoverRun() { ++xa38_groundMoverRuns; }
+  // Remastered grounded mover on moving platforms (issue #117, slice 1). The rider
+  // controller the mover sets after its snap (SetRiderController 0xc1631c), decayed at the
+  // end of every movement tick (PortEndMovementTick). Port-only, never serialized: a
+  // save-state load clears it (PortResetRiderState).
+  PortRemasteredGroundRider::RiderController& PortRider() { return xa3c_rider; }
+  // Exactly one platform carry per tick (PortRemasteredGroundRider::PlanCarry): retail
+  // CScriptPlatform::MoveRiders runs in PreThink, before the player's mover is chosen, so it
+  // defers the player's carry when the previous movement tick ran a carry-owning Remastered
+  // mover (admitted grounded or airborne), and the tick's actual mover then applies or drops it.
+  bool PortDefersRiderCarry() const {
+    return PortRemasteredGroundRider::DeferRetailCarry(xa44_lastTickRemasteredCarry);
+  }
+  void PortSetLastTickRemasteredCarry(bool ran) { xa44_lastTickRemasteredCarry = ran; }
+  void PortDeferRiderCarry(const CVector3f& delta, const CQuaternion& rotDelta, bool rotate,
+                           uint tick);
+  void PortNoteRetailRiderCarry(uint tick) { xa48_retailCarryTick = tick; }
+  bool PortRetailRiderCarried(uint tick) const { return xa48_retailCarryTick == tick; }
+  void PortApplyDeferredRiderCarry(uint tick);
+  void PortDropDeferredRiderCarry() { xa4c_deferredCarryCount = 0; }
+  // A save-state load (PortSaveState::Place): no rider, no deferred carry, and the next tick
+  // is not a carry-owning Remastered one, so nothing from before the load carries across it.
+  void PortResetRiderState() {
+    xa3c_rider = PortRemasteredGroundRider::RiderController();
+    xa44_lastTickRemasteredCarry = false;
+    xa4c_deferredCarryCount = 0;
+    xad4_carriedYaw = 0.f;
+  }
+  // The yaw a Remastered mover's rider carry turned the player by this tick (a rotating
+  // platform, PredictMotion 0xc23e40), noted only when it reached the orientation.
+  // UpdateMouseAim takes it once, so free mouse look turns with the platform instead of
+  // setting the old heading back.
+  void PortNoteCarriedYaw(float yaw) { xad4_carriedYaw += yaw; }
+  float PortTakeCarriedYaw() {
+    const float yaw = xad4_carriedYaw;
+    xad4_carriedYaw = 0.f;
+    return yaw;
+  }
+  // After the player's move each running tick: a deferred carry no mover consumed (the
+  // player did not move this tick) is applied, as retail would have, then the rider decays.
+  void PortEndMovementTick(uint tick);
 #endif
   const CTransform4f& GetFirstPersonCameraTransform(CStateManager& mgr) const;
   void UpdateDebugCamera(CStateManager& mgr);
@@ -338,12 +385,23 @@ public:
   void Update(float dt, CStateManager& mgr);
   bool MouseControlsAllowed(const CStateManager& mgr) const;
   bool MouseLookIsFree(const CStateManager& mgr) const;
+  // port: lock-on free aim, a combat lock a pointer moves under (and, under pointer aim,
+  // any empty lock).
+  bool PortLockFreeAim(const CStateManager& mgr) const;
+  // port: whether the free-aim crosshair is forced open (not over Trilogy's own cursor).
+  bool PortAimCrosshairsOpen(const CStateManager& mgr) const;
+  // port: direct aim, locked onto an empty orbit point (keeps the camera pitch).
+  bool PortEmptyLockKeepsPitch(const CStateManager& mgr) const;
   void UpdateMouseAim(CStateManager& mgr);
   void UpdateTouchLook(float dt, CStateManager& mgr); // port
   void UpdateMorphBallTransition(float dt, CStateManager& mgr);
   void UpdateAimTarget(CStateManager& mgr);
   void UpdateAimTargetTimer(float dt);
   void UpdateOrbitModeTimer(float dt);
+#ifdef TARGET_PC
+  // Trilogy's lock fade in [0, 1] (player +0x11A4): 0 free, 1 fully locked.
+  float PortTriOrbitFade() const;
+#endif
   void UpdateOrbitPreventionTimer(float dt);
   void UpdateGunAlpha();
   void UpdateVisorTransition(float dt, CStateManager& mgr);
@@ -456,7 +514,7 @@ public:
   void ActivateOrbitSource(CStateManager& mgr);
   void UpdateOrbitSelection(const CFinalInput& input, CStateManager& mgr);
   void UpdateOrbitableObjects(CStateManager& mgr);
-  void FindOrbitableObjects(const rstl::reserved_vector< TUniqueId, 1024 >& nearObjects,
+  void FindOrbitableObjects(const rstl::reserved_vector< TUniqueId, kMaxObjects >& nearObjects,
                            rstl::vector< TUniqueId >& listOut, EPlayerZoneInfo zone,
                            EPlayerZoneType type, CStateManager& mgr, bool onScreenTest) const;
   TUniqueId FindBestOrbitableObject(const rstl::vector< TUniqueId >& ids, EPlayerZoneInfo zone,
@@ -465,7 +523,7 @@ public:
   bool ValidateAimTargetId(TUniqueId id, CStateManager& mgr);
   bool ValidateObjectForMode(TUniqueId id, CStateManager& mgr) const;
   TUniqueId FindAimTargetId(CStateManager& mgr);
-  TUniqueId CheckEnemiesAgainstOrbitZone(const rstl::reserved_vector< TUniqueId, 1024 >& ids,
+  TUniqueId CheckEnemiesAgainstOrbitZone(const rstl::reserved_vector< TUniqueId, kMaxObjects >& ids,
                                         EPlayerZoneInfo zone, EPlayerZoneType type,
                                         CStateManager& mgr) const;
   void OrbitPoint(EPlayerOrbitType type, CStateManager& mgr);
@@ -608,6 +666,11 @@ private:
   CVector3f x314_orbitPoint;
   CVector3f x320_orbitVector;
   float x32c_orbitModeTimer;
+#ifdef TARGET_PC
+  // Port: Trilogy's lock fade timer (player +0x328, fn_8019BDFC). Not x32c, which is retail's
+  // decay-only cooldown.
+  float m_triOrbitFadeTimer;
+#endif
   EPlayerZoneInfo x330_orbitZoneMode;
   EPlayerZoneType x334_orbitType;
   uint x338_;
@@ -651,6 +714,7 @@ private:
   float x3f0_vertFreeLookAngleVel;
   float mTouchLookPitch = 0.f;     // port: touch-drag free-look pitch target
   bool mTouchLookActive = false;   // port: touch look owns the free-look state
+  bool mMouseLookButtonHeld = false;  // port: R held under mouse aim (R-jump, issue #252)
   TUniqueId x3f4_aimTarget;
   CVector3f x3f8_targetAimPosition;
   TReservedAverage< CVector3f, 10 > x404_aimTargetAverage;
@@ -781,6 +845,62 @@ private:
   // Port: the trial ground-mover run counter (see PortGroundMoverRuns above). Default 0;
   // the source layout is not affected (every check below is inert off-MWERKS).
   uint32_t xa38_groundMoverRuns = 0;
+  // Port: platform riders under the Remastered grounded mover (see PortRider above).
+  struct SPortDeferredCarry {
+    CVector3f delta;
+    CQuaternion rotDelta;
+    bool rotate;
+  };
+  PortRemasteredGroundRider::RiderController xa3c_rider;
+  bool xa44_lastTickRemasteredCarry = false;
+  uint xa48_retailCarryTick = ~0u;
+  int xa4c_deferredCarryCount = 0;
+  uint xa50_deferredCarryTick = ~0u;
+  SPortDeferredCarry xa54_deferredCarry[4];
+  float xad4_carriedYaw = 0.f;
+  // Port: Remastered's frozen VFX (SPlayerFrozenStateDataShip1 +0x10, CPlayerMP1 +0x10d0), a
+  // HUD billboard that replaces the visor steam while frozen. Its id, the effect (+0x1110)
+  // and the amount bound to its de3a3b53 real (+0x1114).
+  CAssetId xPortFrozenFxId = kInvalidAssetId;
+  TUniqueId xPortFrozenFx = kInvalidUniqueId;
+  float xPortFrozenFxAmount = 0.f;
+  void PortCreateFrozenFx(CStateManager& mgr);
+  void PortTickFrozenFx(CStateManager& mgr, float dt);
+  void PortBindFrozenFx(CStateManager& mgr);
+
+public:
+  // Port: Remastered's visor steam (CPlayerMP1::SVisorSteamShip1Parameters), set each frame by
+  // a Steam object a mod's .roomfx gave its SteamMP1 (CScriptSteam).
+  struct SPortVisorSteamShip1Params {
+    bool flag;       // +0x0: bind the colour
+    float colour[4]; // +0x4: CColor4f
+    CVector3f dir;   // +0x14: camera-space direction of the steam source
+    float b;         // +0x20: thermal cold scale
+    float i;         // +0x24
+    float s1;        // +0x28: fade-in rate
+    float a;         // +0x2c: fade-out rate
+    float s2;        // +0x30: post-FX scale
+    float g;         // +0x34: second amount's rise rate
+    float h;         // +0x38: its fall rate
+  };
+  // CScriptSteamMP1::Think 0xf36498 tail: start the effect, or retarget the running one.
+  void PortSetVisorSteamShip1(CAssetId part, const SPortVisorSteamShip1Params& params,
+                              CStateManager& mgr);
+
+private:
+  // CPlayerMP1::CVisorSteamShip1 (+0xab0): the HUD billboard (+0x0), active this frame (+0x4),
+  // the first direction (+0x8), current (+0x14) and target (+0x50) parameters, state (+0x8c),
+  // amount (+0x90), time (+0x94) and second amount (+0x98).
+  TUniqueId xPortSteamFx = kInvalidUniqueId;
+  bool xPortSteamActive = false;
+  CVector3f xPortSteamInitDir = CVector3f(0.f, 0.f, 0.f);
+  SPortVisorSteamShip1Params xPortSteamCur = {};
+  SPortVisorSteamShip1Params xPortSteamTgt = {};
+  int xPortSteamState = 0;
+  float xPortSteamAmount = 0.f;
+  float xPortSteamTime = 0.f;
+  float xPortSteamAmount2 = 0.f;
+  void PortUpdateVisorSteamShip1(float dt, CStateManager& mgr);
 #endif
 };
 NESTED_CHECK_SIZEOF(CPlayer, CPlayerStuckTracker, 0x2e0);

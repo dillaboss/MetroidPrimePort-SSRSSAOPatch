@@ -114,6 +114,8 @@ public:
   // IsOnWallAtPosition 0xf93c9c and SnapToGround 0xf934ec.
   static void MoveGroundedRemastered(CStateManager& mgr, CPlayer& player, float dt,
                                      const TEntityList*);
+  // Scales the whole velocity down when its rise exceeds the player's maximum (0xf94480).
+  static void PortCapRise(CStateManager& mgr, CPlayer& player);
 #endif
 
   static void MakeCollisionCallbacks(CStateManager&, CPhysicsActor&, const TUniqueId&,

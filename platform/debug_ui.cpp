@@ -2,154 +2,36 @@
 // is already initialized and rendered every presented frame, so this only has
 // to build the windows between aurora_begin_frame and aurora_end_frame.
 //
-// The overlay is one translation unit split across files: this one holds the
-// shared state, and each section (a page, the settings table, the toasts...)
-// lives in platform/debug_ui/<section>.inc, #included below in its place. The
-// parts are not compiled on their own; tools/check_settings_index.py reads
-// them with this file.
+// The overlay is split across files: this one holds the settings and runtime
+// switches the game reads and the state shared across threads; the settings
+// file, each page and each section live in platform/debug_ui/<section>.cpp.
+// What more than one of them uses is declared in debug_ui/debug_ui_internal.h.
 
-#include "port_env.h"
-#include "port_collision_view.h"
-#include "port_debug.h"
-#include "port_gyro_motion.h"
-#include "port_dynamic_res.h"
-#include "port_freecam.h"
-#include "port_photo.h"
-#include "port_pointer.h"
-#include "port_hd_font.h"
-#include "port_room_env.h"
-#include "port_room_geo.h"
-#include "port_log.h"
-#include "port_log_file.h"
-#include "port_paths.h"
-#include "port_config_reset.h"
-#include "port_apclient.h"
-#include "port_rando_gen.h"
-#include "port_controls.h"
-#include "port_input_devices.h"
-#include "port_input_remap_ui.h"
-#include "port_data_folder.h"
-#include "port_gci.h"
-#include "port_mods.h"
-#include "port_importers.h"
-#include "port_remastered_effect_import.h"
-#include "port_remastered_import.h"
-#include "port_remastered_text.h"
-#include "port_discord.h"
-#include "port_update_check.h"
-#include "port_gallery.h"
-#include "port_livesplit.h"
-#include "port_map_pickups.h"
-#include "port_prompts.h"
-#include "port_tracker.h"
-#include "port_savestate.h"
-#include "port_skip_cutscenes.h"
-#include "port_mouse.h"
-#include "port_input_map.h"
-#include "port_textures.h"
+#include "debug_ui/debug_ui_internal.h"
+
 #include "port_build_info.h"
-#include "port_gpu_driver.h"
-#include "port_disc.h"
-#include "port_pal_languages.h"
-#if defined(__ANDROID__)
-#include "touch_pad.h"
-#endif
+#include "port_discord.h"
+#include "port_env.h"
+#include "port_gyro_motion.h"
+#include "port_input_devices.h"
+#include "port_livesplit.h"
+#include "port_log.h"
+#include "port_paths.h"
+#include "port_pointer.h"
+#include "port_update_check.h"
 
-#include "MetroidPrime/Cameras/CCameraManager.hpp"
-#include "Kyoto/Graphics/CCubeMaterial.hpp"
-#include "Kyoto/Graphics/CGX.hpp"
-#include "Kyoto/Graphics/CGraphics.hpp"
-#include "Kyoto/Graphics/CCubeModel.hpp"
-#include "Kyoto/Graphics/CModel.hpp"
-#include "Kyoto/Graphics/CTexture.hpp"
-#include "GuiSys/CGuiModel.hpp"
-#include "MetroidPrime/CHealthInfo.hpp"
-#include "MetroidPrime/CGameArea.hpp"
-#include "MetroidPrime/CMapWorld.hpp"
-#include "MetroidPrime/CMemoryCard.hpp"
-#include "MetroidPrime/CStateManager.hpp"
-#include "MetroidPrime/CWorld.hpp"
-#include "MetroidPrime/CScriptLayerManager.hpp"
-#include "MetroidPrime/Player/CGameOptions.hpp"
-#include "MetroidPrime/Player/CGameState.hpp"
-#include "MetroidPrime/Player/CPlayerState.hpp"
-#include "Kyoto/CResFactory.hpp"
-#include "Kyoto/Streams/CMemoryInStream.hpp"
-#include "Kyoto/Streams/CMemoryStreamOut.hpp"
-#include "Kyoto/Audio/CSfxManager.hpp"
-#include "MetroidPrime/SFX/UI.h"
-
-#include <aurora/aurora.h>
-#include <aurora/gfx.h>
-#include <aurora/imgui.h>
-#include <dolphin/gx/GXExtra.h>
-#include <dolphin/pad.h>
-#include <dolphin/vi.h>
-#include <imgui.h>
-#include <imgui_internal.h>
-#include <musyx/port_voices.h>
-
-#include <SDL3/SDL_dialog.h>
-#include <SDL3/SDL_filesystem.h>
-#include <SDL3/SDL_iostream.h>
-#include <SDL3/SDL_misc.h>
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_keyboard.h>
 #include <SDL3/SDL_mouse.h>
-#include <SDL3/SDL_gamepad.h>
-#include <SDL3/SDL_scancode.h>
-#include <SDL3/SDL_timer.h>
-#include <SDL3/SDL_events.h>
-#include <SDL3/SDL_sensor.h>
-#include <SDL3/SDL_stdinc.h>
-#include <SDL3/SDL_video.h>
 
-#if defined(__ANDROID__)
-#include <jni.h>
-#include <android/log.h>
-#include <SDL3/SDL_joystick.h>
-#include <SDL3/SDL_system.h>
-#include <cctype>
-#include <unistd.h>
-#endif
-#if !defined(_WIN32)
-extern char** environ;
-#endif
-
-#include <algorithm>
-#include <atomic>
-#include <cctype>
-#include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
-#include <filesystem>
 #include <fstream>
-#include <iterator>
-#include <map>
-#include <mutex>
-#include <optional>
-#include <sstream>
 #include <string>
-#include <utility>
-#include <vector>
 
-namespace aurora {
-void request_screenshot() noexcept;
-}
-
-// Implemented by the AI and MusyX audio backends.
-extern "C" void AIPortSetOutputEnabled(int enabled);
-extern "C" int AIPortOutputEnabled(void);
-extern "C" void salSetMuted(int muted);
-
-// ImGui's item hooks, forwarded by extern/aurora/extern/imgui_item_hook.cpp.
-extern void (*gImGuiItemAddHook)(ImGuiContext* ctx, ImGuiID id, const ImRect& rect);
-extern void (*gImGuiItemInfoHook)(ImGuiContext* ctx, ImGuiID id, const char* label,
-                                  ImGuiItemStatusFlags flags);
-
-namespace {
+namespace DebugUi {
 
 static_assert(PortInput::kScancodeLShift == SDL_SCANCODE_LSHIFT);
 PortInput::Settings& sInput = PortInput::MutableSettings();
@@ -161,9 +43,6 @@ unsigned sSimRate = 60;
 bool sSimAdaptive = false;
 bool sFrameLimitEnabled = true;
 int sFpsCap = 0; // with the 60 FPS cap off; 0 = unlimited
-constexpr int kFpsCapMin = 30;
-constexpr int kFpsCapMax = 500;
-int ClampFpsCap(int fps) { return fps <= 0 ? 0 : std::clamp(fps, kFpsCapMin, kFpsCapMax); }
 bool sTurbo = false;
 unsigned sTurboTicks = 1;
 bool sTraceTiming = false;
@@ -179,7 +58,7 @@ bool sVsyncEnabled = true;
 bool sVsyncEnabled = false;
 #endif
 // Android hides the status and navigation bars by default; a desktop starts windowed.
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(SDL_PLATFORM_IOS)
 bool sFullscreen = true;
 #else
 bool sFullscreen = false;
@@ -194,7 +73,7 @@ float sRenderScale = 1.f;
 // Dynamic resolution: draws the EFB between sDynamicResMin and sRenderScale to hold a frame rate.
 bool sDynamicRes = false;
 int sDynamicResTarget = 0;  // fps; 0 = the 60 fps cap, or the display's rate without it
-float sDynamicResMin = 1.f; // the lowest scale it drops to: 0.5, 0.75 or 1
+float sDynamicResMin = 1.f; // the lowest scale it drops to, kDynamicResMinLowest to 4
 // Sharpening of a frame stretched up to the window: 0 off, 1 while dynamic resolution has
 // lowered the scale, 2 whenever the EFB is smaller than the window. Strength 0-100.
 int sSharpenMode = 1;
@@ -203,25 +82,36 @@ float sDynScale = 0.f;      // the scale in use; 0 = sRenderScale
 PortDebug::EAspectMode sAspectMode = PortDebug::kAspect_Window;
 bool sHudWide = true;
 bool sCinemaBars = false;
+bool sBallBars = false;
+bool sPhazonShell = true;
 bool sSharpScanWindow = false;
+bool sGeneratedBallLooks = true;
 bool sAutoAim = true;
 int sScanSpeed = 100;
+int sHintDelay = 0;
+int sMusicBoost = PortDebug::kVolumeBoostDefault;
+int sSfxBoost = PortDebug::kVolumeBoostDefault;
 bool sSecondaryCrosshairs = true;
 // A remapped pad drives menus and the map with its standard buttons (issue #57).
 bool sMenuStandardButtons = true;
 // Index into kPromptGlyphs; 0 = follow the input in use. Atomic: PortPrompts reads it off the UI thread.
 std::atomic< int > sPromptGlyphs{0};
-constexpr const char* kPromptGlyphs[] = {"auto", "xbox", "playstation", "switch", "gamecube", "keyboard"};
 bool sShowShaderCompilation = true;
 bool sShowMenuHint = true;
 int sHudScale = PortDebug::kHudScaleMax;
-#if defined(__ANDROID__)
+#if defined(PORT_TOUCH_CONTROLS)
 int sScanSpread = PortDebug::kScanSpreadMin; // touch controls cover the screen edges
 #else
 int sScanSpread = PortDebug::kScanSpreadMax;
 #endif
+// Indexed by PortDebug::HudOpacityPart.
+int sHudOpacity[PortDebug::kHudOpacityPartCount] = {PortDebug::kHudOpacityVisor, PortDebug::kHudOpacityVisor,
+                                                    PortDebug::kHudOpacityVisor, PortDebug::kHudOpacityMax};
 int sCrosshairOpacity = PortDebug::kCrosshairOpacityMax;
+PortDebug::ECrosshairStyle sCrosshairStyle = PortDebug::kCrosshairStyle_Classic;
 bool sCrosshairCustomColor = false;
+bool sCrosshairXRay = false;
+bool sCrosshairThermal = false;
 float sCrosshairColor[3] = {1.f, 1.f, 1.f};
 bool sHideHelmet = false;
 bool sHideVisorEffects = false;
@@ -244,12 +134,19 @@ bool sMapLogicColors = true;
 // first playthrough.
 bool sMapPickupKinds = false;
 bool sMapStationPickups = true;
+// Off by default: the disc's own map legend and prompts, without the port's
+// lines. Room marks themselves are unaffected.
+bool sMapExtraUi = false;
 // The Tracker tab's item, scan and room counts. Off so the tab doesn't spoil
 // what is left to find until asked.
 bool sTrackerProgress = false;
 int sApSuitDamage = 1;
 bool sCheats = false;
 bool sSkippableCutscenes = false;
+// Off by default: a beam door that was opened stays blue (PortBeamDoors).
+bool sBeamDoorsStayUnlocked = false;
+bool sStackBeams = false;
+int sWalkSpeed = PortDebug::kWalkSpeedDefault;
 // The stored choice only. Randomizer and Archipelago games force it on at use
 // (PortSkipCutscenes::Forced), which the getter does not fold in.
 bool sRevision100Compatibility = false;
@@ -262,9 +159,12 @@ bool sSaveStateRoomState = true;
 std::atomic<bool> sTouchBeamShift{false}; // the touch twin layout's held Beam button
 std::atomic<bool> sTouchTurboFire{false}; // the touch Turbo button, held
 bool sInvulnerable = false;
+bool sPhazonBeamCheat = false;
 // MP_GODMODE, for this run only: -1 unset, else 0 or 1. Never saved, and changing the
 // setting ends it.
 int sInvulnerableRun = -1;
+// The infinite ammo cheat's kInfAmmo* bits. Never saved; MP_INFINITE_AMMO=1 sets them all.
+unsigned sInfiniteAmmo = 0;
 // On by default: a game that closes at launch gives no chance to tick the box
 // first, and a phone or a desktop launcher has no terminal to read.
 bool sLogFile = true;
@@ -281,6 +181,11 @@ bool sProjectedShadows = true;
 // Setting `opengles`; sOpenGlesAtStart is what this run was started with.
 bool sOpenGles = false;
 bool sOpenGlesAtStart = false;
+// Setting `graphics_backend` (Windows and desktop Linux, issue #135); sGraphicsBackendAtStart
+// is what this run was started with, so the Video page can say when a change needs a restart
+// and when Aurora fell back from it.
+PortDebug::EGraphicsBackend sGraphicsBackend = PortDebug::kGraphicsBackend_Auto;
+PortDebug::EGraphicsBackend sGraphicsBackendAtStart = PortDebug::kGraphicsBackend_Auto;
 // Setting `gpu_driver`: an installed custom Vulkan driver's id (port_gpu_driver.h), "" = the system's.
 std::string sGpuDriver;
 std::string sGpuDriverAtStart;
@@ -288,6 +193,32 @@ bool sUnlockHardMode = false;
 // Setting `storage_clamp`: -1 auto (aurora decides), 0 off, 1 on; read once when shaders are first made.
 int sStorageClamp = -1;
 int sStorageClampAtStart = -1;
+// Set when ApplyStorageClamp wrote MP_STORAGE_CLAMP from the setting, so the log can tell it from a user's.
+bool sStorageClampEnvFromSetting = false;
+// Setting `driver_workarounds`: bit i is kDriverWorkarounds[i]; AtStart is what this run's device got.
+unsigned sDriverWorkarounds = 0;
+unsigned sDriverWorkaroundsAtStart = 0;
+// What BeginDriverWorkarounds did at start, for the F1 section: error checks on this run,
+// MP_DRIVER_WORKAROUNDS overriding the boxes, or the boxes cleared after a start that failed.
+bool sDriverChecksThisRun = false;
+const char* sDriverWorkaroundsEnv = nullptr;
+bool sDriverWorkaroundsCleared = false;
+
+// `driver_workarounds` / MP_DRIVER_WORKAROUNDS: comma-separated names to kDriverWorkarounds bits.
+unsigned ParseDriverWorkarounds(std::string_view rest) {
+  unsigned bits = 0;
+  while (!rest.empty()) {
+    const size_t comma = rest.find(',');
+    const std::string_view name = rest.substr(0, comma);
+    for (size_t i = 0; i < kDriverWorkaroundCount; ++i) {
+      if (name == kDriverWorkarounds[i].key) {
+        bits |= 1u << i;
+      }
+    }
+    rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+  }
+  return bits;
+}
 bool sUnlockFusionSuit = false;
 bool sUnlockGalleries = false;
 bool sSpeedrunTimer = false;
@@ -304,13 +235,6 @@ std::string sModsDisabled;
 // are, so turning it off brings them back.
 bool sOriginalExperience = false;
 std::atomic<uint32_t> sWheelMask{0};
-// The touch wheels' icons: ARGB pixels per [wheel][item], filled by the game thread, copied out by
-// the Android UI thread.
-struct WheelIcon {
-  int w = 0;
-  int h = 0;
-  std::vector<uint32_t> argb;
-};
 std::mutex sWheelIconMutex;
 WheelIcon sWheelIcons[2][4];
 // The game's CGameOptions as hex of its PutTo bits. Retail keeps them only in each
@@ -334,8 +258,6 @@ bool sSmoothFrames = true;
 bool sFrameInterpolation = true;
 bool sActorInterpolation = true;
 bool sPoseInterpolation = true;
-// Faster on a phone (POCO F8 Ultra: 8-27% more fps in the heaviest rooms), even or mixed on a PC.
-constexpr bool kRoomGeoResidentDefault = true;
 bool sRoomGeoResident = kRoomGeoResidentDefault;
 bool sParticleInterpolation = true;
 float sPresentOverride = -1.f;
@@ -356,12 +278,6 @@ std::atomic< bool > sTouchColorsFlag{false};
 std::atomic< bool > sTouchLabelsFlag{true};
 std::atomic< bool > sTouchTurboFlag{false};
 std::atomic< bool > sTouchFloatingStickFlag{true};
-constexpr float kTouchMarginMaxDp = PortInput::kTouchMarginMaxDp;
-constexpr float kTouchSideMarginDefault = PortInput::kTouchSideMarginDefault;
-constexpr float kTouchStickInsetDefault = PortInput::kTouchStickInsetDefault;
-constexpr float kTouchButtonInsetDefault = PortInput::kTouchButtonInsetDefault;
-constexpr float kTouchOpacityMin = PortInput::kTouchOpacityMin;
-constexpr float kTouchOpacityMax = PortInput::kTouchOpacityMax;
 // Java's layout change is saved by the game thread's next frame: ImGui's settings
 // path isn't safe from the UI thread.
 std::atomic< bool > sTouchLayoutSavePending{false};
@@ -390,6 +306,12 @@ std::string sDiscPath;
 // the picked content:// addresses (the picker keeps their read grant).
 std::string sRemasteredImagePath;
 std::string sRemasteredKeysPath;
+// The parts the panel leaves out of an import, comma separated (remastered_skip):
+// hud, text, effects, movies, gallery, geometry.
+std::string sRemasteredSkip;
+// The parts of the installed import the mods load without (remastered_hide), comma separated:
+// PortMods::kImportParts.
+std::string sRemasteredHide;
 
 std::string SettingsFilePath() {
   const std::string& dir = PortPaths::UserFolder();
@@ -400,16 +322,44 @@ bool ParseBool(const std::string& value) {
   return value == "1" || value == "true" || value == "on" || value == "yes";
 }
 
-std::string Trim(const std::string& text) {
-  const size_t begin = text.find_first_not_of(" \t\r\n");
-  if (begin == std::string::npos) {
-    return std::string();
-  }
-  const size_t end = text.find_last_not_of(" \t\r\n");
-  return text.substr(begin, end - begin + 1);
-}
 
 void MarkDirty() { sSettingsDirty = true; }
+
+PortRemastered::ImportParts RemasteredImportParts() {
+  PortRemastered::ImportParts parts;
+  for (size_t at = 0; at < sRemasteredSkip.size();) {
+    const size_t comma = std::min(sRemasteredSkip.find(',', at), sRemasteredSkip.size());
+    const std::string part = Trim(sRemasteredSkip.substr(at, comma - at));
+    parts.hud &= part != "hud";
+    parts.text &= part != "text";
+    parts.effects &= part != "effects";
+    parts.movies &= part != "movies";
+    parts.gallery &= part != "gallery";
+    parts.geometry &= part != "geometry";
+    at = comma + 1;
+  }
+  return parts;
+}
+
+void SetRemasteredImportParts(const PortRemastered::ImportParts& parts) {
+  std::string skip;
+  const auto add = [&](bool kept, const char* name) {
+    if (!kept) {
+      skip += skip.empty() ? "" : ",";
+      skip += name;
+    }
+  };
+  add(parts.geometry, "geometry");
+  add(parts.effects, "effects");
+  add(parts.hud, "hud");
+  add(parts.text, "text");
+  add(parts.movies, "movies");
+  add(parts.gallery, "gallery");
+  if (skip != sRemasteredSkip) {
+    sRemasteredSkip = skip;
+    MarkDirty();
+  }
+}
 
 void ApplyLiveSplit() {
   PortLiveSplit::Configure(sLiveSplit, sLiveSplitAddress, sLiveSplitSplitUpgrades);
@@ -425,8 +375,8 @@ void ApplyUpdateCheck() {
                              (dir.empty() ? std::string("./") : dir) + "update-check.txt");
 }
 
-} // namespace
-#include "debug_ui/settings.inc"
+} // namespace DebugUi
+
 namespace {
 // Whether the player just used a real pad, keyboard or mouse. The touch overlay
 // is itself a virtual pad, and touches also arrive as a mouse, so neither counts.
@@ -466,80 +416,12 @@ bool IsPhysicalInput(const SDL_Event& event) {
     return false;
   }
 }
+} // namespace
 
-// Photo mode on a touchscreen: the touch controls hide (nativeDebugOverlayVisible), a finger
-// put down on the left half is an invisible stick centred where it landed, and one on the right
-// half drags the view. Fingers that land on the photo windows are left to ImGui. Events arrive on
-// Android's UI thread, so the state is shared under a lock and the game thread takes it each frame.
-constexpr float kPhotoStickRadius = 0.12f; // of the screen height, for a full stick
-constexpr float kPhotoLookDegrees = 100.f; // per screen height dragged
-struct PhotoTouch {
-  bool stickDown = false, lookDown = false; // Android finger ids start at 0
-  SDL_FingerID stick = 0;
-  SDL_FingerID look = 0;
-  float stickX = 0.f, stickY = 0.f; // where the stick finger landed
-  float moveX = 0.f, moveY = 0.f;
-  float lookX = 0.f, lookY = 0.f; // the look finger's last place
-  float yaw = 0.f, pitch = 0.f;   // not taken yet
-  bool enabled = false;
-  float aspect = 1.f; // window width over height
-  std::vector<ImVec4> windows; // x0, y0, x1, y1 as fractions of the window
-};
-std::mutex sPhotoTouchMutex;
-PhotoTouch sPhotoTouch;
-
-void PhotoTouchEvent(const SDL_Event& event) {
-  if (event.type != SDL_EVENT_FINGER_DOWN && event.type != SDL_EVENT_FINGER_MOTION &&
-      event.type != SDL_EVENT_FINGER_UP && event.type != SDL_EVENT_FINGER_CANCELED) {
-    return;
-  }
-  const SDL_TouchFingerEvent& f = event.tfinger;
-  std::lock_guard lock(sPhotoTouchMutex);
-  PhotoTouch& t = sPhotoTouch;
-  if (event.type == SDL_EVENT_FINGER_DOWN) {
-    if (!t.enabled) {
-      return;
-    }
-    for (const ImVec4& r : t.windows) {
-      if (f.x >= r.x && f.x <= r.z && f.y >= r.y && f.y <= r.w) {
-        return;
-      }
-    }
-    if (f.x < 0.5f && !t.stickDown) {
-      t.stickDown = true;
-      t.stick = f.fingerID;
-      t.stickX = f.x;
-      t.stickY = f.y;
-      t.moveX = t.moveY = 0.f;
-    } else if (f.x >= 0.5f && !t.lookDown) {
-      t.lookDown = true;
-      t.look = f.fingerID;
-      t.lookX = f.x;
-      t.lookY = f.y;
-    }
-  } else if (event.type == SDL_EVENT_FINGER_MOTION) {
-    if (t.stickDown && f.fingerID == t.stick) {
-      t.moveX = std::clamp((f.x - t.stickX) * t.aspect / kPhotoStickRadius, -1.f, 1.f);
-      t.moveY = std::clamp((t.stickY - f.y) / kPhotoStickRadius, -1.f, 1.f);
-    } else if (t.lookDown && f.fingerID == t.look) {
-      t.yaw -= (f.x - t.lookX) * t.aspect * kPhotoLookDegrees;
-      t.pitch -= (f.y - t.lookY) * kPhotoLookDegrees;
-      t.lookX = f.x;
-      t.lookY = f.y;
-    }
-  } else {
-    if (t.stickDown && f.fingerID == t.stick) {
-      t.stickDown = false;
-      t.moveX = t.moveY = 0.f;
-    }
-    if (t.lookDown && f.fingerID == t.look) {
-      t.lookDown = false;
-    }
-  }
-}
+namespace DebugUi {
 
 bool SDLCALL debug_event_watch(void*, SDL_Event* event) {
-  PhotoTouchEvent(*event);
+  PortDebug::PhotoTouchEvent(*event);
   // The port menu, save state and screenshot keys are bindings
   // (PortInputDevices::PollPortActions).
   if (event->type == SDL_EVENT_KEY_DOWN && !event->key.repeat &&
@@ -564,6 +446,7 @@ void EnsureInitialized() {
   }
   sInitialized = true;
   LoadSettings();
+  const std::string fileSettings = SettingsText();
 
   // Environment variables are explicit per-run overrides and win over the file.
   if (port::EnvFlag("MP_TRACE_TIMING")) {
@@ -572,7 +455,7 @@ void EnsureInitialized() {
   if (port::EnvFlag("MP_FAST_BOOT")) {
     sFastBoot = true;
   }
-  if (const char* language = std::getenv("MP_LANGUAGE")) {
+  if (const char* language = port::EnvString("MP_LANGUAGE")) {
     sTextLanguage = language;
   }
   if (port::EnvFlag("MP_TURBO")) {
@@ -582,7 +465,7 @@ void EnsureInitialized() {
       sTurboTicks = static_cast< unsigned >(ticks);
     }
   }
-  if (const char* present = std::getenv("MP_PRESENT_T")) {
+  if (const char* present = port::EnvString("MP_PRESENT_T")) {
     if (std::strcmp(present, "cycle") == 0) {
       sPresentOverride = PortDebug::kPresentCycle;
     } else if (std::strcmp(present, "tick") == 0) {
@@ -598,13 +481,16 @@ void EnsureInitialized() {
   if (port::EnvFlag("MP_SKIP_CUTSCENES")) {
     sSkipCutscenes = true;
   }
-  if (const char* god = std::getenv("MP_GODMODE")) {
-    sInvulnerableRun = ParseBool(god) ? 1 : 0;
+  if (port::EnvString("MP_GODMODE") != nullptr) {
+    sInvulnerableRun = port::EnvFlag("MP_GODMODE") ? 1 : 0;
+  }
+  if (port::EnvFlag("MP_INFINITE_AMMO")) {
+    sInfiniteAmmo = PortDebug::kInfAmmoAll;
   }
   if (port::EnvFlag("MP_SHOW_DEBUG_UI")) {
     sVisible = true;
   }
-  if (const char* aspect = std::getenv("MP_ASPECT")) {
+  if (const char* aspect = port::EnvString("MP_ASPECT")) {
     if (std::strcmp(aspect, "16:9") == 0) {
       sAspectMode = PortDebug::kAspect_16_9;
     } else if (std::strcmp(aspect, "window") == 0) {
@@ -617,13 +503,32 @@ void EnsureInitialized() {
   }
   sHudWide = port::EnvFlag("MP_HUD_WIDE", sHudWide);
   sCinemaBars = port::EnvFlag("MP_CINEMA_BARS", sCinemaBars);
+  sBallBars = port::EnvFlag("MP_BALL_BARS", sBallBars);
   sSharpScanWindow = port::EnvFlag("MP_SHARP_SCAN_WINDOW", sSharpScanWindow);
+  sGeneratedBallLooks = port::EnvFlag("MP_POWER_SPIDER_BALL", sGeneratedBallLooks);
   sAutoAim = port::EnvFlag("MP_AUTO_AIM", sAutoAim);
   sScanSpeed = std::clamp(port::EnvInt("MP_SCAN_SPEED", sScanSpeed), PortDebug::kScanSpeedMin,
                           PortDebug::kScanSpeedMax);
+  sHintDelay = std::clamp(port::EnvInt("MP_HINT_DELAY", sHintDelay), PortDebug::kHintDelayMin,
+                          PortDebug::kHintDelayMax);
+  sMusicBoost = std::clamp(port::EnvInt("MP_MUSIC_BOOST", sMusicBoost), PortDebug::kVolumeBoostMin,
+                           PortDebug::kVolumeBoostMax);
+  sSfxBoost = std::clamp(port::EnvInt("MP_SFX_BOOST", sSfxBoost), PortDebug::kVolumeBoostMin,
+                         PortDebug::kVolumeBoostMax);
+  ApplyVolumeBoosts();
   sSecondaryCrosshairs = port::EnvFlag("MP_SECONDARY_CROSSHAIRS", sSecondaryCrosshairs);
+  if (const char* style = std::getenv("MP_CROSSHAIR_STYLE")) {
+    if (std::strcmp(style, "classic") == 0) {
+      sCrosshairStyle = PortDebug::kCrosshairStyle_Classic;
+    } else if (std::strcmp(style, "remastered") == 0) {
+      sCrosshairStyle = PortDebug::kCrosshairStyle_Remastered;
+    } else if (std::strcmp(style, "gamecube") == 0) {
+      sCrosshairStyle = PortDebug::kCrosshairStyle_GameCube;
+    }
+  }
   sMenuStandardButtons = port::EnvFlag("MP_MENU_STANDARD_BUTTONS", sMenuStandardButtons);
   PortPointer::SetEnabled(port::EnvFlag("MP_POINTER_MENUS", PortPointer::Enabled()));
+  PortPointer::SetMapSwapFingers(port::EnvFlag("MP_MAP_SWAP_FINGERS", PortPointer::MapSwapFingers()));
   PortInput::ApplyEnvOverrides();
   if (port::EnvFlag("MP_DISABLE_AI_AUDIO")) {
     sAiAudioEnabled = false;
@@ -642,15 +547,16 @@ void EnsureInitialized() {
     sSimAdaptive = true;
   }
   sOriginalExperience = port::EnvFlag("MP_ORIGINAL", sOriginalExperience);
-  if (std::getenv("MP_SSAO") != nullptr) {
+  if (port::EnvString("MP_SSAO") != nullptr) {
     sSsaoRun = port::EnvFlag("MP_SSAO", false) ? 1 : 0;
   }
-  if (std::getenv("MP_SSR") != nullptr) {
+  if (port::EnvString("MP_SSR") != nullptr) {
     sSsrRun = port::EnvFlag("MP_SSR", false) ? 1 : 0;
   }
-  if (std::getenv("MP_FPS_CAP") != nullptr) {
+  if (port::EnvString("MP_FPS_CAP") != nullptr) {
     sFpsCap = ClampFpsCap(port::EnvInt("MP_FPS_CAP", 0));
   }
+  NoteEnvOverrides(fileSettings);
 
   std::atexit(SaveSettings);
   ApplyLiveSplit();
@@ -658,39 +564,12 @@ void EnsureInitialized() {
   ApplyUpdateCheck();
   PortUpdateCheck::CheckNow(); // once per launch
 }
-} // namespace
+} // namespace DebugUi
 
 namespace PortDebug {
 
-#include "debug_ui/options.inc"
-#include "debug_ui/input.inc"
-#include "debug_ui/runtime.inc"
-#include "debug_ui/ui_common.inc"
-#include "debug_ui/performance.inc"
-#include "debug_ui/file_dialogs.inc"
-namespace {
-} // namespace
-#include "debug_ui/gallery.inc"
-namespace {
-} // namespace
-#include "debug_ui/overlays.inc"
-namespace {
-} // namespace
-#include "debug_ui/mods.inc"
-#include "debug_ui/game_sections.inc"
-#include "debug_ui/video.inc"
-#include "debug_ui/controls.inc"
-#include "debug_ui/audio.inc"
-#include "debug_ui/archipelago.inc"
-#include "debug_ui/cheats.inc"
-#include "debug_ui/remastered.inc"
-#include "debug_ui/debug.inc"
-#include "debug_ui/tracker.inc"
-#include "debug_ui/savestates.inc"
-#include "debug_ui/tabs.inc"
-#include "debug_ui/randomizer.inc"
-#include "debug_ui/search.inc"
-#include "debug_ui/window.inc"
+void MarkSettingsDirty() { MarkDirty(); }
+
 void LoadDiscPath() {
   const std::string path = SettingsFilePath();
   std::ifstream file(path);
@@ -704,7 +583,7 @@ void LoadDiscPath() {
       continue;
     }
     sDiscPath = Trim(line.substr(separator + 1));
-    std::fprintf(stderr, "metroid_prime_port: saved disc image %s\n", sDiscPath.c_str());
+    PortLog::Write("metroid_prime_port: saved disc image %s\n", sDiscPath.c_str());
     return;
   }
 }
@@ -719,5 +598,3 @@ void SetDiscPath(const char* path) {
 }
 
 } // namespace PortDebug
-
-#include "debug_ui/android_jni.inc"

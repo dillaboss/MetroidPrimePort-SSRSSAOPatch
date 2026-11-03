@@ -13,6 +13,8 @@ struct DrawData {
   PipelineRef pipeline;
   wgpu::Color color;
   float depth = 0.f;
+  // The part of the target cleared; empty: all of it.
+  ClipRect rect{};
 };
 
 constexpr uint32_t ClearPipelineConfigVersion = 4;

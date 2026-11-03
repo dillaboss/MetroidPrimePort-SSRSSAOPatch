@@ -1,5 +1,7 @@
 #include "port_remastered_ground_world.h"
 
+#include "port_remastered_collision_material.h"
+
 #include <limits>
 
 namespace PortRemasteredGroundWorld {
@@ -14,17 +16,8 @@ using PortRemasteredGroundContacts::AABB;
 // this module's `Result` is never ambiguous.
 using GeometryResult = PortRemasteredGroundContacts::Result;
 
-// CMaterialList bits. The port's list uses the same bit numbers as the shipped
-// list the material translators read (include/Collision/CMaterialList.hpp).
-constexpr std::uint64_t kBitCeiling = 29;
-constexpr std::uint64_t kBitWall = 30;
-constexpr std::uint64_t kBitFloor = 31;
-constexpr std::uint64_t kBitCharacter = 33;
-constexpr std::uint64_t kBitSolidCharacter = 55;
-constexpr std::uint64_t kBitNoPlayerCollision = 58;
-
 // port -> Remastered canonical, and its own inverse: the change is symmetric.
-// See platform/port_remastered_room.cpp:277 (kR2G) and 359-363 (MulR2G).
+// See platform/port_remastered_room_internal.h (kR2G and MulR2G).
 inline float RemFromPortX(float x) { return -x; }
 
 inline Vec3 ToRemastered(const Vec3f& v) { return {RemFromPortX(v.x), v.z, v.y}; }
@@ -87,20 +80,14 @@ Contact FromGeometry(const PortRemasteredGroundContacts::Contact& c, bool self,
 } // namespace
 
 int Orientation(std::uint64_t materialBits) {
-  // TranslatePositiveMP1Material stores in bit order 29, 30, 31, each
-  // overwriting the previous one (0xc59e04, 0xc59e10, 0xc59e1c).
-  const bool floor = (materialBits & (1ull << kBitFloor)) != 0;
-  const bool wall = (materialBits & (1ull << kBitWall)) != 0;
-  const bool ceiling = (materialBits & (1ull << kBitCeiling)) != 0;
-  return floor ? 0 : wall ? 2 : ceiling ? 1 : -1;
+  // TranslatePositiveMP1Material, 0xc59c20 (orientation stores 0xc59e04-0xc59e1c).
+  return PortRemasteredCollisionMaterial::TranslatePositive(materialBits).orientation;
 }
 
 bool Flag100(std::uint64_t materialBits) {
-  if ((materialBits & (1ull << kBitNoPlayerCollision)) != 0) {
-    return true;
-  }
-  return (materialBits & (1ull << kBitCharacter)) != 0 &&
-         (materialBits & (1ull << kBitSolidCharacter)) == 0;
+  // Actor behavior bit 0x100 (NoPlayerCollision, or Character && !SolidCharacter,
+  // 0xc53ccc): the only behavior values carrying 0x100 are 0x110.
+  return (PortRemasteredCollisionMaterial::TranslateActor(materialBits).behavior & 0x100u) != 0;
 }
 
 bool BuildTriangleContacts(const Query& query, const Triangle& tri,
@@ -126,6 +113,7 @@ bool BuildTriangleContacts(const Query& query, const Triangle& tri,
   // already merged into `materialBits`.
   contacts[count++] = FromGeometry(r.box, true, query.actorMaterialBits, boxLo, boxHi, 0);
   contacts[count++] = FromGeometry(r.triangle, false, tri.materialBits, triLo, triHi, 0);
+  contacts[count - 1].ownerUid = tri.ownerUid;
   for (std::size_t j = 0; j < count; ++j) {
     const auto& source = j == 0 ? r.box : r.triangle;
     for (std::size_t p = source.firstPoint; p <= source.lastPoint && p < r.pointCount; ++p) {

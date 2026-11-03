@@ -2,8 +2,13 @@
 
 #include "port_console.h"
 #include "port_debug.h"
+#include "port_disc.h"
+#include "port_dread_samus_mod.h"
+#include "port_hints.h"
 #include "port_mouse.h"
 #include "port_freecam.h"
+#include "port_third_person.h"
+#include "port_third_person_body.h"
 
 #include "Collision/CInternalCollisionStructure.hpp"
 #include "Kyoto/CDependencyGroup.hpp"
@@ -46,6 +51,7 @@
 #include "MetroidPrime/SFX/PuddleSpore.h"
 #include "MetroidPrime/SFX/Weapons.h"
 #include "MetroidPrime/ScriptObjects/CHUDBillboardEffect.hpp"
+#include "Kyoto/Particles/CElementGen.hpp"
 #include "MetroidPrime/ScriptObjects/CScriptAreaAttributes.hpp"
 #include "MetroidPrime/ScriptObjects/CScriptWater.hpp"
 #include "MetroidPrime/TCastTo.hpp"
@@ -68,6 +74,9 @@
 #include "Kyoto/Math/CTransform4f.hpp"
 #include "Kyoto/Math/CVector3f.hpp"
 #include "Kyoto/Math/CloseEnough.hpp"
+#ifdef TARGET_PC
+#include "Kyoto/CResFactory.hpp"
+#endif
 #include "Kyoto/Text/CStringTable.hpp"
 
 #include "Collision/CCollisionInfo.hpp"
@@ -261,6 +270,9 @@ CPlayer::CPlayer(TUniqueId uid, const CTransform4f& xf, const CAABox& aabb, CAss
 , x314_orbitPoint(0.f, 0.f, 0.f)
 , x320_orbitVector(0.f, 0.f, 0.f)
 , x32c_orbitModeTimer(0.f)
+#ifdef TARGET_PC
+, m_triOrbitFadeTimer(0.f)
+#endif
 , x330_orbitZoneMode(kZI_Targeting)
 , x334_orbitType(kZT_Ellipse)
 , x338_(1)
@@ -567,7 +579,12 @@ void CPlayer::UpdateGunState(const CFinalInput& input, CStateManager& mgr) {
       needsDraw = true;
     }
 
-    if (x3b8_grappleState != kGS_None ||
+#ifdef TARGET_PC
+    const bool grappleHolsters = x3b8_grappleState != kGS_None && !PortDebug::GrappleShoot();
+#else
+    const bool grappleHolsters = x3b8_grappleState != kGS_None;
+#endif
+    if (grappleHolsters ||
         mgr.GetPlayerState()->GetCurrentVisor() == CPlayerState::kPV_Scan ||
         mgr.GetPlayerState()->GetTransitioningVisor() == CPlayerState::kPV_Scan) {
       needsDraw = false;
@@ -772,7 +789,8 @@ void CPlayer::UpdateGunTransform(const CVector3f& gunPos, CStateManager& mgr) {
   // ray through the pointer would miss what the pointer is on. Shots and the gun model aim
   // from the gun at the point the ray hits instead (or a far point when it hits nothing);
   // the model turns only so far, so it stays in view. No assist bends the shot off the
-  // pointer (a lock re-centres the pointer and aims as usual).
+  // pointer (a lock re-centres the pointer and aims as usual; under lock-on free aim, with
+  // or without pointer aim, a centred pointer still does).
   float pointerX = 0.f;
   float pointerY = 0.f;
   x490_gun->PortSetPointerAimPoint(false, CVector3f::Zero());
@@ -911,6 +929,39 @@ bool CPlayer::MouseLookIsFree(const CStateManager& mgr) const {
   return MouseControlsAllowed(mgr) && (x304_orbitState == kOS_NoOrbit || x304_orbitState == kOS_Grapple);
 }
 
+bool CPlayer::PortLockFreeAim(const CStateManager& mgr) const {
+  // Scan locks and grapples still aim through the centre.
+  if (!MouseControlsAllowed(mgr) ||
+      mgr.GetPlayerState()->GetCurrentVisor() == CPlayerState::kPV_Scan) {
+    return false;
+  }
+  // Under pointer aim an empty lock always frees the pointer: Trilogy's Z with nothing
+  // targeted holds the view and leaves the cursor free. A target lock follows the setting.
+  if (x304_orbitState == kOS_OrbitPoint && PortDebug::PointerAim()) {
+    return true;
+  }
+  return PortDebug::LockOnFreeAim() &&
+         (x304_orbitState == kOS_OrbitObject || x304_orbitState == kOS_OrbitPoint ||
+          x304_orbitState == kOS_OrbitCarcass || x304_orbitState == kOS_ForcedOrbitObject);
+}
+
+// The port's free-aim crosshair. On a Trilogy disc with the Classic style, Trilogy's aiming
+// cursor marks the aim and the retained GC crosshair, drawn at the view centre (fn_80238C88 at
+// +0xF0, the pointer ray at distance 0), would be a second one (issue #219): there only the
+// show-crosshairs input opens it, as on the Wii. The GameCube and Remastered styles draw from
+// the open crosshair in place of Trilogy's cursor.
+bool CPlayer::PortAimCrosshairsOpen(const CStateManager& mgr) const {
+  if (PortDisc::IsTrilogy(PortDisc::Current()) &&
+      PortDebug::CrosshairStyle() == PortDebug::kCrosshairStyle_Classic) {
+    return false;
+  }
+  return (PortDebug::AimCrosshair() && MouseLookIsFree(mgr)) || PortLockFreeAim(mgr);
+}
+
+bool CPlayer::PortEmptyLockKeepsPitch(const CStateManager& mgr) const {
+  return MouseControlsAllowed(mgr) && x304_orbitState == kOS_OrbitPoint;
+}
+
 void CPlayer::UpdateMouseAim(CStateManager& mgr) {
   const bool active = MouseControlsAllowed(mgr);
   if (!active && PortDebug::MouseAim() && PortDebug::MouseGameplayActive()) {
@@ -920,8 +971,25 @@ void CPlayer::UpdateMouseAim(CStateManager& mgr) {
   if (active) {
     forward = mgr.GetCameraManager()->GetFirstPersonCamera()->GetGunFollowTransform().GetForward();
   }
+  // A rotating platform's rider carry turned the player this tick (Remastered movers only).
+  // Free look turns with it, or the SetTransform below would put the old heading back. Taken
+  // every call, so a turn under a lock or without mouse aim (which keeps it on the player's
+  // transform) is never applied later.
+  const float carriedYaw = PortTakeCarriedYaw();
+  if (carriedYaw != 0.f && active && MouseLookIsFree(mgr)) {
+    PortDebug::TurnMouseAim(carriedYaw);
+  }
+  // An analog L's travel starts a point orbit a tick or more before its click locks on
+  // (UpdateOrbitInput). In the Scan Visor the pointer holds still through it, so the click
+  // picks the scan point under the pointer's window rather than the one at the centre
+  // (issue #190).
+  const bool scanPointHold = x304_orbitState == kOS_OrbitPoint &&
+                             mgr.GetPlayerState()->GetCurrentVisor() == CPlayerState::kPV_Scan;
+  const bool lockFree = PortLockFreeAim(mgr);
+  const bool emptyLock = lockFree && x304_orbitState == kOS_OrbitPoint && PortDebug::PointerAim();
   if (PortDebug::UpdateMouseAim(active, !MouseLookIsFree(mgr),
-                               forward.GetX(), forward.GetY(), forward.GetZ())) {
+                               forward.GetX(), forward.GetY(), forward.GetZ(),
+                               lockFree, scanPointHold, emptyLock)) {
     SetTransform(CQuaternion::ZRotation(CRelAngle(PortDebug::AimYaw()))
                      .BuildTransform4f(GetTransform().GetTranslation()));
   }
@@ -932,7 +1000,7 @@ void CPlayer::UpdateMouseAim(CStateManager& mgr) {
     // pitch-down under free mouse look, and CheckPostGrapple reads a zero jump
     // timer in the air as a grapple jump, which blocked the sideways dash.
     x3ec_freeLookPitchAngle = PortDebug::AimPitch();
-    x9c4_25_showCrosshairs = PortDebug::AimCrosshair() && MouseLookIsFree(mgr);
+    x9c4_25_showCrosshairs = PortAimCrosshairsOpen(mgr);
   }
 }
 
@@ -1149,6 +1217,10 @@ bool CPlayer::ShouldSampleFailsafe(CStateManager& mgr) const {
 }
 
 void CPlayer::UpdateVisorState(const CFinalInput& input, float dt, CStateManager& mgr) {
+#ifdef TARGET_PC
+  // CPlayerMP1::UpdateVisorState updates the Remastered visor steam first.
+  PortUpdateVisorSteamShip1(dt, mgr);
+#endif
   x7a0_visorSteam.Update(dt);
   if (x7a0_visorSteam.AffectsThermal()) {
     mgr.SetThermalColdScale2(mgr.GetThermalColdScale2() + x7a0_visorSteam.GetAlpha());
@@ -1417,13 +1489,18 @@ void CPlayer::SetMorphBallState(EPlayerMorphBallState state, CStateManager& mgr)
     if (x9c5_26_ && mgr.GetCameraManager()->GetInsideFluid()) {
       if (const CScriptWater* water = GetVisorRunoffEffect(mgr)) {
         if (water->GetUnmorphVisorRunoffEffect()) {
-          mgr.AddObject(rs_new CHUDBillboardEffect(
+          CHUDBillboardEffect* effect = rs_new CHUDBillboardEffect(
               rstl::optional_object< TToken< CGenDescription > >(
                   *water->GetUnmorphVisorRunoffEffect()),
               rstl::optional_object_null(), mgr.AllocateUniqueId(), true,
               rstl::string_l("WaterSheets"), CHUDBillboardEffect::GetNearClipDistance(mgr),
               CHUDBillboardEffect::GetScaleForPOV(mgr), CColor(1.f, 1.f, 1.f, 1.f),
-              CVector3f(1.f, 1.f, 1.f), CVector3f(0.f, 0.f, 0.f)));
+              CVector3f(1.f, 1.f, 1.f), CVector3f(0.f, 0.f, 0.f));
+#ifdef TARGET_PC
+          // CPlayerMP1::SetMorphBallState 0xc6b988: scale type 0.
+          effect->PortSetScaleType(0);
+#endif
+          mgr.AddObject(effect);
         }
         DoSfxEffects(CSfxManager::SfxStart(water->GetUnmorphVisorRunoffSfx()));
       }
@@ -1563,14 +1640,26 @@ void CPlayer::SetCameraState(EPlayerCameraState camState, CStateManager& mgr) {
 }
 
 void CPlayer::UpdateFreeLookState(const CFinalInput& input, float dt, CStateManager& mgr) {
+  mMouseLookButtonHeld = false;
   if (MouseControlsAllowed(mgr)) {
+    // Port: the mouse owns the view, but R still does what holding it does to the
+    // camera timers (UpdateCameraTimers). That zeroes the jump camera timer, so a
+    // later L in the air keeps Samus's momentum (CheckPostGrapple skips ComputeDash):
+    // the R-jump (issue #252).
+    const bool hold1 = ControlMapper::GetDigitalInput(ControlMapper::kC_LookHold1, input);
+    const bool hold2 = ControlMapper::GetDigitalInput(ControlMapper::kC_LookHold2, input);
+    mMouseLookButtonHeld =
+        gpTweakPlayer->mHoldButtonsForFreeLook &&
+        (gpTweakPlayer->mTwoButtonsForFreeLook ? hold1 && hold2 : hold1 || hold2) &&
+        x304_orbitState != kOS_ForcedOrbitObject &&
+        (x3b8_grappleState == kGS_None || x3b8_grappleState == kGS_Firing);
     x3dc_inFreeLook = false;
     x3dd_lookButtonHeld = false;
     x3de_lookAnalogHeld = false;
     x3e4_freeLookYawAngle = 0.f;
     x3e8_horizFreeLookAngleVel = 0.f;
     x3f0_vertFreeLookAngleVel = 0.f;
-    x9c4_25_showCrosshairs = PortDebug::AimCrosshair() && MouseLookIsFree(mgr);
+    x9c4_25_showCrosshairs = PortAimCrosshairsOpen(mgr);
     return;
   }
   if (x304_orbitState == kOS_ForcedOrbitObject || IsMorphBallTransitioning() ||
@@ -1653,7 +1742,7 @@ void CPlayer::UpdateFreeLookState(const CFinalInput& input, float dt, CStateMana
 }
 
 void CPlayer::UpdateCameraTimers(float dt, const CFinalInput& input) {
-  if (x3dc_inFreeLook || x3dd_lookButtonHeld) {
+  if (x3dc_inFreeLook || x3dd_lookButtonHeld || mMouseLookButtonHeld) {
     x294_jumpCameraTimer = 0.f;
     x29c_fallCameraTimer = 0.f;
     return;
@@ -1974,7 +2063,12 @@ void CPlayer::Think(float dt, CStateManager& mgr) {
 }
 
 void CPlayer::SetFrozenState(CStateManager& stateMgr, CAssetId steamTxtr, const ushort sfx,
-                             CAssetId iceTxtr) {
+                             CAssetId iceTxtr
+#ifdef TARGET_PC
+                             ,
+                             CAssetId portFrozenFx
+#endif
+) {
   if (!stateMgr.GetCameraManager()->IsInCinematicCamera() && !GetFrozenState()) {
     bool showMsg;
     CSystemState& systemState = gpGameState->SystemState();
@@ -2005,6 +2099,12 @@ void CPlayer::SetFrozenState(CStateManager& stateMgr, CAssetId steamTxtr, const 
     IsMorphBallTransitioning();
     xa08_steamTextureId = steamTxtr;
     xa0c_iceTextureId = iceTxtr;
+#ifdef TARGET_PC
+    // CPlayerMP1::SetFrozenState 0xc6f834 copies the frozen state data, then
+    // CreateFrozenVFXShip1.
+    xPortFrozenFxId = portFrozenFx;
+    PortCreateFrozenFx(stateMgr);
+#endif
     DoSfxEffects(CSfxManager::SfxStart(sfx));
     EndLandingControlFreeze();
   }
@@ -2034,12 +2134,243 @@ void CPlayer::BreakFrozenState(CStateManager& stateMgr) {
   }
 
   x768_morphball->ResetMorphBallIceBreak();
+#ifdef TARGET_PC
+  // CPlayerMP1::BreakFrozenState 0xc6fc34 sets no visor steam: the frozen VFX fades out in
+  // TickFrozenVFXShip1.
+  if (xPortFrozenFxId != kInvalidAssetId) {
+    return;
+  }
+#endif
   SetVisorSteam(0.f, 0.3f / 0.7f, 1.f / 14.f, xa08_steamTextureId, false);
 }
+
+#ifdef TARGET_PC
+namespace {
+// The frozen VFX's amount, real de3a3b53-9c80-43d7-9ff4-48291f47306a (0x1d20730), bytes_le.
+const PortGuid& PortFrozenFxAmountGuid() {
+  static const PortGuid g = [] {
+    static const u8 b[16] = {0x53, 0x3b, 0x3a, 0xde, 0x80, 0x9c, 0xd7, 0x43,
+                             0x9f, 0xf4, 0x48, 0x29, 0x1f, 0x47, 0x30, 0x6a};
+    PortGuid r;
+    for (int i = 0; i < 16; ++i) {
+      r.bytes[i] = b[i];
+    }
+    return r;
+  }();
+  return g;
+}
+}  // namespace
+
+// CPlayerMP1::CreateFrozenVFXShip1 0xc6fad8: replace the effect with one built from the frozen
+// VFX (HUD billboard, white, scale type 0) and bind the current amount.
+void CPlayer::PortCreateFrozenFx(CStateManager& mgr) {
+  if (xPortFrozenFx != kInvalidUniqueId) {
+    mgr.DeleteObjectRequest(xPortFrozenFx);
+    xPortFrozenFx = kInvalidUniqueId;
+  }
+  if (xPortFrozenFxId == kInvalidAssetId) {
+    return;
+  }
+  xPortFrozenFx = mgr.AllocateUniqueId();
+  CHUDBillboardEffect* effect = rs_new CHUDBillboardEffect(
+      rstl::optional_object< TToken< CGenDescription > >(
+          gpSimplePool->GetObj(SObjectTag('PART', xPortFrozenFxId))),
+      rstl::optional_object_null(), xPortFrozenFx, true, rstl::string_l("FrozenVFX"),
+      CHUDBillboardEffect::GetNearClipDistance(mgr), CHUDBillboardEffect::GetScaleForPOV(mgr),
+      CColor(1.f, 1.f, 1.f, 1.f), CVector3f(1.f, 1.f, 1.f), CVector3f(0.f, 0.f, 0.f));
+  effect->PortSetScaleType(0);
+  mgr.AddObject(effect);
+  PortBindFrozenFx(mgr);
+}
+
+// CPlayerMP1::PushFrozenVFXShip1Variables 0xc701fc.
+void CPlayer::PortBindFrozenFx(CStateManager& mgr) {
+  if (CHUDBillboardEffect* effect =
+          TCastToPtr< CHUDBillboardEffect >(mgr.ObjectById(xPortFrozenFx))) {
+    if (effect->IsElementGen()) {
+      static_cast< CElementGen* >(effect->GetParticleGen())
+          ->PortBindReal(PortFrozenFxAmountGuid(), xPortFrozenFxAmount);
+    }
+  }
+}
+
+// CPlayerMP1::TickFrozenVFXShip1 0xc70088: the amount rises to 0.7 over 0.3 s while frozen and
+// falls to 0 over 0.05 s after; the effect goes once it has faded.
+void CPlayer::PortTickFrozenFx(CStateManager& mgr, float dt) {
+  const bool frozen = GetFrozenState();
+  if (frozen) {
+    if (xPortFrozenFxAmount < 0.7f) {
+      xPortFrozenFxAmount = rstl::min_val(0.7f, xPortFrozenFxAmount + dt / 0.42857146f);
+    }
+  } else if (xPortFrozenFxAmount > 0.f) {
+    xPortFrozenFxAmount = rstl::max_val(0.f, xPortFrozenFxAmount - dt / 0.071428575f);
+  }
+  PortBindFrozenFx(mgr);
+  if (!frozen && xPortFrozenFxAmount <= 0.f) {
+    mgr.DeleteObjectRequest(xPortFrozenFx);
+    xPortFrozenFx = kInvalidUniqueId;
+  }
+}
+
+namespace {
+PortGuid PortSteamGuid(const char* uuid) {
+  // Textual UUID -> bytes_le, as the PVRT stores them.
+  u8 raw[16];
+  int n = 0;
+  for (const char* p = uuid; *p != '\0' && n < 16; ++p) {
+    if (*p == '-') {
+      continue;
+    }
+    auto nib = [](char c) { return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10; };
+    raw[n++] = static_cast< u8 >(nib(p[0]) << 4 | nib(p[1]));
+    ++p;
+  }
+  PortGuid g;
+  static const int order[16] = {3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15};
+  for (int i = 0; i < 16; ++i) {
+    g.bytes[i] = raw[order[i]];
+  }
+  return g;
+}
+
+// CVisorSteamShip1::Initialize 0xc6b220's handles (0x1d206bc..0x1d2071c).
+const PortGuid& PortSteamVar(int i) {
+  static const PortGuid g[7] = {
+      PortSteamGuid("adaa0e6e-adc2-4798-8256-5bad55a79b51"),  // real: amount
+      PortSteamGuid("42cb395e-7a3a-4842-8b77-96779420664e"),  // real: time
+      PortSteamGuid("bbc89d9c-fb0b-4ba6-a621-7b7100ce24c3"),  // real: active
+      PortSteamGuid("78453678-edc6-4311-96b7-b37621aedb25"),  // vec3: direction
+      PortSteamGuid("8e03e6e6-a4cf-412b-9f04-41a92158214e"),  // vec3: first direction
+      PortSteamGuid("5722cee3-18b0-4f50-8130-36c400f16744"),  // real: i
+      PortSteamGuid("061627ff-4637-42e9-9daf-a634f4877128"),  // colour
+  };
+  return g[i];
+}
+
+// The per-float step of CVisorSteamShip1::Update: move a dt fraction of the way, or snap.
+float PortSteamApproach(float cur, float tgt, float dt) {
+  return 0.001f <= CMath::AbsF(cur - tgt) ? cur + (tgt - cur) * dt : tgt;
+}
+}  // namespace
+
+// CPlayerMP1::SetVisorSteamShip1 0xc6b3cc (with no effect yet) and CScriptSteamMP1::Think's
+// copy into the running one's target parameters.
+void CPlayer::PortSetVisorSteamShip1(CAssetId part, const SPortVisorSteamShip1Params& params,
+                                     CStateManager& mgr) {
+  if (xPortSteamFx != kInvalidUniqueId) {
+    xPortSteamTgt = params;
+  } else if (part != kInvalidAssetId && gpResourceFactory->GetResourceTypeById(part) != 0) {
+    // CreateHUDBillboardEffect(part, white, scale type 0), then CVisorSteamShip1::Initialize.
+    xPortSteamFx = mgr.AllocateUniqueId();
+    CHUDBillboardEffect* effect = rs_new CHUDBillboardEffect(
+        rstl::optional_object< TToken< CGenDescription > >(
+            gpSimplePool->GetObj(SObjectTag('PART', part))),
+        rstl::optional_object_null(), xPortSteamFx, true, rstl::string_l("VisorSteamShip1"),
+        CHUDBillboardEffect::GetNearClipDistance(mgr), CHUDBillboardEffect::GetScaleForPOV(mgr),
+        CColor(1.f, 1.f, 1.f, 1.f), CVector3f(1.f, 1.f, 1.f), CVector3f(0.f, 0.f, 0.f));
+    effect->PortSetScaleType(0);
+    effect->SetRunIndefinitely(true);
+    mgr.AddObject(effect);
+    xPortSteamActive = false;
+    xPortSteamInitDir = params.dir;
+    xPortSteamCur = params;
+    xPortSteamTgt = params;
+    xPortSteamState = 0;
+    xPortSteamAmount = 0.f;
+    xPortSteamTime = 0.f;
+    xPortSteamAmount2 = 0.f;
+  }
+  xPortSteamActive = true;
+}
+
+// CPlayerMP1::CVisorSteamShip1::Update 0xc6a4cc. Not ported: the reset when visor managed
+// effect 3 is active (the port has no visor effect manager) and the post-FX scale it writes
+// from s2 and the second amount (PostFXManager +0xaa0), which no port pass reads.
+void CPlayer::PortUpdateVisorSteamShip1(float dt, CStateManager& mgr) {
+  if (xPortSteamFx == kInvalidUniqueId) {
+    return;
+  }
+  SPortVisorSteamShip1Params& cur = xPortSteamCur;
+  const SPortVisorSteamShip1Params& tgt = xPortSteamTgt;
+  if (cur.flag) {
+    bool close = true;
+    for (int k = 0; k < 4; ++k) {
+      close = close && CMath::AbsF(cur.colour[k] - tgt.colour[k]) < 0.001f;
+    }
+    for (int k = 0; k < 4; ++k) {
+      cur.colour[k] = close ? tgt.colour[k] : (1.f - dt) * cur.colour[k] + tgt.colour[k] * dt;
+    }
+  }
+  if (!close_enough(cur.dir, tgt.dir, 0.001f)) {
+    cur.dir = cur.dir * (1.f - dt) + tgt.dir * dt;
+  } else {
+    cur.dir = tgt.dir;
+  }
+  cur.b = PortSteamApproach(cur.b, tgt.b, dt);
+  cur.i = PortSteamApproach(cur.i, tgt.i, dt);
+  cur.s1 = PortSteamApproach(cur.s1, tgt.s1, dt);
+  cur.a = PortSteamApproach(cur.a, tgt.a, dt);
+  cur.s2 = PortSteamApproach(cur.s2, tgt.s2, dt);
+  cur.g = PortSteamApproach(cur.g, tgt.g, dt);
+  cur.h = PortSteamApproach(cur.h, tgt.h, dt);
+
+  if (xPortSteamState == 0) {
+    const float rate = cur.s1 * dt;
+    if (xPortSteamActive || 0.25f <= xPortSteamAmount) {
+      xPortSteamAmount += rate;
+      xPortSteamAmount2 += cur.g * dt;
+    } else {
+      xPortSteamAmount -= rate;
+      xPortSteamAmount2 -= cur.g * dt;
+    }
+    xPortSteamTime += rate;
+  } else if (xPortSteamState == 1) {
+    xPortSteamAmount -= cur.a * dt;
+    xPortSteamTime += cur.a * dt;
+    xPortSteamAmount2 -= cur.h * dt;
+  }
+  xPortSteamAmount = rstl::min_val(rstl::max_val(xPortSteamAmount, 0.f), 1.f);
+  xPortSteamAmount2 = rstl::min_val(rstl::max_val(xPortSteamAmount2, 0.f), 1.f);
+  if (!xPortSteamActive && xPortSteamAmount == 1.f) {
+    xPortSteamState = 1;
+  }
+  mgr.AddThermalColdScale2(
+      rstl::min_val(rstl::max_val(xPortSteamAmount * cur.b, 0.f), 1.f));
+
+  if (CHUDBillboardEffect* effect =
+          TCastToPtr< CHUDBillboardEffect >(mgr.ObjectById(xPortSteamFx))) {
+    if (effect->IsElementGen()) {
+      CElementGen* gen = static_cast< CElementGen* >(effect->GetParticleGen());
+      const float half = xPortSteamAmount * 0.5f;
+      gen->PortBindReal(PortSteamVar(0), (xPortSteamState != 0 ? 1.f - half : half) * 100.f);
+      gen->PortBindReal(PortSteamVar(1), xPortSteamTime);
+      gen->PortBindReal(PortSteamVar(2), xPortSteamActive ? 1.f : 0.f);
+      gen->PortBindVector(PortSteamVar(3), cur.dir);
+      gen->PortBindVector(PortSteamVar(4), xPortSteamInitDir);
+      gen->PortBindReal(PortSteamVar(5), cur.i);
+      if (cur.flag) {
+        gen->PortBindColor(PortSteamVar(6), CColor(cur.colour[0], cur.colour[1], cur.colour[2],
+                                                   cur.colour[3]));
+      }
+    }
+  }
+  if (!xPortSteamActive && xPortSteamAmount == 0.f && xPortSteamAmount2 == 0.f) {
+    mgr.DeleteObjectRequest(xPortSteamFx);
+    xPortSteamFx = kInvalidUniqueId;
+  }
+  xPortSteamActive = false;
+}
+#endif
 
 void CPlayer::UpdateFrozenState(const CFinalInput& input, CStateManager& mgr) {
   x750_frozenTimeout -= input.Time();
   if (x750_frozenTimeout > 0.f) {
+#ifdef TARGET_PC
+    // CPlayerMP1::UpdateFrozenState 0xc6fe48 ticks the frozen VFX instead.
+    if (xPortFrozenFxId != kInvalidAssetId) {
+      PortTickFrozenFx(mgr, input.Time());
+    } else
+#endif
     SetVisorSteam(0.7f, 0.3f / 0.7f, 1.f / 14.f, xa08_steamTextureId, false);
   } else {
     BreakFrozenState(mgr);
@@ -2117,6 +2448,12 @@ void CPlayer::ProcessInput(const CFinalInput& input, CStateManager& mgr) {
     return;
   }
 
+#ifdef TARGET_PC
+  // CPlayerMP1::UpdateFrozenState runs every frame: thawed, it fades the frozen VFX out.
+  if (!GetFrozenState() && xPortFrozenFx != kInvalidUniqueId) {
+    PortTickFrozenFx(mgr, input.Time());
+  }
+#endif
   if (GetFrozenState()) {
     UpdateFrozenState(input, mgr);
 
@@ -2490,10 +2827,15 @@ void CPlayer::PreRender(CStateManager& mgr, const CFrustumPlanes& frustum) {
 
   if (x2f4_cameraState != kCS_FirstPerson
 #ifdef TARGET_PC
-      || PortFreeCam::ShowPlayer()
+      || PortFreeCam::ShowPlayer() || PortThirdPerson::Active()
 #endif
   ) {
     CActor::PreRender(mgr, frustum);
+#ifdef TARGET_PC
+    if (PortThirdPerson::Active()) {
+      PortThirdPersonBody::PreRender(mgr);
+    }
+#endif
   }
 }
 
@@ -2534,8 +2876,8 @@ void CPlayer::Render(const CStateManager& mgr) const {
 
   bool firstPerson = x2f4_cameraState == kCS_FirstPerson;
 #ifdef TARGET_PC
-  // Port: the free camera shows the body the first-person view leaves out.
-  if (PortFreeCam::ShowPlayer()) {
+  // Port: the free and third-person cameras show the body the first-person view leaves out.
+  if (PortFreeCam::ShowPlayer() || PortThirdPerson::Active()) {
     firstPerson = false;
   }
 #endif
@@ -2544,6 +2886,19 @@ void CPlayer::Render(const CStateManager& mgr) const {
     bool doBallRender = false;
     switch (x2f8_morphBallState) {
     case kMS_Unmorphed:
+#ifdef TARGET_PC
+      // Third person: the cutscene body that walks, when its pak has it.
+      if (PortThirdPerson::Active()) {
+        // The cutscene body stands on the origin, the player's origin is the middle of its box.
+        CTransform4f bodyXf = GetTransform();
+        CVector3f origin = bodyXf.GetTranslation();
+        origin.SetZ(GetBoundingBox().GetMinPoint().GetZ());
+        bodyXf.SetTranslation(origin);
+        if (PortThirdPersonBody::Render(mgr, bodyXf, GetActorLights())) {
+          break;
+        }
+      }
+#endif
       GetModelData()->Touch(mgr, 0);
       CPhysicsActor::Render(mgr);
       if (HasTransitionBeamModel()) {
@@ -2828,6 +3183,7 @@ void CPlayer::UpdateScanningState(const CFinalInput& input, CStateManager& mgr, 
                                          x3ac_scanningTime / totalTime);
           if (x3ac_scanningTime >= totalTime &&
               x3b0_curScanTime >= gpTweakGui->GetScanSidesStartTime()) {
+            PortHints::ScanCompleted(static_cast< uint32_t >(scanInfo->GetStringTableId()));
             SetScanningState(kSS_ScanComplete, mgr);
           }
         }
@@ -3199,7 +3555,9 @@ const CDamageVulnerability* CPlayer::GetDamageVulnerability() const {
 bool CPlayer::CanRenderUnsorted(const CStateManager& mgr) const { return false; }
 
 bool CPlayer::HasTransitionBeamModel() const {
-  return !x7f0_ballTransitionBeamModel.null() && !x7f0_ballTransitionBeamModel->IsNull();
+  // The Dread Samus body (port_dread_samus_mod.h) carries its own cannon: Prime's is not drawn on it.
+  return !x7f0_ballTransitionBeamModel.null() && !x7f0_ballTransitionBeamModel->IsNull() &&
+         !PortDreadSamus::Replaces(PortDreadSamus::InGameBody(x7cc_transitionSuit));
 }
 
 void CPlayer::LoadAnimationTokens() {
@@ -3378,7 +3736,7 @@ void CPlayer::DoPostCameraStuff(float dt, CStateManager& mgr) {
     if (PortDebug::MouseAim() && PortDebug::MouseGameplayActive()) x490_gun->CancelMouseInput(mgr);
     PortDebug::SetMouseGameplayActive(false);
   } else {
-    x9c4_25_showCrosshairs = PortDebug::AimCrosshair() && MouseLookIsFree(mgr);
+    x9c4_25_showCrosshairs = PortAimCrosshairsOpen(mgr);
     if (PortDebug::AimInitialized()) x3ec_freeLookPitchAngle = PortDebug::AimPitch();
   }
   UpdateArmAndGunTransforms(dt, mgr);
@@ -3468,3 +3826,51 @@ bool CPlayer::IsEnergyLow(const CStateManager& mgr) const {
 }
 
 bool CPlayer::IsTransparent() const { return x588_alpha < 1.f; }
+
+#ifdef TARGET_PC
+// CScriptPlatform::MoveRiders' player move, held until the tick's mover is known
+// (PortRemasteredGroundRider::PlanCarry). More platforms than slots: the extra carry is
+// applied at once, as retail does.
+void CPlayer::PortDeferRiderCarry(const CVector3f& delta, const CQuaternion& rotDelta, bool rotate,
+                                  uint tick) {
+  if (xa50_deferredCarryTick != tick) {
+    xa4c_deferredCarryCount = 0;
+    xa50_deferredCarryTick = tick;
+  }
+  if (xa4c_deferredCarryCount == int(sizeof(xa54_deferredCarry) / sizeof(xa54_deferredCarry[0]))) {
+    SetTranslation(GetTranslation() + delta);
+    if (rotate) {
+      SetRotation(TransformLocalToWorldRotation(rotDelta));
+    }
+    PortNoteRetailRiderCarry(tick);
+    return;
+  }
+  SPortDeferredCarry& carry = xa54_deferredCarry[xa4c_deferredCarryCount++];
+  carry.delta = delta;
+  carry.rotDelta = rotDelta;
+  carry.rotate = rotate;
+}
+
+// The deferred moves, in MoveRiders order, exactly as MoveRiders would have made them.
+void CPlayer::PortApplyDeferredRiderCarry(uint tick) {
+  if (xa50_deferredCarryTick == tick) {
+    for (int i = 0; i < xa4c_deferredCarryCount; ++i) {
+      const SPortDeferredCarry& carry = xa54_deferredCarry[i];
+      SetTranslation(GetTranslation() + carry.delta);
+      if (carry.rotate) {
+        SetRotation(TransformLocalToWorldRotation(carry.rotDelta));
+      }
+    }
+    if (xa4c_deferredCarryCount != 0) {
+      PortNoteRetailRiderCarry(tick);
+    }
+  }
+  xa4c_deferredCarryCount = 0;
+}
+
+void CPlayer::PortEndMovementTick(uint tick) {
+  PortApplyDeferredRiderCarry(tick);
+  // DecayRiderFrameCount (PostSimulation): a rider set this tick carries next tick.
+  xa3c_rider.Decay(PortDebug::TickPeriod() * 60.f);
+}
+#endif

@@ -567,6 +567,10 @@ def cmd_start(a):
 def start_run(a):
     cfg = config()
     name = a.name
+    # A mod itself (e.g. .../mods/remastered-models) loads each file as its own loose mod, so
+    # its CMDLs (the arm cannon) silently stay retail: insist on the dir that holds the mods.
+    if a.mods and a.mods != "none" and (Path(a.mods) / ".import-version").exists():
+        die(f"--mods {a.mods} is a mod, not a mods dir; pass its parent {Path(a.mods).parent}")
     d = run_dir(name)
     RIG.mkdir(parents=True, exist_ok=True)
     CACHE.mkdir(exist_ok=True)
@@ -631,6 +635,19 @@ def start_run(a):
             die(f"--settings file not found: {src}")
         if src.is_file():
             shutil.copy(src, user / "port_settings.ini")
+    ini = user / "port_settings.ini"
+    if a.mods != "none" and ini.is_file():
+        # The real settings may have the Remastered mod switched off (mods_disabled); a rig run
+        # is meant to test it, so it is always on here. --mods none is the retail A/B.
+        lines = []
+        for l in ini.read_text().splitlines():
+            if l.startswith("mods_disabled="):
+                rest = [m for m in l.split("=", 1)[1].split(",") if m and m != "remastered-models"]
+                if not rest:
+                    continue
+                l = "mods_disabled=" + ",".join(rest)
+            lines.append(l)
+        ini.write_text("\n".join(lines) + "\n")
     if not a.cutscenes:
         # Cutscenes become skippable on first sight (and get randomprime's room patches, as
         # with the F1 setting), so MP_SKIP_CUTSCENES skips them instead of fast-forwarding x8.
@@ -651,29 +668,55 @@ def start_run(a):
         mods = Path(a.mods) if a.mods else real / "mods"
     mods = mods.resolve() if mods.exists() else mods
 
-    xlog = open(d / "xvfb.log", "w")
-    xv = subprocess.Popen(["Xvfb", f":{display}", "-screen", "0", f"{a.size}x24", "-ac"],
-                          stdout=xlog, stderr=xlog, start_new_session=True)
-    run["xvfb"] = ident(xv.pid)
-    save_run(run)
-    end = time.monotonic() + 15
-    while not Path(f"/tmp/.X11-unix/X{display}").exists():
-        if xv.poll() is not None or time.monotonic() > end:
-            die(f"Xvfb :{display} failed to start: {(d / 'xvfb.log').read_text()[-200:].strip()}")
-        time.sleep(0.1)
+    host = getattr(a, "host_display", False)
+    if host:
+        # The user's own X display (Xwayland under GNOME): the real GPU driver, DRI3 and all.
+        # Xvfb's llvmpipe can't run Dawn's GL backends, so GL work needs this.
+        if not os.environ.get("DISPLAY"):
+            die("--host-display needs DISPLAY set")
+    else:
+        xlog = open(d / "xvfb.log", "w")
+        xv = subprocess.Popen(["Xvfb", f":{display}", "-screen", "0", f"{a.size}x24", "-ac"],
+                              stdout=xlog, stderr=xlog, start_new_session=True)
+        run["xvfb"] = ident(xv.pid)
+        save_run(run)
+        end = time.monotonic() + 15
+        while not Path(f"/tmp/.X11-unix/X{display}").exists():
+            if xv.poll() is not None or time.monotonic() > end:
+                die(f"Xvfb :{display} failed to start: {(d / 'xvfb.log').read_text()[-200:].strip()}")
+            time.sleep(0.1)
 
     env = {k: v for k, v in os.environ.items() if not k.startswith("MP_") and k not in ("WAYLAND_DISPLAY",)}
     env.update({
-        "DISPLAY": f":{display}", "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}", "SDL_AUDIO_DRIVER": "dummy",
-        "MESA_VK_WSI_DEBUG": "sw", "SDL_VIDEODRIVER": "x11",  # RADV on Xvfb has no DRI3
+        "DISPLAY": os.environ["DISPLAY"] if host else f":{display}",
+        "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}", "SDL_AUDIO_DRIVER": "dummy", "SDL_VIDEODRIVER": "x11",
+    })
+    if host:
+        # GNOME rewrites Xwayland's auth file on a shell restart; a long-lived agent shell keeps the old name.
+        if not Path(env.get("XAUTHORITY", "")).is_file():
+            auths = sorted(Path(f"/run/user/{os.getuid()}").glob(".mutter-Xwaylandauth.*"), key=lambda p: p.stat().st_mtime)
+            if auths:
+                env["XAUTHORITY"] = str(auths[-1])
+    else:
+        env["MESA_VK_WSI_DEBUG"] = "sw"  # RADV on Xvfb has no DRI3
+    env.update({
         "MP_USER_PATH": str(user), "MP_CACHE_PATH": str(CACHE), "MP_MODS": str(mods),
         "MP_FAST_BOOT": "0" if getattr(a, "front", False) else "1", "MP_DISABLE_AI_AUDIO": "1", "MP_UPDATE_CHECK": "0", "MP_ASPECT": "16:9", "MP_CONSOLE": str(port),
         "ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1",
+        # Xvfb presents are CPU copies (MESA_VK_WSI_DEBUG=sw); present one frame in 6. Every frame is
+        # still rendered and `shot` reads the EFB. --env AURORA_PRESENT_EVERY=1 to see every frame.
+        "AURORA_PRESENT_EVERY": "6",
     })
     if a.room:
         env["MP_BOOT_WORLD"] = a.room
     if not a.cutscenes:
         env["MP_SKIP_CUTSCENES"] = "1"
+    # Test runs die to hazards and enemies while an agent reads a screenshot; damage tests opt in.
+    env["MP_GODMODE"] = "0" if getattr(a, "mortal", False) else "1"
+    if getattr(a, "turbo", None) is not None:
+        if not 1 <= a.turbo <= 16:
+            die("--turbo takes 1..16 ticks per frame")
+        env["MP_TURBO"] = str(a.turbo)
     for kv in a.env:
         k, v = kv.split("=", 1)
         env[k] = v
@@ -979,7 +1022,8 @@ def cmd_film(a):
     print(out)
     for f, prev, cur, pf in zip(frames[1:], pngs, pngs[1:], frames):
         print(f"frame {pf} -> {f}: {image_stats(prev, cur)[1]}")
-    run_console(run, ["hold 0"], echo=False)
+    if not a.keep_hold:
+        run_console(run, ["hold 0"], echo=False)
 
 
 def region_mad(pa, pb, region):
@@ -1137,7 +1181,8 @@ def cmd_doctor(a):
         rep("WARN", "no remastered-models mod installed")
     else:
         st = mod / ".import-version"
-        have = st.read_text().strip() if st.is_file() else None
+        # First line: the version; the second is the commit that imported it.
+        have = st.read_text().split("\n", 1)[0].strip() if st.is_file() else None
         if have is None:
             rep("WARN", f"remastered-models has no .import-version (current kImportVersion={cur})")
         elif cur is not None and str(cur) != have:
@@ -1201,10 +1246,17 @@ def build_parser():
         s.add_argument("--cutscenes", action="store_true",
                        help="keep cutscenes (default: MP_SKIP_CUTSCENES=1 + skippable_cutscenes=1, which also "
                             "applies randomprime's room patches; with --room, start waits for gameplay)")
+        s.add_argument("--mortal", action="store_true",
+                       help="the player can take damage and die (default: MP_GODMODE=1, as `god on`)")
+        s.add_argument("--turbo", type=int, nargs="?", const=8, metavar="TICKS",
+                       help="MP_TURBO: uncapped, TICKS (1..16, default 8) game ticks per drawn frame, so "
+                            "scripted runs finish sooner (one tick per frame during screen fades)")
         s.add_argument("--saves", action="store_true", help="copy USA/ and savestates/ from the real user dir")
         s.add_argument("--size", default="1280x720", help="Xvfb screen size WxH")
         s.add_argument("--wait", type=float, default=120, help="seconds to wait for the console")
         s.add_argument("--gdb", action="store_true", help="run under gdb so a crash leaves a backtrace in game.log")
+        s.add_argument("--host-display", action="store_true",
+                       help="run on the user's $DISPLAY with the real GPU driver instead of Xvfb (GL backends; opens a window)")
         s.add_argument("--replace", action="store_true", help="stop a running run of this name first")
 
     s = add("start", cmd_start, "start Xvfb + game with a console; prints 'name display port log'")
@@ -1266,6 +1318,8 @@ def build_parser():
     s.add_argument("--pre", help="';'-separated console commands to run first (e.g. 'fx 12345678 5')")
     s.add_argument("--cols", type=int)
     s.add_argument("--width", type=int, default=480)
+    s.add_argument("--keep-hold", action="store_true",
+                   help="leave the game held after the last frame, so a next film carries on from it")
     s = add("fxbisect", cmd_fxbisect, "mute each asset of an effect's tree and rank which one changes a region")
     s.add_argument("name")
     s.add_argument("root", help="root PART asset id (hex) as spawned by --shot-cmds")

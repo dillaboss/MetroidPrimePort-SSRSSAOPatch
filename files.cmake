@@ -193,6 +193,9 @@ set(MP_GAME_SOURCES
     src/Kyoto/Particles/CModVectorElement.cpp
     src/Kyoto/Particles/CParticleData.cpp
     src/Kyoto/Particles/CParticleDataFactory.cpp
+    src/Kyoto/Particles/CPortVfxMat.cpp
+    src/Kyoto/Particles/CPortCurlNoise.cpp
+    src/Kyoto/Particles/CPortCurlNoiseField.cpp
     src/Kyoto/Particles/CParticleElectric.cpp
     src/Kyoto/Particles/CParticleElectricDataFactory.cpp
     src/Kyoto/Particles/CParticleGen.cpp
@@ -466,6 +469,7 @@ set(MP_GAME_SOURCES
     src/MetroidPrime/HUD/CHudRadarInterface.cpp
     src/MetroidPrime/HUD/CHudThreatInterface.cpp
     src/MetroidPrime/HUD/CHudVisorBeamMenu.cpp
+    src/MetroidPrime/HUD/CHudRadialSelect.cpp
     src/MetroidPrime/HUD/CSamusHud.cpp
     src/MetroidPrime/PathFinding/CPathFindArea.cpp
     src/MetroidPrime/PathFinding/CPathFindRegion.cpp

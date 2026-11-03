@@ -47,14 +47,28 @@
 
 #include <math.h>
 
+#include <utility>
 #include <vector>
 
 #include "port_debug.h"
 #include "port_pointer.h"
 #include "port_pointer_menu.h"
 #include "port_map_icons.h"
+#include "port_custom_res.h"
+#include "port_map_marks.h"
+#include "port_map_pickups.h"
+#include "port_automapper.h"
+#include "port_disc.h"
 
 static const char* const skFRME_MapScreen = "FRME_MapScreen";
+
+// Trilogy nudges the map screen's panes from code (@ fn_8037A578): `offset`
+// is in the widget's own space.
+static void PortTrilogyMove(CGuiWidget* widget, const CVector3f& offset) {
+  CTransform4f xf = widget->GetO2PTransform();
+  xf.SetTranslation(xf * offset);
+  widget->SetO2PTransform(xf);
+}
 
 static inline const rstl::vector< CGameHintInfo::CGameHint >& GetGameHints() {
   return gpMemoryCard->GetHints();
@@ -657,7 +671,25 @@ void CAutoMapper::ProcessControllerInput(const CFinalInput& frameInput,
       x300_textpane_instructions->TextSupport().SetText(rstl::wstring_l(L""));
       x308_textpane_instructions2->TextSupport().SetText(rstl::wstring_l(L""));
     } else {
+#ifdef TARGET_PC
+      if (PortShowsMarkPrompt()) {
+        // Port: X marks or unmarks the shown room.
+        rstl::wstring mark;
+        mark.append(L"&image=", -1);
+        mark.append(CStringExtras::ConvertToUNICODE(rstl::string(CBasics::Stringize(
+                        "SI,0.6,1.0,%8.8X", gpTweakPlayerRes->xac_xButton[0]))));
+        mark.append(L"; ", -1);
+        mark.append(PortMapMarks::IsMarked(x24_world->IGetWorldAssetId(), xa0_curAreaId.value)
+                        ? L"Unmark room"
+                        : L"Mark room",
+                    -1);
+        x2fc_textpane_hint->TextSupport().SetText(mark);
+      } else {
+        x2fc_textpane_hint->TextSupport().SetText(rstl::wstring_l(L""));
+      }
+#else
       x2fc_textpane_hint->TextSupport().SetText(rstl::wstring_l(L""));
+#endif
 
       const wchar_t imagePrefix[] = L"&image=";
       const wchar_t imageSuffix[] = L";";
@@ -672,9 +704,13 @@ void CAutoMapper::ProcessControllerInput(const CFinalInput& frameInput,
       string.append(strTable->GetString(0x2e), -1);
       x300_textpane_instructions->TextSupport().SetText(string);
 
+      // Trilogy draws the C-stick (Z + Nunchuk) art unsquashed and puts both zoom
+      // buttons before the text (@ fn_80024E74).
+      const bool trilogy = PortDisc::IsTrilogy(PortDisc::Current());
       string.assign(imagePrefix, -1);
       string.append(CStringExtras::ConvertToUNICODE(rstl::string(
-          CBasics::Stringize("SI,0.6,1.0,%8.8X", gpTweakPlayerRes->x48_cStick[x2e8_rStickPos]))));
+          CBasics::Stringize(trilogy ? "SI,1.0,1.0,%8.8X" : "SI,0.6,1.0,%8.8X",
+                             gpTweakPlayerRes->x48_cStick[x2e8_rStickPos]))));
       string.append(imageSuffix, -1);
       string.append(strTable->GetString(0x2f), -1);
       x304_textpane_instructions1->TextSupport().SetText(string);
@@ -683,11 +719,16 @@ void CAutoMapper::ProcessControllerInput(const CFinalInput& frameInput,
       string.append(CStringExtras::ConvertToUNICODE(rstl::string(
           CBasics::Stringize("%8.8X", gpTweakPlayerRes->x70_lTrigger[x2ec_lTriggerPos]))));
       string.append(imageSuffix, -1);
-      string.append(strTable->GetString(0x30), -1);
+      if (!trilogy) {
+        string.append(strTable->GetString(0x30), -1);
+      }
       string.append(imagePrefix, -1);
       string.append(CStringExtras::ConvertToUNICODE(rstl::string(
           CBasics::Stringize("%8.8X", gpTweakPlayerRes->x7c_rTrigger[x2f0_rTriggerPos]))));
       string.append(imageSuffix, -1);
+      if (trilogy) {
+        string.append(strTable->GetString(0x30), -1);
+      }
       x308_textpane_instructions2->TextSupport().SetText(string);
     }
   }
@@ -725,350 +766,9 @@ void CAutoMapper::ProcessControllerInput(const CFinalInput& frameInput,
 }
 
 #ifdef TARGET_PC
-namespace {
-
-// What Draw put under the pointer last frame: map areas (world map) or
-// universe hexes, as GUI rects. sub is the hex index in the universe.
-struct PortMapHit {
-  int id;
-  int sub;
-  float x0, y0, x1, y1;
-  float cx, cy;
-};
-std::vector< PortMapHit > sPortMapHits;
-bool sPortMapHitsUniverse = false;
-// The world map's area surfaces as GUI triangles; hit indexes sPortMapHits.
-// An area with triangles is hit only inside one, not anywhere in its rect.
-struct PortMapTri {
-  int hit;
-  float x[3], y[3];
-};
-std::vector< PortMapTri > sPortMapTris;
-// GUI pixels per two yScale (the pan's view height, see ProcessMapPanInput).
-float sPortMapViewPx = 480.f;
-
-// A clicked area or world the area point glides to; the id stays set once it
-// lands and is cleared when a glide is cancelled.
-bool sPortMapGlide = false;
-bool sPortMapGlideUniverse = false;
-int sPortMapGlideId = -1;
-CVector3f sPortMapGlideTo(0.f, 0.f, 0.f);
-// A click on the gliding world enters it once the glide lands.
-bool sPortMapEnter = false;
-
-// Degrees the map turns per GUI pixel of a left mouse drag.
-const float kPortMapDegPerPx = 0.4f;
-// Farthest a click can be from a universe hex's center, in GUI pixels.
-const float kPortMapHexReach = 40.f;
-
-void PortMapStopGlide() {
-  sPortMapGlide = false;
-  sPortMapEnter = false;
-  sPortMapGlideId = -1;
-}
-
-bool PortMapInTri(const PortMapTri& t, float gx, float gy) {
-  float s[3];
-  for (int e = 0; e < 3; ++e) {
-    const int n = (e + 1) % 3;
-    s[e] = (t.x[n] - t.x[e]) * (gy - t.y[e]) - (t.y[n] - t.y[e]) * (gx - t.x[e]);
-  }
-  return (s[0] >= 0.f && s[1] >= 0.f && s[2] >= 0.f) ||
-         (s[0] <= 0.f && s[1] <= 0.f && s[2] <= 0.f);
-}
-
-// Collects one area's surface triangles from its projected vertices.
-struct PortMapTriSink {
-  int hit;
-  std::vector< float > px, py;
-  std::vector< bool > ok;
-
-  static void Add(void* ctx, int a, int b, int c) {
-    const PortMapTriSink& s = *static_cast< const PortMapTriSink* >(ctx);
-    const int n = static_cast< int >(s.ok.size());
-    if (a >= n || b >= n || c >= n || !s.ok[a] || !s.ok[b] || !s.ok[c]) {
-      return;
-    }
-    PortMapTri t = {s.hit, {s.px[a], s.px[b], s.px[c]}, {s.py[a], s.py[b], s.py[c]}};
-    sPortMapTris.push_back(t);
-  }
-};
-
-int PortMapHitAt(float gx, float gy) {
-  // Under the pointer: inside a triangle for map areas, inside the rect for
-  // universe hexes. Of several, the smallest rect wins (a room drawn over a
-  // bigger one).
-  std::vector< bool > inTri;
-  if (!sPortMapTris.empty()) {
-    inTri.assign(sPortMapHits.size(), false);
-    for (const PortMapTri& t : sPortMapTris) {
-      if (!inTri[t.hit] && PortMapInTri(t, gx, gy)) {
-        inTri[t.hit] = true;
-      }
-    }
-  }
-  int best = -1;
-  float bestArea = 0.f;
-  for (int i = 0; i < static_cast< int >(sPortMapHits.size()); ++i) {
-    const PortMapHit& h = sPortMapHits[i];
-    if (gx < h.x0 || gx > h.x1 || gy < h.y0 || gy > h.y1) {
-      continue;
-    }
-    if (!inTri.empty() && !inTri[i]) {
-      continue;
-    }
-    const float area = (h.x1 - h.x0) * (h.y1 - h.y0);
-    if (best < 0 || area < bestArea) {
-      best = i;
-      bestArea = area;
-    }
-  }
-  return best;
-}
-
-} // namespace
-
-void CAutoMapper::PortRecordPointerHits(const CStateManager& mgr, const CTransform4f& planeXf,
-                                        const CTransform4f& mapXf) const {
-  sPortMapHits.clear();
-  sPortMapTris.clear();
-  const bool universe = IsInMapperState(kAMS_MapScreenUniverse);
-  if (!PortPointer::Enabled() || (!universe && !IsInMapperState(kAMS_MapScreen))) {
-    return;
-  }
-  sPortMapHitsUniverse = universe;
-
-  // The pan's scale: the screen distance of yScale along the camera's up.
-  const float camAngleRad = xa8_renderState0.x1c_camAngle * (1.f / 360.f) * (2.f * M_PIF);
-  const float yScale =
-      xa8_renderState0.x18_camDist / static_cast< float >(tan(M_PIF / 2.f - 0.5f * camAngleRad));
-  const CMatrix3f camRot = xa8_renderState0.x8_camOrientation.BuildTransform();
-  const CVector3f& focus = xa8_renderState0.x20_areaPoint;
-  float ax, ay, bx, by;
-  if (PortGuiHit::Project(planeXf, focus, ax, ay) &&
-      PortGuiHit::Project(planeXf, focus + yScale * camRot.GetColumn(2), bx, by)) {
-    const float d = sqrtf((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
-    if (d > 1.f) {
-      sPortMapViewPx = 2.f * d;
-    }
-  }
-
-  if (universe) {
-    const CMapUniverse* mapu = x8_mapu.GetObject();
-    for (int w = 0; w < static_cast< int >(mapu->GetNumMapWorldDatas()); ++w) {
-      const CMapUniverse::CMapWorldData& mwData = mapu->GetMapWorldData(w);
-      if (!gpGameState->StateForWorld(mwData.GetWorldAssetId())
-               .GetMapWorldInfo()
-               .GetPtr()
-               ->IsAnythingSet()) {
-        continue;
-      }
-      for (int i = 0; i < static_cast< int >(mwData.GetNumMapAreaDatas()); ++i) {
-        float gx, gy;
-        if (PortGuiHit::Project(planeXf, mwData.GetMapAreaData(i).GetTransform().GetTranslation(),
-                                gx, gy)) {
-          PortMapHit h = {w,
-                          i,
-                          gx - kPortMapHexReach,
-                          gy - kPortMapHexReach,
-                          gx + kPortMapHexReach,
-                          gy + kPortMapHexReach,
-                          gx,
-                          gy};
-          sPortMapHits.push_back(h);
-        }
-      }
-    }
-    return;
-  }
-
-  if (x24_world == nullptr) {
-    return;
-  }
-  const CMapWorld* mw = x24_world->IGetMapWorld();
-  const CMapWorldInfo& mwInfo =
-      *gpGameState->StateForWorld(x24_world->IGetWorldAssetId()).GetMapWorldInfo().GetPtr();
-  rstl::vector< int > areas = mw->GetVisibleAreas(*x24_world, mwInfo);
-  for (int i = 0; i < areas.size(); ++i) {
-    const int aid = areas[i];
-    CMapArea* mapa = mw->GetMapArea(aid);
-    const CTransform4f model = mapXf * mapa->GetAreaPostTransform(*x24_world, aid);
-    const CAABox& box = mapa->GetBoundingBox();
-    PortMapHit h = {aid, 0, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-    bool any = false;
-    for (int c = 0; c < 8; ++c) {
-      float gx, gy;
-      if (!PortGuiHit::Project(model, box.GetPoint(c), gx, gy)) {
-        continue;
-      }
-      if (!any) {
-        h.x0 = h.x1 = gx;
-        h.y0 = h.y1 = gy;
-        any = true;
-      } else {
-        h.x0 = rstl::min_val(h.x0, gx);
-        h.x1 = rstl::max_val(h.x1, gx);
-        h.y0 = rstl::min_val(h.y0, gy);
-        h.y1 = rstl::max_val(h.y1, gy);
-      }
-    }
-    if (!any || !PortGuiHit::Project(model, mapa->GetAreaCenterPoint(), h.cx, h.cy)) {
-      continue;
-    }
-    sPortMapHits.push_back(h);
-
-    PortMapTriSink sink;
-    sink.hit = static_cast< int >(sPortMapHits.size()) - 1;
-    const uint numVerts = mapa->GetVertexCount();
-    const CVector3f* verts = mapa->GetVertices();
-    sink.px.resize(numVerts);
-    sink.py.resize(numVerts);
-    sink.ok.resize(numVerts);
-    for (uint v = 0; v < numVerts; ++v) {
-      sink.ok[v] = PortGuiHit::Project(model, verts[v], sink.px[v], sink.py[v]);
-    }
-    for (int s = 0; s < mapa->GetNumSurfaces(); ++s) {
-      mapa->GetSurface(s).PortForEachTriangle(&PortMapTriSink::Add, &sink);
-    }
-  }
-}
-
-// Drag rotates (left mouse) or pans (right/middle, touch, two fingers), the
-// wheel and pinch zoom, a click picks an area or world and a click on the
-// picked one presses A, a right click presses B. Behind the gates of
-// ProcessMapScreenInput, so hints and leave rules are unchanged.
-void CAutoMapper::PortPointerInput(CFinalInput& input, const CStateManager& mgr) {
-  const bool universe = x1bc_state == kAMS_MapScreenUniverse;
-  if (sPortMapGlide && sPortMapGlideUniverse != universe) {
-    PortMapStopGlide();
-  }
-  if ((!universe && x1bc_state != kAMS_MapScreen) || !IsInPlayerControlState() ||
-      IsRenderStateInterpolating() || !PortPointerMenu::Begin()) {
-    PortMapStopGlide();
-    return;
-  }
-  if (PortPointerMenu::TakeBack() && x328_ == 0) {
-    PortPointerMenu::PressB(input);
-  }
-  if (x32c_loadingDummyWorld || !x1e0_hintSteps.empty() || x328_ != 0) {
-    PortMapStopGlide();
-    return;
-  }
-
-  PortPointerMenu::ViewMotion m;
-  if (PortPointerMenu::TakeViewMotion(m)) {
-    float panX = m.panX;
-    float panY = m.panY;
-    float rotX = m.rotateX;
-    float rotY = m.rotateY;
-    if (PortPointer::TouchIsLast()) {
-      // One finger pans on touch, as on the Android overlay.
-      panX += rotX;
-      panY += rotY;
-      rotX = rotY = 0.f;
-    }
-    if (panX != 0.f || panY != 0.f) {
-      PortMapStopGlide();
-      PortDebug::AddMapPan(panX, panY, sPortMapViewPx, 250);
-    }
-    if (rotX != 0.f || rotY != 0.f) {
-      CEulerAngles eulers = CEulerAngles::FromQuaternion(xa8_renderState0.x8_camOrientation);
-      CAbsAngle angX = CAbsAngle::FromRadians(eulers.GetX());
-      CAbsAngle angZ = CAbsAngle::FromRadians(eulers.GetZ());
-      angZ -= CRelAngle::FromDegrees(rotX * kPortMapDegPerPx);
-      angX -= CRelAngle::FromDegrees(rotY * kPortMapDegPerPx);
-      float angXDeg = angX.AsDegrees();
-      if (angXDeg > 180.f)
-        angXDeg -= 360.f;
-      angX = CAbsAngle::FromDegrees(CMath::Clamp(gpTweakAutoMapper->x14_minCamRotateX, angXDeg,
-                                                 gpTweakAutoMapper->x18_maxCamRotateX));
-      xa8_renderState0.x8_camOrientation = CQuaternion::YXZRotation(
-          CRelAngle(0.f), CRelAngle(angX.AsRadians()), CRelAngle(angZ.AsRadians()));
-    }
-    if (m.twist != 0.f) {
-      // A two-finger twist turns the map, as on the Android overlay.
-      PortDebug::AddMapRotate(m.twist);
-    }
-    if (m.zoom != 0.f) {
-      PortDebug::AddMapZoom(static_cast< float >(pow(2.0, 0.5 * m.zoom)));
-    }
-  }
-  // A held pan drag keeps the map from drifting back to its area.
-  PortPointer::Recognizer& g = PortPointer::Gestures();
-  if (g.Dragging() && (PortPointer::TouchIsLast() ||
-                       (g.Buttons() & (PortPointer::kButtonRight | PortPointer::kButtonMiddle)))) {
-    PortMapStopGlide();
-    PortDebug::AddMapPan(0.f, 0.f, sPortMapViewPx, 250);
-  }
-
-  // A tap on the corner A prompt (icon or label) presses A, as the button does.
-  if (x2c_frmeInitialized != NULL && (universe || HasCurrentMapUniverseWorld(mgr))) {
-    const CGuiWidget* icon = x2c_frmeInitialized->FindWidget("textpane_right1");
-    const CGuiWidget* label = x2c_frmeInitialized->FindWidget("textpane_right");
-    if ((icon != NULL && PortPointerMenu::TakeClickOn(icon)) ||
-        (label != NULL && PortPointerMenu::TakeClickOn(label))) {
-      PortMapStopGlide();
-      PortPointerMenu::PressA(input);
-    }
-  }
-
-  float gx, gy;
-  int count;
-  if (sPortMapHitsUniverse == universe && PortPointerMenu::TakeClickPoint(gx, gy, count)) {
-    const int hit = PortMapHitAt(gx, gy);
-    if (hit >= 0) {
-      const PortMapHit& h = sPortMapHits[hit];
-      const int picked = sPortMapGlide ? sPortMapGlideId : universe ? x9c_worldIdx
-                                                                     : xa0_curAreaId.value;
-      // The area glided to counts as picked even when the closest-area search
-      // settled on an overlapping one.
-      const bool landed = !universe && !sPortMapGlide && h.id == sPortMapGlideId;
-      if (h.id == picked && universe && sPortMapGlide) {
-        // A enters the world under the area point: wait for the glide to land.
-        sPortMapEnter = true;
-      } else if (h.id == picked || landed) {
-        PortPointerMenu::PressA(input);
-      } else {
-        sPortMapGlide = true;
-        sPortMapGlideUniverse = universe;
-        sPortMapGlideId = h.id;
-        sPortMapGlideTo = universe ? x8_mapu.GetObject()
-                                         ->GetMapWorldData(h.id)
-                                         .GetMapAreaData(h.sub)
-                                         .GetTransform()
-                                         .GetTranslation()
-                                   : GetAreaPointOfInterest(mgr, h.id);
-      }
-    }
-  }
-
-  if (ControlMapper::GetAnalogInput(ControlMapper::kC_MapMoveForward, input) > 0.f ||
-      ControlMapper::GetAnalogInput(ControlMapper::kC_MapMoveBack, input) > 0.f ||
-      ControlMapper::GetAnalogInput(ControlMapper::kC_MapMoveLeft, input) > 0.f ||
-      ControlMapper::GetAnalogInput(ControlMapper::kC_MapMoveRight, input) > 0.f) {
-    PortMapStopGlide();
-  }
-  if (sPortMapEnter && !sPortMapGlide) {
-    // Landed last frame, so x9c_worldIdx has caught up.
-    sPortMapEnter = false;
-    if (universe && x9c_worldIdx == sPortMapGlideId) {
-      PortPointerMenu::PressA(input);
-    }
-  }
-  if (sPortMapGlide) {
-    CVector3f& point = xa8_renderState0.x20_areaPoint;
-    const CVector3f toTarget = sPortMapGlideTo - point;
-    const float t = 1.f - static_cast< float >(exp(-12.0 * input.Time()));
-    if (toTarget.Magnitude() < 0.01f) {
-      point = sPortMapGlideTo;
-      sPortMapGlide = false;
-    } else {
-      point = point + t * toTarget;
-      // Hold off ProcessMapPanInput's drift back to the current area.
-      PortDebug::AddMapPan(0.f, 0.f, sPortMapViewPx, 100);
-    }
-  }
-}
+// The map screen's pointer input (PortRecordPointerHits, PortPointerInput), the
+// mark prompt and the legend live in platform/port_automapper.cpp; the helpers
+// called below are declared in port_automapper.h.
 #endif
 
 void CAutoMapper::ProcessMapScreenInput(const CFinalInput& input, const CStateManager& mgr) {
@@ -1094,6 +794,14 @@ void CAutoMapper::ProcessMapScreenInput(const CFinalInput& input, const CStateMa
           pointLocal, CUnitVector3f(camRot.GetColumn(1), CUnitVector3f::kN_No), mgr, *x24_world,
           *mwInfo);
       BeginMapperStateTransition(kAMS_MapScreen, mgr);
+    }
+  }
+
+  if (input.PX() && x1bc_state == kAMS_MapScreen && x328_ == 0 && x24_world != nullptr &&
+      IsInPlayerControlState()) {
+    if (PortMapMarks::Toggle(x24_world->IGetWorldAssetId(), xa0_curAreaId.value) != 0) {
+      CSfxManager::SfxStart(0x5ac, 127, 64, false, CSfxManager::kMedPriority, false,
+                            CSfxManager::kAllAreas);
     }
   }
 
@@ -1175,6 +883,20 @@ void CAutoMapper::ProcessMapRotateInput(const CFinalInput& input, const CStateMa
   if (right > maxMag) {
     maxMag = right;
     dirSlot = 3;
+  }
+
+  // Port: Controls > Options > Map can flip either rotate axis (#225).
+  if (PortDebug::MapInvertX()) {
+    if (dirSlot == 2)
+      dirSlot = 3;
+    else if (dirSlot == 3)
+      dirSlot = 2;
+  }
+  if (PortDebug::MapInvertY()) {
+    if (dirSlot == 0)
+      dirSlot = 1;
+    else if (dirSlot == 1)
+      dirSlot = 0;
   }
 
   left = 0.f;
@@ -1437,7 +1159,12 @@ void CAutoMapper::ProcessMapPanInput(const CFinalInput& input, const CStateManag
 }
 
 void CAutoMapper::Draw(const CStateManager& mgr, const CTransform4f& xf, float alpha) const {
+#ifdef TARGET_PC
+  // The opacity of the visor in use (issue #144).
+  float drawAlpha = alpha * gpGameState->GameOptions().GetActiveHudAlpha(mgr);
+#else
   float drawAlpha = alpha * gpGameState->GameOptions().GetHudAlpha();
+#endif
   gpRender->SetBlendMode_AlphaBlended();
   CGraphics::SetCullMode(kCM_Front);
 
@@ -1796,6 +1523,11 @@ void CAutoMapper::Update(float dt, const CStateManager& mgr) {
   if (x28_frmeMapScreen.get() != NULL && x2c_frmeInitialized == NULL) {
     if (x28_frmeMapScreen->TryCache()) {
       x2c_frmeInitialized = x28_frmeMapScreen->GetObject();
+#ifdef TARGET_PC
+      // Port: the new frame's widgets, before the port's own state is taken from
+      // them (see PortForgetMapPanes).
+      PortForgetMapPanes();
+#endif
       // Port: keep the map screen's proportions in widescreen instead of
       // stretching it across the wider viewport.
       if (CGuiCamera* cam = x2c_frmeInitialized->GetFrameCamera()) {
@@ -1823,7 +1555,26 @@ void CAutoMapper::Update(float dt, const CStateManager& mgr) {
           static_cast< CGuiTextPane* >(x2c_frmeInitialized->FindWidget("textpane_mapLegend"));
       mapLegend->TextSupport().SetWordWrap(false);
       mapLegend->TextSupport().SetImageBaseline(true);
+#ifdef TARGET_PC
+      if (PortLegendReady()) {
+        sPortLegendKey = PortLegendKey();
+        PortSetLegend(mapLegend, PortLegendText());
+      } else {
+        sPortLegendKey = ~0u;
+        PortSetLegend(mapLegend, PortLegendBase());
+      }
+#else
       mapLegend->TextSupport().SetText(rstl::wstring(gpStringTable->GetString(0x31)));
+#endif
+      // Trilogy moves its frame's panes (@ fn_80027E94).
+      if (PortDisc::IsTrilogy(PortDisc::Current())) {
+        PortTrilogyMove(leftPane, CVector3f(-1.f, 0.5f, 0.f));
+        PortTrilogyMove(x300_textpane_instructions, CVector3f(-1.f, 0.f, 0.f));
+        PortTrilogyMove(x304_textpane_instructions1, CVector3f(-1.f, 0.f, 0.f));
+        PortTrilogyMove(x308_textpane_instructions2, CVector3f(-1.5f, 0.f, 0.f));
+        mapLegend->SetO2PTransform(mapLegend->GetO2PTransform() *
+                                   CTransform4f::Translate(0.f, 0.f, 0.6f));
+      }
 
       x30c_basewidget_leftPane = x2c_frmeInitialized->FindWidget("basewidget_leftPane");
       x310_basewidget_yButtonPane = x2c_frmeInitialized->FindWidget("basewidget_yButtonPane");
@@ -1837,7 +1588,22 @@ void CAutoMapper::Update(float dt, const CStateManager& mgr) {
 
   // Update frame and text panes
   if (x2c_frmeInitialized != NULL) {
+#ifdef TARGET_PC
+    if (sPortLegendKey != PortLegendKey() && PortLegendReady()) {
+      sPortLegendKey = PortLegendKey();
+      CGuiTextPane* legend =
+          static_cast< CGuiTextPane* >(x2c_frmeInitialized->FindWidget("textpane_mapLegend"));
+      if (legend != NULL) {
+        PortSetLegend(legend, PortLegendText());
+      }
+    }
+#endif
     x2c_frmeInitialized->Update(dt);
+#ifdef TARGET_PC
+    // Port: the mark prompt's own place, and the disc's hint pane back when it
+    // is not showing it (see PortPlaceMarkHint).
+    PortPlaceMarkHint(x2fc_textpane_hint, PortShowsMarkPrompt());
+#endif
 
     {
       CGuiTextPane* right1 =
@@ -2138,6 +1904,10 @@ void CAutoMapper::CompleteMapperStateTransition(const CStateManager& mgr) {
   }
 
   if (x1c0_nextState == kAMS_MiniMap) {
+#ifdef TARGET_PC
+    // Port: the frame's widgets go away with it (see PortForgetMapPanes).
+    PortForgetMapPanes();
+#endif
     x28_frmeMapScreen = NULL;
     x2c_frmeInitialized = NULL;
     x2fc_textpane_hint = NULL;

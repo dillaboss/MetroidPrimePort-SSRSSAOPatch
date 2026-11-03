@@ -2,6 +2,7 @@
 #define _CHUDENERGYINTERFACE
 
 #include "MetroidPrime/HUD/CHudInterface.hpp"
+#include "Kyoto/Graphics/CColor.hpp"
 #include "Kyoto/Math/CVector3f.hpp"
 #include "rstl/pair.hpp"
 #include "types.h"
@@ -29,6 +30,10 @@ public:
   static rstl::pair< CVector3f, CVector3f > BallEnergyCoordFunc(float t);
   static rstl::pair< CVector3f, CVector3f > ThermalEnergyCoordFunc(float t);
   static rstl::pair< CVector3f, CVector3f > XRayEnergyCoordFunc(float t);
+#ifdef TARGET_PC
+  // Trilogy only: the HUD message fade, applied to the warning's alpha (fn_800E3D44 sets x8).
+  void SetAlpha(float alpha) { mMessageAlpha = alpha; }
+#endif
 
 private:
   EHudType x0_hudType;
@@ -46,6 +51,18 @@ private:
   CAuiMeter* x24_meter_energytanks;
   CGuiTextPane* x28_textpane_energywarning;
   CAuiEnergyBarT01* x2c_energybart01_energybar;
+#ifdef TARGET_PC
+  // Issue #144: the energy readout's own opacity, applied to these widgets over their authored
+  // colours: the energy group, or its pieces in a frame without one.
+  void UpdateHudAlpha();
+  CGuiWidget* mAlphaWidgets[3];
+  CColor mAlphaColors[3];
+  int mAlphaWidgetCount;
+  // The warning's own fader sets its colour each frame; it takes the opacity directly unless it
+  // is in one of mAlphaWidgets.
+  bool mWarningFaded;
+  float mMessageAlpha;
+#endif
 };
 CHECK_SIZEOF(CHudEnergyInterface, 0x30)
 

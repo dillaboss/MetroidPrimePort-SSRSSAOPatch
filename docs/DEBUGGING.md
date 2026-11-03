@@ -7,8 +7,20 @@ non-zero with a one-line `mprig: <reason>` on stderr when it fails. State is in 
 (git-ignored): `build/rig/<name>/{run.json,game.log,user/,shots/}`.
 
 The Xvfb/RADV environment (`MESA_VK_WSI_DEBUG=sw`, `SDL_VIDEODRIVER=x11`, dummy audio,
-`MP_FAST_BOOT`, `MP_CONSOLE`, ...) is set automatically. **Never capture on `:0`**: GPU-heavy
-runs on the real display have taken the desktop session down.
+`MP_FAST_BOOT`, `MP_CONSOLE`, ...) is set automatically, with `AURORA_PRESENT_EVERY=6`: Aurora renders
+every frame but presents one in 6, since an Xvfb present is a CPU copy (`shot` reads the EFB, so it is
+unaffected; `--env AURORA_PRESENT_EVERY=1` presents them all). That only pays off uncapped: `start --turbo [ticks]`
+(`MP_TURBO`, default 8 ticks per drawn frame, no frame cap) for runs that wait on game time. **Never capture on `:0`**: GPU-heavy
+runs on the real display have taken the desktop session down. The one exception is
+`start --host-display`, for the OpenGL backends only (Xvfb's llvmpipe can't run Dawn's GL): it
+skips Xvfb and opens a window on the user's `$DISPLAY` with the real driver (it picks up the
+newest Xwayland auth file under GNOME). Use it only with the user's OK, one run at a time.
+To test the GL 3.3 path on a Mesa driver, add `--env MP_GRAPHICS_BACKEND=opengl --env
+MESA_GL_VERSION_OVERRIDE=3.3 --env MESA_GLSL_VERSION_OVERRIDE=330 --env
+"MESA_EXTENSION_OVERRIDE=+GL_ARB_texture_storage -GL_ARB_compute_shader
+-GL_ARB_shader_storage_buffer_object -GL_ARB_shader_image_load_store"` (Mesa hides
+texture storage at 3.3, which real 3.3 drivers expose); game.log then reports texture vertex
+fetch and no compute shaders.
 
 ## Setup
 
@@ -29,13 +41,30 @@ vs the current `kImportVersion`, `/tmp` space, stale runs).
 (even unseen ones) and the fade-in after them has run. Pass `--cutscenes` to see them. Use your own run names so sessions stay apart.
 `--room` takes a room name too (`--room "landing site"`; `rooms [filter]` lists them).
 
+Runs start in god mode (`MP_GODMODE=1`): the player takes no damage, so a run doesn't die to an
+enemy or lava while you read a screenshot. Pass `--mortal` only to test damage or death. (`hurt` bypasses god mode: it hits the player
+without taking energy either way.)
+
+Getting somewhere fast (every move is one `cmd` call with many commands, never a walk):
+
+- Never walk with `press`/`stick` to reach a place: those are for testing movement or input.
+  Boot into the room (`--room "<name>"`), then `goto <id>` (stands on the floor 6 units from an
+  actor, facing it; use the hex editor id from `objs [filter]`, which stays the same across loads,
+  unlike `u<uid>`; a `goto` onto a pickup can collect it and pause the game until `press a 1`), `tp x y z` + `face <yaw>`, `look <id>`, or a saved view
+  (`--at VIEW`, `view save`). `room <area>` jumps to another area of the world.
+- Clear what is in the way rather than playing through it: `kill <id>` (bosses too), `send <id> <msg>`
+  (open a door, start a trigger), `give <item> [n]` (missing beam, visor, Morph Ball, missiles).
+- Put a whole step in one call: `$M cmd t1 'goto 00080072' 'visor thermal' 'wait 30' status`, or
+  `shot` with the commands; several rooms are one `shots` call. Read `status` before a screenshot:
+  it is text and costs no image.
+
 **Settled** = `status --json` says first person, no cinematic and `fade` false (the in-game fade-in
 filter, `CInGameGuiManager::StartFadeIn`, is done), on two polls at least 12 frames apart. `start --room`,
 a `warp` sent through `cmd`/`shot`, and `shot` wait for it (not on `--cutscenes` runs).
 
 ## Subcommands
 
-- `start <name> [--build B] [--room MLVL[:MREA]|NAME] [--at VIEW] [--env K=V]... [--mods DIR|none] [--settings FILE|none] [--saves] [--size WxH] [--wait S] [--cutscenes] [--gdb] [--replace]`:
+- `start <name> [--build B] [--room MLVL[:MREA]|NAME] [--at VIEW] [--env K=V]... [--mods DIR|none] [--settings FILE|none] [--saves] [--mortal] [--size WxH] [--wait S] [--cutscenes] [--gdb] [--replace]`:
   `--build` is a dir under `build/` or a path (default `port-gcc`). The user dir is fresh: only
   `port_settings.ini` and `imgui.ini` are copied (`--saves` adds `USA/`, `savestates/`). Mods
   default to the real user's (read-only); `--mods none` is an empty folder. On a startup crash
@@ -104,6 +133,90 @@ the install needs a re-import. Use `--mods DIR` to test a mod build without touc
 **Two builds side by side**: start `a --build port-gcc` and `b --build <other>` with the same
 `--room`, then `shot` both with the same commands and `diff` / `sheet` them.
 
+## Save-state round-trip check
+
+`tools/statecheck.py` finds save-state gaps (a boss resuming in the wrong phase, a timer or door that
+comes back different) without a player: it dumps every live object (`statedump <file>` in the console,
+JSON lines from `platform/port_statedump.cpp`), saves to slot 8, loads it, dumps again and diffs.
+
+    S="python3 tools/statecheck.py --build port-gcc"          # --build etc. go to `mprig start`
+    $S --room "artifact temple" --setup 'send 001003D3 SetToZero' --setup 'wait 900'
+    $S --run mine --setup 'kill 00100101 1500' --setup 'wait 300'   # a run already in the room
+    $S --rooms scenarios.txt --out /tmp/sc                          # one game, many scenarios
+
+A scenario file has one line per scenario, `ROOM [| setup ; setup]` (`#` comments). The game is held
+for the round trip so the order is exact: dump A, `state save` (taken at the start of the next tick),
+`step 1`, dump A1, `state load`, `step 1` until `[savestate] room state:` is logged, dump B (when that line ends in `neighbour areas still streaming`, B0 is dumped then and B waits for `room state, neighbour areas:`: the areas resident at the save stream back in and take their saved state; what B0 had but B lacks died in that wait, a `gone-after-restore` warning, e.g. debris near the end of its life). Generated copies the save leaves to their generators (sounds, maze walls) are warnings when missing.
+Dumps are kept under `--out` (`NN-<room>-{A,A1,B0,B,C}.jsonl`; B0 and C only when taken). Add `--turbo 8` for long setup waits if
+your `mprig` has it.
+
+Reading the report: first a per-class table (`!` strict, `~` warning, kind and count), then
+details per class. **Strict** fields are `active`, `hp`, `kbres`, `door_open`, `timer`/`timing`,
+`counter`, `boss` (hex block, with the differing byte offsets), `ai` (state name), `body`, `loco`, the
+player's `morph` and `hp`, and missing/extra objects that have an editor id. **Warnings** are
+position/velocity/forward beyond a tolerance (`--tol-pos`, `--tol-vel`), animation, AI state time and
+missing/extra objects with no editor id (effects and projectiles are not saved by design). A field that
+differs from A but equals A1 (the world one tick later) is "tick drift" and only counted. Exit 0 with no
+strict diff, 1 otherwise, 2 if the harness failed. A last section, "schema fields", diffs each object's
+`fields` (the bool/int/float/bitfield/math/TUniqueId members of its class chain, from the generated
+schema in `docs/SAVESTATE_SCHEMA.md`, that its `kTagFields` block saves; references as `eid:` editor
+ids), all strict, grouped by class.field; `--tol-field` is the float tolerance. The members no block
+saves (other classes' fields, CActor render state; dumped as `fields_other`) follow as one uncounted
+"unsaved schema fields" line, each diff with `--other-fields`: a gap finder, not a failure. Port-added
+members (`xPort*`, `xpc_*`) are skipped. `--post-wait N` also dumps C N ticks after B and prints C against A as a second,
+uncounted report, for a restore that hands over late (Metroid Prime's exo comes back inactive in B).
+The cinematic cameras, waypoints and sounds always show
+position warnings: they are moved by scripts the restore does not replay; ignore them.
+
+Enemies (every `CPatterned`) and generated pickups save their schema fields in the room record's `kTagFields` block
+(`platform/port_savestate_fields.cpp`; the load log's "N enemy fields set"). For a baseline without it,
+start the game with `--start-arg=--env --start-arg=MP_SAVESTATE_FIELDS=0`. Expected leftovers in the
+"schema fields" section: `x254_` and other members the constructor never sets, `xPort*`, render and
+physics bookkeeping (`x9c_renderBounds`, `xc8_drawnToken`, `xfc_constantForce`), and what the AI state
+machine, body controller and animation change on the first tick (no codec for them yet).
+
+## Crash soak
+
+`tools/mpsoak.py` is the pre-release smoke: it drives `mprig` through the shipping matrix -- Remastered
+and retail (`--mods none`), Dawn validation and robustness on (`--env
+MP_DAWN_DISABLE=skip_validation,disable_robustness`, which makes any WebGPU error fatal in game) and
+the release toggles -- at MSAA 1 and 4, switched inside the same game with the console's `msaa N`.
+Every run also passes `MP_GX_CHECK_ARRAYS=1`: aurora then walks each indexed draw's vertex indices and
+drops a draw that would read past one of its arrays (the bind pose read through TEX7 included, the
+807013b1e Vulkan crash), logging `gx: vertex array overrun:` once per array. A texture coordinate no
+texgen reads is not checked: retail's packed-lightmap draws index TEX0 past its array that way, which
+nothing reads. It costs about 1 ns per
+vertex per indexed attribute, so it is off in release builds unless set (`0` turns it off), and on in
+builds without `NDEBUG`.
+
+    python3 tools/mpsoak.py --evidence-dir build/s-release-<date>/soak
+    python3 tools/mpsoak.py --dry-run --evidence-dir /tmp/soak-dry    # the commands only, no game
+
+One game per (mode, toggles), `soak-<mode>-<toggles>`, started with `--turbo`. Each room is one
+`mprig shot` that warps into it (`shots` starts and stops a game of its own, so it cannot share one
+process across two MSAA values). Screenshots land in `<evidence>/<mode>-<toggles>-msaa<N>/<NN>-<room>.png`;
+`summary.tsv` has a row per (mode, toggles, msaa, room) with `ok`, `warn` or `FAIL` and the first
+matching log line, and the exit status is 1 when any row FAILs.
+
+A room FAILs on `port: crashed:`, `WebGPU error`, `Device lost`, `gx: vertex array overrun:`, an aurora
+`[fatal]` line (desktop aurora logs `fmt`'s `[level] [module] message`, so `Log.fatal`/`FATAL` starts
+`[fatal]`) and on the game process going away; `not supported; skipped` lines are `warn`. After a death
+it writes `mprig crash <run>` to `<evidence>/<mode>-<toggles>-msaa<N>-<room>-crash.txt`, restarts the run
+(`--replace`) and carries on with the next room. It stops its own runs by exact name at exit (`--keep`
+leaves them up).
+
+`--rooms` overrides the tour (comma-separated names or `MLVL:MREA`; a name that does not resolve or that
+matches two rooms lists the candidates; `room@<editor id>` also turns to face that object with `look`
+before the shot), `--modes`/`--toggles`/`--msaa` narrow the matrix, and `--build` / `--disc` go to
+`mprig start`. The default tour is 12 rooms across all seven worlds: Exterior Docking Hangar, Tallon
+Canyon, Root Cave, both ends of the Tallon Overworld <-> Magmoor elevator, Phendrana Shorelines, Main
+Plaza, Main Quarry, Sunchamber, Hive Totem, Crater Entry Point, and the Frigate's Reactor Core. Tallon
+Canyon and the Magmoor elevator room face their water and lava: a fog volume only copies depth while it
+is on screen, and a spawn view that misses it hid issue #200 (an `@id` tour entry reproduces it on the
+build before the fix). Keep rooms whose warp lands on a save station out of the tour: the save prompt
+pauses the game and every later warp fails as "not ticking" (Landing Site does this). The full matrix
+takes a few minutes: the warps are the cost (~2 s in a cached world, ~10 s into a Frigate room).
+
 ## Shaders
 
 From "this pixel looks wrong" to the material, its PBR record and the generated WGSL:
@@ -143,7 +256,9 @@ vars can be set without a rebuild:
 Paths for `shader dump` / `shader override` / `drawlog dump` go under
 `/sdcard/Android/data/org.metroidprime.port/files`. `pick` doesn't work (it looks for a local
 screenshot): use `drawlog` plus `adb exec-out screencap -p`. `MP_OPENGLES=0/1` forces the backend
-for one run. `MP_DAWN_ENABLE` / `MP_DAWN_DISABLE` take comma-separated Dawn toggle names. `MP_PIPELINE_THREADS=<n>` sets
+for one run. `MP_DAWN_ENABLE` / `MP_DAWN_DISABLE` take comma-separated Dawn toggle names; they apply after the
+F1 > Video > Compatibility > Driver workarounds checkboxes, and either can turn off one of Aurora's defaults
+(`skip_validation`). `MP_PIPELINE_THREADS=<n>` sets
 how many threads compile pipelines (default half the cores, at most 8; GL always 1). Clear the
 properties (`setprop debug.mport.env ''`) when you're done.
 
@@ -164,6 +279,13 @@ Console `fx` (also in `docs/CONSOLE.md`) shows the live generators of the partic
     fx <PART> [dist] [scale] [loop]   spawn in front of the game camera, prints `generator #id`
 
 `fx list/tree/stats/mute/solo/timescale` run even while `hold 1`; spawning does not (a tick command).
+
+The port-only material versions and override targets are documented in [REMASTERED_VFX.md](REMASTERED_VFX.md).
+
+Debug switches: `MP_NESTED_LIGHTS=0` drops the lights of child particle generators;
+`MP_PARTICLE_LIGHT_SCALE=<s>` multiplies the particle light gain (default 1);
+`MP_ITPE_DEFAULT=0` drops the default ITPE (Remastered's 1) the port fills in for
+effects that leave it out, to compare.
 
 **Spawn and filmstrip an effect**
 
@@ -227,11 +349,23 @@ properties, `pdiff a b` only those that differ (e.g. the disc's against the conv
 
 ## GPU self-test
 
-For "the world is black on this GPU" reports (issues #7, #8): renders 10 known patterns into 32x32 offscreen
+For "the world is black on this GPU" reports (issues #7, #8): renders known patterns into 32x32 offscreen
 targets through the same GX -> generated WGSL -> pipeline -> bind-group path the game uses, reads them back and
-compares them (RGB, +-2 per channel). Cases: direct, 8-bit and 16-bit indexed vertices, konst/register TEV
-colour, a 3-stage TEV combine, RGBA8 / IA8 / I8 / CMPR textures, alpha blend and alpha-compare, depth in both
-draw orders, EFB copy sampled back.
+compares them (RGB, +-2 per channel; alpha is shown, not compared). Cases: direct, 8-bit and 16-bit indexed
+vertices, konst/register TEV colour, a 3-stage TEV combine, RGBA8 / IA8 / I8 / CMPR textures, alpha blend and
+alpha-compare, depth in both draw orders, EFB copy sampled back.
+
+Every case goes draw -> EFB copy -> readback, so two more checks leave stages out (issue #143):
+`readback` copies a texture written from the CPU straight back (no GX), and `efb-clear-copy` clears the EFB
+with a copy and copies it again (no draw). The readback buffer starts filled with `A5` bytes, so a block no copy
+reached says "nothing was copied back" instead of reading as black. When the failures point at one stage, a
+`diagnosis:` line names it: readback broken (the other results mean nothing), EFB copies broken, or draws not
+reaching the framebuffer. When everything passes, the diagnosis says so and what that leaves: the cases draw
+offscreen and never present, so a fault the player still sees is in presenting the frame (swapchain, present
+mode) or in drawing the cases don't cover. Tell the reporter that rather than "your GPU is fine".
+
+The count includes `readback` and `efb-clear-copy`, so it reads `x/12`; reports from before these checks
+(issue #143) read `x/10` with the same ten draw cases.
 A silent warm-up pass runs first so the async pipeline compiles finish, then the logged pass (a few frames later).
 Each case's own pipeline is waited for (a blocking lookup), so a draw is never skipped because its pipeline is
 still compiling: a FAIL means the draw happened and the device rendered it wrong. The wait can delay the call
@@ -242,11 +376,27 @@ by one compile of a fresh case's pipeline (~300 ms) however busy the compile que
 
     gpu selftest: backend Vulkan, adapter "...", clamped storage loads active|off
     gpu selftest: tev-3-stage: PASS (0.2 ms)
-    gpu selftest: indexed16-pos: FAIL (pixel 4,4 got 000000FF want 00FF00FF, 144/1024 pixels wrong) (0.3 ms)
-    gpu selftest: 9/10 passed (35 ms)
+    gpu selftest: readback: PASS (0.0 ms)
+    gpu selftest: indexed16-pos: FAIL (pixel 4,4 got 000000 alpha FF want 00FF00, 144/1024 pixels wrong) (0.3 ms)
+    gpu selftest: 11/12 passed (35 ms)
 
 A FAIL names the feature. Results land a frame or two after the request. Game rendering is unaffected: the
 run uses its own targets and the game's GX state is reset afterwards. Code: `extern/aurora/lib/gfx/selftest.cpp`.
+
+## Motion watch (`[motion]` log lines)
+
+`platform/port_motion_watch.cpp` keeps the player's last 20 `CGameCollision::MovePlayer`
+ticks and writes them to the port log (stderr, `metroid_prime_port.log`) when Samus moves more
+than 2 units in one tick, ends a tick faster than 60 units/s, or starts a tick more than 2 units
+from where the previous one ended (a jump outside the mover). A dump is a header line
+(`[motion] <reason>: tick N moved … speed … gap …`) then one `[motion]` line per tick: sim tick,
+area id, mover (`rmGround`, `rmAir`, `groundNew`, `groundOld`, `ball`, `air`), movement state
+(`ms`), morph state (`mb`), the retained Remastered object state (`ret`, `!` = invalid),
+non-player colliders, position and velocity before and after, the impulse fed to the mover,
+`gap`, `warp`/`cine` tags and `kb=` knockbacks (`Class#uid`, direction, power) received since the
+previous tick. At most one dump per 2 s and 20 per run. `CPlayer::Teleport` (console `tp`/`goto`,
+save-state load, room warps) sets the `warp` tag and is not dumped; a rebuilt player or a
+rewound sim clock restarts the ring. Normal play writes nothing.
 
 ## Limits
 
@@ -267,3 +417,16 @@ run uses its own targets and the game's GX state is reset afterwards. Code: `ext
 - `fx` mute hides draws only; muted generators keep emitting and updating (so their children still count in
   `fx stats` particles). Owner objects are not shown, and CRSC (crossfade/swoosh descriptions that are not
   generators) are not listed. Roots are the generators nobody else lists as a child.
+
+## Disc image check
+
+F1 > System > Disc image > "Check disc image" (console: `disc verify`, then `disc verify status`)
+reads the whole mounted image on a low-priority thread through its own nod handle (ISO, RVZ, CISO, GCZ;
+the game's reads are untouched) and compares each 1 MiB with the CRC32s of the Redump image of the
+revision named by the disc header (`platform/port_disc_verify_table.inc`, generated by
+`tools/disc_chunk_table.py` from the four Redump ISOs), plus the whole-image SHA-1. A mismatch is
+reported with the damaged MiB count, how many are all zeros, and the files from the disc's FST that
+overlap them (e.g. issue #176: zeros inside Metroid4.pak). The result is logged as
+`disc check: ...`. A full check takes about 10 s (cached) to 25 s (cold ISO) on a desktop.
+
+The same section shows the image path and a "Replace disc image..." button (always; the advice and the button lead when the check finds a damaged or unknown image; console: `disc replace <path>`). It asks for a file without blocking, refuses anything that is not a supported Metroid Prime disc, and remembers the new image for the next start (log: `disc image replaced: <path> (<revision>)`); the mounted disc is never swapped. On Android the picked file is copied to `disc.iso.part` on a background thread with a progress bar and renamed over `disc.iso` only when complete; Cancel keeps the old image. Disabled while a check or copy runs.

@@ -10,9 +10,14 @@
 #include "MetroidPrime/PathFinding/CPathFindSearch.hpp"
 #include "rstl/vector.hpp"
 
+#ifdef TARGET_PC
+#include "Kyoto/Particles/CElementGen.hpp"
+#endif
+
 class CCollisionResponseData;
 
 class CDrone : public CPatterned {
+  friend struct PortEntitySchema; // save-state field schema (platform/include/port_entity_schema.h)
 public:
   DECLARE_TYPES_MATCH_OR_ACCEPT;
   void Think(float dt, CStateManager& mgr) override;
@@ -64,7 +69,7 @@ public:
   void Burn(float duration, float damage) override;
   CPathFindSearch* GetSearchPath() override { return &x6b0_pathFind; }
   virtual void BuildNearList(EMaterialTypes includeMat, EMaterialTypes excludeMat, float radius,
-                             rstl::reserved_vector< TUniqueId, 1024 >& list, CStateManager& mgr);
+                             rstl::reserved_vector< TUniqueId, kMaxObjects >& list, CStateManager& mgr);
   virtual void SetLightEnabled(CStateManager& mgr, bool active);
   virtual void SetVisorFlareEnabled(CStateManager& mgr, bool active);
   virtual void UpdateVisorFlare(CStateManager& mgr);
@@ -180,6 +185,11 @@ private:
   bool x835_24_ : 1;
   bool x835_25_ : 1;
   bool x835_26_ : 1;
+#ifdef TARGET_PC
+  // Remastered's scanner effect (CDroneMP1 +0x818), drawn while scanning in place of the
+  // LaserLight.
+  rstl::single_ptr< CElementGen > xPortScannerEffect;
+#endif
 };
 CHECK_SIZEOF(CDrone, (VERSION >= VERSION_GM8P_00 ? 0x848 : 0x838))
 

@@ -38,14 +38,27 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 public final class MetroidPrimeActivity extends SDLActivity {
     private static final String TAG = "MetroidPrimePort";
     // Distinct from SDL's own dialog request codes, which count up from 0.
     private static final int REQUEST_TEXTURE_PACK = 0x7e57;
+    private static final int REQUEST_TEXTURE_PACK_ZIP = 0x7e58;
+    // Asks the system picker to list the phone's storage root, which it otherwise
+    // hides behind its shortcuts (Downloads, Recent, ...).
+    private static final String SHOW_ADVANCED = "android.content.extra.SHOW_ADVANCED";
     private static final int REQUEST_STORAGE = 0x7e58;
-    // The Remastered import's .nsp/.xci (+0) and prod.keys (+1).
+    // The Remastered import's .nsp/.xci (+0) and prod.keys (+1), a PAL disc for its
+    // languages (+2) and a disc for the full Flaahgra theme (+3).
     private static final int REQUEST_REMASTERED = 0x7e59;
+    // A disc picked after Android destroyed the activity behind the picker
+    // reaches a new launch, which drops it: SDL's dialog state died with the old
+    // process. The picker's request code is kept here, and such a pick is left
+    // in PENDING_DISC_FILE for the native side's next start (platform/main.cpp).
+    private static final String DISC_PICK_PREFS = "disc_pick";
+    private static final String PENDING_DISC_FILE = "pending_disc_uri";
     private TouchControlsView touchControls;
     private final AtomicBoolean texturePackCopying = new AtomicBoolean();
     // The data folder the texture pack being picked is copied into.
@@ -59,6 +72,8 @@ public final class MetroidPrimeActivity extends SDLActivity {
     private static native boolean nativeFramePresented();
     // Implemented in platform/port_memory_log.cpp; level -1 is onLowMemory.
     private static native void nativeMemoryWarning(int level, long availableKb, long thresholdKb, boolean low);
+    // Implemented in platform/debug_ui/android_jni.cpp.
+    private static native void nativeDrawInsets(int left, int top, int right, int bottom);
 
     // How the previous run ended, for the log (issue #102): a low-memory kill leaves
     // no crash report, so the system's exit record is the only trace. Read by
@@ -69,6 +84,14 @@ public final class MetroidPrimeActivity extends SDLActivity {
         return exitReport;
     }
 
+    // ActivityManager.isLowRamDevice() (Android Go and the like), read by
+    // port_memory_log.cpp to build pipelines on first use instead of at startup.
+    private static volatile boolean lowRamDevice = false;
+
+    static boolean lowRamDevice() {
+        return lowRamDevice;
+    }
+
     private String buildExitReport() {
         StringBuilder report = new StringBuilder();
         ActivityManager manager = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
@@ -77,6 +100,7 @@ public final class MetroidPrimeActivity extends SDLActivity {
         }
         ActivityManager.MemoryInfo memory = new ActivityManager.MemoryInfo();
         manager.getMemoryInfo(memory);
+        lowRamDevice = manager.isLowRamDevice();
         report.append(String.format(Locale.ROOT,
             "port: device memory: %d MiB, %d MiB available, low-memory threshold %d MiB, app heap class %d MiB",
             memory.totalMem >> 20, memory.availMem >> 20, memory.threshold >> 20, manager.getMemoryClass()));
@@ -240,6 +264,20 @@ public final class MetroidPrimeActivity extends SDLActivity {
             mLayout.addView(touchControls, new android.widget.RelativeLayout.LayoutParams(
                 android.widget.RelativeLayout.LayoutParams.MATCH_PARENT,
                 android.widget.RelativeLayout.LayoutParams.MATCH_PARENT));
+            // SDL's safe area includes the gesture zones, which stay reported
+            // with the bars hidden (a ~140 px band along the top on ColorOS).
+            // The settings window's top edge only needs to avoid the cutout and
+            // a bar on screen (window.cpp DrawArea); the insets still reach
+            // SDLSurface and the overlay below.
+            if (Build.VERSION.SDK_INT >= 30) {
+                mLayout.setOnApplyWindowInsetsListener((view, insets) -> {
+                    android.graphics.Insets draw = insets.getInsets(
+                        android.view.WindowInsets.Type.systemBars() |
+                        android.view.WindowInsets.Type.displayCutout());
+                    nativeDrawInsets(draw.left, draw.top, draw.right, draw.bottom);
+                    return insets;
+                });
+            }
             showStartupCover();
         }
         preferHighestRefreshRate();
@@ -351,8 +389,10 @@ public final class MetroidPrimeActivity extends SDLActivity {
     }
 
     // Called from the debug overlay, on the SDL thread, with the data folder
-    // the pack goes into.
-    public void pickTexturePack(String folder) {
+    // the pack goes into: a folder, or a .zip of one. The .zip is a single
+    // document, so it can be picked from Downloads or Recents where some
+    // providers list no folder contents.
+    public void pickTexturePack(String folder, boolean zip) {
         runOnUiThread(() -> {
             if (texturePackCopying.get()) {
                 nativeTexturePackStatus("A texture pack is still being copied.");
@@ -360,21 +400,35 @@ public final class MetroidPrimeActivity extends SDLActivity {
             }
             texturePackFolder = folder;
             try {
-                startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQUEST_TEXTURE_PACK);
+                if (zip) {
+                    // Providers disagree on a .zip's MIME type, so any file can be picked.
+                    startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT)
+                                               .addCategory(Intent.CATEGORY_OPENABLE)
+                                               .setType("*/*")
+                                               .putExtra(SHOW_ADVANCED, true),
+                                           REQUEST_TEXTURE_PACK_ZIP);
+                } else {
+                    startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+                                               .putExtra(SHOW_ADVANCED, true),
+                                           REQUEST_TEXTURE_PACK);
+                }
             } catch (android.content.ActivityNotFoundException e) {
-                nativeTexturePackStatus("This device has no folder picker.");
+                nativeTexturePackStatus(zip ? "This device has no file picker."
+                                            : "This device has no folder picker.");
             }
         });
     }
 
     // Called from the debug overlay, on the SDL thread: picks the Remastered
     // .nsp/.xci (which 0), prod.keys (which 1) or a PAL disc image for its
-    // languages (which 2). None has a MIME type of its own.
+    // languages (which 2), a disc image for the full Flaahgra theme (which 3) or a Metroid Dread
+    // .nsp/.xci for the Dread Samus import (which 4). None has a MIME type of its own.
     public void pickRemasteredFile(int which) {
         runOnUiThread(() -> {
             Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT)
                 .addCategory(Intent.CATEGORY_OPENABLE)
-                .setType("*/*");
+                .setType("*/*")
+                .putExtra(SHOW_ADVANCED, true);
             try {
                 startActivityForResult(intent, REQUEST_REMASTERED + which);
             } catch (android.content.ActivityNotFoundException e) {
@@ -468,16 +522,38 @@ public final class MetroidPrimeActivity extends SDLActivity {
         if (requestCode == REQUEST_TEXTURE_PACK) {
             Uri tree = data != null && resultCode == RESULT_OK ? data.getData() : null;
             if (tree != null) {
-                copyTexturePack(tree);
+                copyTexturePack(tree, false);
             }
             return;
         }
-        if (requestCode >= REQUEST_REMASTERED && requestCode <= REQUEST_REMASTERED + 2) {
+        if (requestCode == REQUEST_TEXTURE_PACK_ZIP) {
+            Uri zip = data != null && resultCode == RESULT_OK ? data.getData() : null;
+            if (zip != null) {
+                copyTexturePack(zip, true);
+            }
+            return;
+        }
+        if (requestCode >= REQUEST_REMASTERED && requestCode <= REQUEST_REMASTERED + 4) {
             Uri uri = data != null && resultCode == RESULT_OK ? data.getData() : null;
             if (uri != null) {
                 rememberRemasteredPick(requestCode - REQUEST_REMASTERED, uri);
             }
             return;
+        }
+        android.content.SharedPreferences discPick = getSharedPreferences(DISC_PICK_PREFS, MODE_PRIVATE);
+        if (discPick.getInt("request", Integer.MIN_VALUE) == requestCode) {
+            discPick.edit().remove("request").commit();
+            Uri disc = data != null && resultCode == RESULT_OK ? data.getData() : null;
+            if (disc != null && !isFileDialogPending(requestCode)) {
+                persistUri(disc);
+                try (OutputStream out = new FileOutputStream(new File(getFilesDir(), PENDING_DISC_FILE))) {
+                    out.write(disc.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    Log.i(TAG, "Kept a disc picked before the activity was recreated: " + disc);
+                } catch (IOException e) {
+                    Log.w(TAG, "Could not keep the disc picked before the activity was recreated", e);
+                }
+                return;
+            }
         }
         if (data != null) {
             persistUri(data.getData());
@@ -491,6 +567,26 @@ public final class MetroidPrimeActivity extends SDLActivity {
         super.onActivityResult(requestCode, resultCode, data);
     }
 
+    // Remembers which dialog is the disc picker (opening, filtered to disc
+    // images) in storage that outlives the process. commit, not apply: the
+    // process can be gone before an apply is written.
+    @Override
+    protected void onFileDialogShown(String[] filters, boolean forWrite, int requestCode) {
+        boolean disc = false;
+        if (!forWrite && filters != null) {
+            for (String filter : filters) {
+                disc |= filter != null && filter.contains("rvz");
+            }
+        }
+        android.content.SharedPreferences.Editor edit = getSharedPreferences(DISC_PICK_PREFS, MODE_PRIVATE).edit();
+        if (disc) {
+            edit.putInt("request", requestCode);
+        } else {
+            edit.remove("request");
+        }
+        edit.commit();
+    }
+
     private void persistUri(Uri uri) {
         if (uri == null) {
             return;
@@ -502,11 +598,12 @@ public final class MetroidPrimeActivity extends SDLActivity {
         }
     }
 
-    // Copies the picked folder's textures into <data>/user_textures.new, which
-    // the native side swaps in for user_textures on its next frame. A copy rather
-    // than reading through the URI: the grant can be revoked, and the loader
-    // needs real paths. The built-in set is never touched.
-    private void copyTexturePack(Uri tree) {
+    // Copies the picked folder's (or extracts the picked .zip's) textures into
+    // <data>/user_textures.new, which the native side swaps in for user_textures
+    // on its next frame. A copy rather than reading through the URI: the grant
+    // can be revoked, and the loader needs real paths. The built-in set is never
+    // touched.
+    private void copyTexturePack(Uri source, boolean zip) {
         if (!texturePackCopying.compareAndSet(false, true)) {
             return;
         }
@@ -519,11 +616,15 @@ public final class MetroidPrimeActivity extends SDLActivity {
             try {
                 deleteTree(staging);
                 int[] copied = {0};
-                String rootId = DocumentsContract.getTreeDocumentId(tree);
-                copyDocumentTree(tree, rootId, staging, copied);
+                if (zip) {
+                    extractTextureZip(source, staging, copied);
+                } else {
+                    copyDocumentTree(source, DocumentsContract.getTreeDocumentId(source), staging, copied);
+                }
                 if (copied[0] == 0) {
                     deleteTree(staging);
-                    nativeTexturePackStatus("No .png or .dds textures in that folder; nothing changed.");
+                    nativeTexturePackStatus(zip ? "No .png or .dds textures in that file (is it a .zip?); nothing changed."
+                                                : "No .png or .dds textures in that folder; nothing changed.");
                     return;
                 }
                 deleteTree(ready);
@@ -540,6 +641,55 @@ public final class MetroidPrimeActivity extends SDLActivity {
                 texturePackCopying.set(false);
             }
         }, "texture-pack-copy").start();
+    }
+
+    // Extracts a .zip's .png/.dds entries, keeping their folders (the loader
+    // searches subfolders). Entry names come from the archive, so any with an
+    // empty, "." or ".." component is skipped rather than allowed out of
+    // destination; so are macOS "._" resource forks.
+    private void extractTextureZip(Uri zip, File destination, int[] copied) throws IOException {
+        try (InputStream input = getContentResolver().openInputStream(zip)) {
+            if (input == null) {
+                throw new IOException("Cannot open " + zip);
+            }
+            ZipInputStream entries = new ZipInputStream(new java.io.BufferedInputStream(input));
+            ZipEntry entry;
+            while ((entry = entries.getNextEntry()) != null) {
+                if (entry.isDirectory()) {
+                    continue;
+                }
+                String[] parts = entry.getName().replace('\\', '/').split("/");
+                String name = parts[parts.length - 1];
+                String lower = name.toLowerCase(Locale.ROOT);
+                if ((!lower.endsWith(".png") && !lower.endsWith(".dds")) || name.startsWith("._")) {
+                    continue;
+                }
+                File target = destination;
+                boolean safe = true;
+                for (String part : parts) {
+                    if (part.isEmpty() || part.equals(".") || part.equals("..")
+                            || part.equals("__MACOSX")) {
+                        safe = false;
+                        break;
+                    }
+                    target = new File(target, part);
+                }
+                if (!safe) {
+                    continue;
+                }
+                File parent = target.getParentFile();
+                if (!parent.isDirectory() && !parent.mkdirs()) {
+                    throw new IOException("Failed to create " + parent);
+                }
+                try (FileOutputStream output = new FileOutputStream(target)) {
+                    copyStream(entries, output);
+                }
+                if (++copied[0] % 100 == 0) {
+                    nativeTexturePackStatus(String.format(Locale.ROOT,
+                        "Copying the texture pack... %d textures", copied[0]));
+                }
+            }
+        }
     }
 
     private void copyDocumentTree(Uri tree, String parentId, File destination, int[] copied)

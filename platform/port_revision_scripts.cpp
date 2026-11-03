@@ -1,4 +1,5 @@
 #include "port_revision_scripts.h"
+#include "port_bytes.h"
 
 #include "port_skip_cutscenes.h"
 
@@ -17,6 +18,9 @@ const uint32_t kEliteResearch = 0x8A97BB54;
 const uint32_t kArboretum = 0x18AB6106;
 const uint32_t kHiveTotem = 0xC8309DF6;
 const uint32_t kCentralDynamo = 0xFEA372E2;
+
+// Trilogy's MP1 rooms are PAL's, except Main Quarry: it has no extra door lock.
+bool PalScripts(Version version) { return version == Version::Pal || PortDisc::IsTrilogy(version); }
 
 // Op codes and conn state/message codes (port_skip_cutscenes_ops.cpp).
 enum : uint8_t { kEdit = 2, kRemConn = 3, kAddConn = 4, kDelete = 6 };
@@ -210,23 +214,21 @@ std::vector< Guard > GuardsFor(Version version, uint32_t mreaId) {
   if (version == Version::Usa102 && mreaId == kHiveTotem)
     return {{1, 0x04240140, kTypeTrigger, 63, 0, -1},
             {0, 0x0024028D, kTypeActor, kActorTail, kDoorLockModelVertical, -1}};
-  if (version == Version::Pal) {
+  if (PalScripts(version)) {
     switch (mreaId) {
     case kOreProcessing:
       return {{0, 0x00060372, kTypePlatform, kPlatformTail, 0, kPlatformActive},
               {0, 0x00060378, kTypePoi, kPoiTail, 0, kPoiActive},
               {0, 0x00060379, kTypeActor, kActorTail, 0, kActorActive}};
     case kMainQuarry:
+      if (version != Version::Pal)
+        break;
       return {{7, 0x1C0205DB, kTypeActor, kActorTail, kDoorLockModelVertical, kActorActive}};
     case kCentralDynamo:
       return {{1, 0x041B06A1, kTypeActor, kActorTail, kDoorLockModelVertical, -1}};
     }
   }
   return {};
-}
-
-uint32_t BigEndian32(const uint8_t* p) {
-  return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
 }
 
 // Number of guards the room's objects don't satisfy (-1: not parseable).
@@ -251,7 +253,7 @@ int GuardMisses(const std::vector< Guard >& guards, const uint8_t* scly, size_t 
       const size_t tailSize = size_t(o.props.data() + o.props.size() - tail);
       ok = (g.tail == 0 || tailSize == g.tail) &&
            (g.model == 0 || (tailSize >= kActorModel + 4U &&
-                             BigEndian32(tail + kActorModel) == g.model)) &&
+                             port::ReadBE32(tail + kActorModel) == g.model)) &&
            (g.activeOff < 0 || (tailSize > size_t(g.activeOff) && tail[g.activeOff] == 1));
       break;
     }
@@ -264,13 +266,15 @@ int GuardMisses(const std::vector< Guard >& guards, const uint8_t* scly, size_t 
 } // namespace
 
 std::vector< uint8_t > OpsFor(Version version, uint32_t mreaId) {
-  if (version == Version::Pal) {
+  if (PalScripts(version)) {
     switch (mreaId) {
     case kGeothermalCore:
       return GeothermalPal();
     case kOreProcessing:
       return OreProcessingPal();
     case kMainQuarry:
+      if (version != Version::Pal)
+        break;
       return MainQuarryPal();
     case kCentralDynamo:
       return CentralDynamoPal();
@@ -326,13 +330,15 @@ Result Apply(Version version, uint32_t mreaId, const uint8_t* scly, size_t size,
 }
 
 const char* Describe(Version version, uint32_t mreaId) {
-  if (version == Version::Pal) {
+  if (PalScripts(version)) {
     switch (mreaId) {
     case kGeothermalCore:
       return "PAL Geothermal Core Power Bomb rock";
     case kOreProcessing:
       return "PAL Ore Processing Power Bomb rock";
     case kMainQuarry:
+      if (version != Version::Pal)
+        break;
       return "PAL Main Quarry door lock";
     case kCentralDynamo:
       return "PAL Central Dynamo door lock";

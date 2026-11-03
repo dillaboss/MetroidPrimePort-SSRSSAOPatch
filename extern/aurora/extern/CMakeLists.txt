@@ -138,7 +138,8 @@ if (AURORA_ENABLE_GX)
     set(ZLIB_BUILD_TESTING OFF CACHE BOOL "Enable Zlib Examples as tests" FORCE)
     set(ZLIB_INSTALL OFF CACHE BOOL "Enable installation of zlib" FORCE)
     set(ZLIB_COMPAT ON CACHE BOOL "Use the compat version of zlib instead of the newer zlib-ng" FORCE)
-    if (MSVC AND CMAKE_C_COMPILER_ID STREQUAL "Clang" AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+    if (MSVC AND CMAKE_C_COMPILER_ID STREQUAL "Clang" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^([Aa][Rr][Mm]64|aarch64)$")
+      # (Windows reports the processor as ARM64, in capitals.)
       # zlib-ng's NEON LD4 probe passes GNU-style -march flags that clang-cl rejects
       set(NEON_HAS_LD4 1 CACHE INTERNAL "")
     endif ()
@@ -220,7 +221,10 @@ if (AURORA_ENABLE_GX)
     set(FT_DISABLE_PNG ON CACHE BOOL "" FORCE)
     set(FT_DISABLE_BZIP2 ON CACHE BOOL "" FORCE)
     FetchContent_Declare(Freetype
+      # Tried in order; the official mirrors carry the same tarball (same hash).
       URL https://files.twilitrealm.dev/freetype-2.14.3.tar.gz
+          https://download.savannah.gnu.org/releases/freetype/freetype-2.14.3.tar.gz
+          https://downloads.sourceforge.net/project/freetype/freetype2/2.14.3/freetype-2.14.3.tar.gz
       URL_HASH SHA256=e61b31ab26358b946e767ed7eb7f4bb2e507da1cfefeb7a8861ace7fd5c899a1
       DOWNLOAD_EXTRACT_TIMESTAMP FALSE
       EXCLUDE_FROM_ALL

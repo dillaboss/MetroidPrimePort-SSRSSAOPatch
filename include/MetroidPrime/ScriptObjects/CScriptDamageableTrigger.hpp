@@ -13,6 +13,7 @@
 class CVisorParameters;
 
 class CScriptDamageableTrigger : public CActor {
+  friend struct PortEntitySchema; // save-state field schema (platform/include/port_entity_schema.h)
 public:
   enum ECanOrbit {
     kCO_NoOrbit,
@@ -40,6 +41,12 @@ public:
   rstl::optional_object< CAABox > GetTouchBounds() const override;
   // The alpha its MaxReached -> Activate actors are drawn at (for the port's room geometry).
   float PortLinkedAlpha() const { return GetPuddleAlphaScale(); }
+#ifdef TARGET_PC
+  // Beam doors that stay unlocked (PortBeamDoors): the force field of a door
+  // that is already loaded takes another door type's weaknesses and textures.
+  void PortRestyle(const CDamageVulnerability& vuln, CAssetId patternTex1, CAssetId patternTex2,
+                   CAssetId colorTex);
+#endif
 
 private:
   CFrustumPlanes xe8_frustum;

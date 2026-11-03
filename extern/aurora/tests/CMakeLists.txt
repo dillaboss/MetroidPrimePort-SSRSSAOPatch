@@ -12,6 +12,13 @@ if (NOT TARGET gtest)
     EXCLUDE_FROM_ALL
   )
   FetchContent_MakeAvailable(googletest)
+  # googletest builds itself with -Werror, and newer clang flags its own
+  # char8_t printers (-Wcharacter-conversion)
+  if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    foreach (target gtest gtest_main)
+      target_compile_options(${target} PRIVATE -Wno-error)
+    endforeach ()
+  endif ()
 endif ()
 
 add_executable(io_tests
@@ -96,6 +103,7 @@ if (AURORA_ENABLE_GX)
     gx_dl_test.cpp
     gx_resident_test.cpp
     gx_scene_hdr_fifo_test.cpp
+    gx_vtx_array_check_test.cpp
   )
 
   target_include_directories(gx_fifo_tests PRIVATE
@@ -186,10 +194,12 @@ if (AURORA_ENABLE_GX)
     gx_suit_glass_test.cpp
     gx_inventory_visor_test.cpp
     vfx_blend_test.cpp
+    vfx_cluster_test.cpp
     render_target_layout_test.cpp
     scene_hdr_test.cpp
     scene_hdr_writer_test.cpp
     scene_hdr_water_fog_test.cpp
+    tex_copy_conv_msaa_test.cpp
   )
   target_include_directories(gfx_recording_tests PRIVATE
     ../include

@@ -1,7 +1,10 @@
 // Room geometry at run time: which areas have a file, their models, and the draw. See
 // port_room_geo.h.
 #include "port_env.h"
+#include "port_strings.h"
+#include "port_bytes.h"
 #include "port_room_geo.h"
+#include "port_room_geometry_handedness.h"
 #include "port_maya_spline.h"
 #include "port_room_sky.h"
 
@@ -9,6 +12,7 @@
 #include "port_log.h"
 #include "port_mods.h"
 #include "port_room_env.h"
+#include "port_visor_mesh.h"
 
 #include "Kyoto/Alloc/CMemory.hpp"
 #include "Kyoto/CResFactory.hpp"
@@ -39,11 +43,13 @@
 #include <dolphin/gx/GXExtra.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -124,6 +130,9 @@ struct Placed {
   // A platform's slave (0: none): the platform's editor id, where it stood when its area
   // was made, and how far from there it was when `xf` was last moved with it.
   uint32_t platform = 0;
+  bool actorTransform = false;
+  bool actorVisible = true;
+  CTransform4f actorLocal = CTransform4f::Identity();
   CVector3f platformStart = CVector3f::Zero();
   CVector3f dragged = CVector3f::Zero();
   // A DamageableTrigger's linked actor (kFollow; 0: none): the trigger's editor id, whether
@@ -131,6 +140,8 @@ struct Placed {
   uint32_t follow = 0;
   bool following = false;
   float alpha = 1.f;
+  bool modulated = false;
+  CModelFlags modulation = CModelFlags::Normal();
   size_t cluster = SIZE_MAX; // the Cluster it is drawn in, if any
   float scaleSq = 1.f; // the largest of its transform's axes, squared: model distances to world ones
   int level = -1;      // this frame's level of detail (Model::levels), -1 for the model itself
@@ -146,6 +157,7 @@ struct Placed {
   bool wasShown = false;
   CTransform4f base = CTransform4f::Identity();
   bool sky = false; // Instance::sky: drawn by Sky, not with the room
+  bool worldSky = false; // Instance::worldSky
   float skyRadiance[3] = {};
   float lightmap[3] = {}; // Instance::lightmap
   // Instance::drivers[0]: a float driver of one kind parameter. `value` is the spline at the
@@ -188,6 +200,14 @@ struct Cluster {
 
 // A script node now (see ScriptNode).
 struct NodeState {
+  struct TargetFlags {
+    size_t item;
+    bool modulated;
+    float alpha;
+    CModelFlags flags;
+  };
+  std::vector<TargetFlags> targetFlags;
+  AlphaModulateState modulation;
   bool active = true;
   bool inside = false; // a camera volume: the camera was in it when last looked at
   uint32_t count = 0;  // a counter's value
@@ -217,6 +237,9 @@ struct Area {
   std::vector< Model > models;
   std::vector< Placed > items;
   std::vector< const Placed* > sorted; // this frame's, with blended surfaces still to draw
+  // This frame's drawn models and where (DrawThermalHot): an item's transform, a cluster's
+  // identity.
+  std::vector< std::pair< const CModel*, const CTransform4f* > > hot;
   // The items grouped by model, the order Draw goes in: a model's instances one after another
   // keep its pipelines and textures bound, which is most of the cost of a draw on a phone.
   std::vector< size_t > drawOrder;
@@ -262,6 +285,11 @@ float sMinPixels = -1.f; // < 0 until MinPixels reads MP_ROOM_GEO_MIN_PX
 bool sMergedDraws = true;
 bool sFrontToBack = true;
 bool sDepthPrepass = false;
+#ifdef __ANDROID__
+bool sOpaquePrepass = false;
+#else
+bool sOpaquePrepass = true;
+#endif
 bool sOffscreenCasters = true;
 // Out-of-view models drawn caster-only, summed over the frame's areas (the last whole frame's in
 // sLastCasterCount), for the console.
@@ -330,26 +358,10 @@ const size_t kMergeCopies = 4;
 const size_t kMergeVertices = 4096;
 const float kMergeCell = 64.f;
 
-uint32_t ReadBig(const uint8_t* p) {
-  return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | uint32_t(p[3]);
-}
-void WriteBig(uint8_t* p, uint32_t v) {
-  p[0] = uint8_t(v >> 24);
-  p[1] = uint8_t(v >> 16);
-  p[2] = uint8_t(v >> 8);
-  p[3] = uint8_t(v);
-}
-float ReadBigFloat(const uint8_t* p) {
-  const uint32_t v = ReadBig(p);
-  float f;
-  std::memcpy(&f, &v, 4);
-  return f;
-}
-void WriteBigFloat(uint8_t* p, float f) {
-  uint32_t v;
-  std::memcpy(&v, &f, 4);
-  WriteBig(p, v);
-}
+using port::ReadBEFloat;
+using port::ReadBE32;
+using port::WriteBE32;
+using port::WriteBEFloat;
 
 // A CMDL's sections, as CModel::CModel reads them.
 struct CmdlSections {
@@ -363,20 +375,20 @@ struct CmdlSections {
 };
 
 bool ReadCmdl(const std::vector< uint8_t >& data, CmdlSections& out) {
-  if (data.size() < 0x2c || ReadBig(data.data()) != 0xdeadbabe) {
+  if (data.size() < 0x2c || ReadBE32(data.data()) != 0xdeadbabe) {
     return false;
   }
-  out.version = ReadBig(&data[4]);
-  out.flags = ReadBig(&data[8]);
-  const size_t count = ReadBig(&data[0x24]);
+  out.version = ReadBE32(&data[4]);
+  out.flags = ReadBE32(&data[8]);
+  const size_t count = ReadBE32(&data[0x24]);
   const size_t sizesAt = out.version == 1 ? 0x28 : 0x2c;
-  out.matSets = out.version >= 2 ? ReadBig(&data[0x28]) : 1;
+  out.matSets = out.version >= 2 ? ReadBE32(&data[0x28]) : 1;
   if (sizesAt + count * 4 > data.size()) {
     return false;
   }
   size_t at = (sizesAt + count * 4 + 31) & ~size_t(31);
   for (size_t i = 0; i < count; ++i) {
-    const size_t size = ReadBig(&data[sizesAt + i * 4]);
+    const size_t size = ReadBE32(&data[sizesAt + i * 4]);
     if (at + size > data.size()) {
       return false;
     }
@@ -389,7 +401,7 @@ bool ReadCmdl(const std::vector< uint8_t >& data, CmdlSections& out) {
     return false;
   }
   out.surfaces = info + 1;
-  out.surfaceCount = ReadBig(&data[out.sections[info].first]);
+  out.surfaceCount = ReadBE32(&data[out.sections[info].first]);
   return out.surfaces + out.surfaceCount <= count;
 }
 
@@ -424,16 +436,16 @@ std::vector< uint8_t > MergeCmdl(const std::vector< uint8_t >& source, const CCu
       return {};
     }
     const uint8_t* const header = &source[at];
-    const uint32_t extra = ReadBig(header + 0x1c);
+    const uint32_t extra = ReadBE32(header + 0x1c);
     if (extra > size) {
       return {};
     }
     const size_t headerSize = (0x4b + size_t(extra)) & ~size_t(31);
-    const size_t listSize = ReadBig(header + 0x10) & 0x7fffffff;
+    const size_t listSize = ReadBE32(header + 0x10) & 0x7fffffff;
     if (headerSize + listSize > size) {
       return {};
     }
-    const CCubeMaterial material = cube.GetMaterialByIndex(int(ReadBig(header + 0xc)));
+    const CCubeMaterial material = cube.GetMaterialByIndex(int(ReadBE32(header + 0xc)));
     if (material.PortNeedsModelMatrix()) {
       return {};
     }
@@ -453,9 +465,9 @@ std::vector< uint8_t > MergeCmdl(const std::vector< uint8_t >& source, const CCu
     if ((desc & 3) != GX_INDEX16) {
       return {};
     }
-    if (extra >= 0x40 && ReadBig(header + 0x44) == 0x50424958) { // 'PBIX'
-      surface.bases[0] = ReadBig(header + 0x48);
-      surface.bases[1] = ReadBig(header + 0x4c);
+    if (extra >= 0x40 && ReadBE32(header + 0x44) == 0x50424958) { // 'PBIX'
+      surface.bases[0] = ReadBE32(header + 0x48);
+      surface.bases[1] = ReadBE32(header + 0x4c);
     }
     const uint8_t* const list = header + headerSize;
     for (size_t i = 0; i < listSize;) {
@@ -499,34 +511,29 @@ std::vector< uint8_t > MergeCmdl(const std::vector< uint8_t >& source, const CCu
   std::vector< std::vector< uint8_t > > lists(in.surfaceCount);
   for (size_t s = 0; s < in.surfaceCount; ++s) {
     const uint8_t* const header = &source[in.sections[in.surfaces + s].first];
-    const size_t headerSize = (0x4b + ReadBig(header + 0x1c)) & ~31u;
-    const size_t listSize = ReadBig(header + 0x10) & 0x7fffffff;
+    const size_t headerSize = (0x4b + ReadBE32(header + 0x1c)) & ~31u;
+    const size_t listSize = ReadBE32(header + 0x10) & 0x7fffffff;
     const uint8_t* const list = header + headerSize;
     const Surface& surface = surfaces[s];
     std::vector< uint8_t >& out = lists[s];
     for (size_t copy = 0; copy < copies; ++copy) {
+      const bool mirrored = PortRoomGeometryHandedness::Mirrored(*places[copy]);
+      const PortRoomGeometryHandedness::PrimitiveLayout layout{
+          surface.stride, surface.normalAt,
+          size_t(surface.bases[0]) + copy * positionCount,
+          size_t(surface.bases[1]) + copy * normalCount};
       for (size_t i = 0; i < listSize;) {
         if (list[i] == 0) {
           ++i;
           continue;
         }
         const size_t count = size_t(list[i + 1] << 8 | list[i + 2]);
-        out.insert(out.end(), list + i, list + i + 3);
-        i += 3;
-        for (size_t v = 0; v < count; ++v, i += surface.stride) {
-          const size_t start = out.size();
-          out.insert(out.end(), list + i, list + i + surface.stride);
-          const auto move = [&](size_t at, uint32_t base, size_t perCopy) {
-            const uint32_t index = base + (uint32_t(out[start + at]) << 8 | out[start + at + 1]) + uint32_t(copy * perCopy);
-            out[start + at] = uint8_t(index >> 8);
-            out[start + at + 1] = uint8_t(index);
-            return index < 0x10000;
-          };
-          if (!move(0, surface.bases[0], positionCount) ||
-              (surface.normalAt != SIZE_MAX && !move(surface.normalAt, surface.bases[1], normalCount))) {
-            return {};
-          }
+        const uint8_t opcode = list[i];
+        const std::span<const uint8_t> vertices(list + i + 3, count * surface.stride);
+        if (!PortRoomGeometryHandedness::AppendPrimitive(opcode, count, vertices, layout, mirrored, out)) {
+          return {}; // unsupported primitive or layout: retain the individual draw path
         }
+        i += 3 + count * surface.stride;
       }
     }
     out.resize(aligned(out.size()), 0);
@@ -544,11 +551,11 @@ std::vector< uint8_t > MergeCmdl(const std::vector< uint8_t >& source, const CCu
   const CVector3f hi = bounds.GetMaxPoint();
   const float box[6] = {lo.GetX(), lo.GetY(), lo.GetZ(), hi.GetX(), hi.GetY(), hi.GetZ()};
   for (int i = 0; i < 6; ++i) {
-    WriteBigFloat(&out[0xc + i * 4], box[i]);
+    WriteBEFloat(&out[0xc + i * 4], box[i]);
   }
   size_t at = aligned(sizesAt + sizes.size() * 4);
   for (size_t i = 0; i < sizes.size(); ++i) {
-    WriteBig(&out[sizesAt + i * 4], uint32_t(sizes[i]));
+    WriteBE32(&out[sizesAt + i * 4], uint32_t(sizes[i]));
     uint8_t* const dst = &out[at];
     const uint8_t* const src = &source[in.sections[i].first];
     if (i == in.positions) {
@@ -556,11 +563,11 @@ std::vector< uint8_t > MergeCmdl(const std::vector< uint8_t >& source, const CCu
         const CTransform4f& xf = *places[copy];
         for (size_t v = 0; v < positionCount; ++v) {
           const uint8_t* const p = src + v * 12;
-          const CVector3f world = xf * CVector3f(ReadBigFloat(p), ReadBigFloat(p + 4), ReadBigFloat(p + 8));
+          const CVector3f world = xf * CVector3f(ReadBEFloat(p), ReadBEFloat(p + 4), ReadBEFloat(p + 8));
           uint8_t* const q = dst + (copy * positionCount + v) * 12;
-          WriteBigFloat(q, world.GetX());
-          WriteBigFloat(q + 4, world.GetY());
-          WriteBigFloat(q + 8, world.GetZ());
+          WriteBEFloat(q, world.GetX());
+          WriteBEFloat(q + 4, world.GetY());
+          WriteBEFloat(q + 8, world.GetZ());
         }
       }
     } else if (i == in.positions + 1) {
@@ -583,7 +590,7 @@ std::vector< uint8_t > MergeCmdl(const std::vector< uint8_t >& source, const CCu
           uint8_t* const q = dst + (copy * normalCount + v) * normalSize;
           float n[3], wn[3];
           for (int k = 0; k < 3; ++k) {
-            n[k] = ReadBigFloat(p + k * 4);
+            n[k] = ReadBEFloat(p + k * 4);
           }
           for (int r = 0; r < 3; ++r) {
             wn[r] = c[r * 3] * n[0] + c[r * 3 + 1] * n[1] + c[r * 3 + 2] * n[2];
@@ -591,14 +598,14 @@ std::vector< uint8_t > MergeCmdl(const std::vector< uint8_t >& source, const CCu
           const float nLength = std::sqrt(wn[0] * wn[0] + wn[1] * wn[1] + wn[2] * wn[2]);
           for (int k = 0; k < 3; ++k) {
             wn[k] = nLength > 0.f ? sign * wn[k] / nLength : 0.f;
-            WriteBigFloat(q + k * 4, wn[k]);
+            WriteBEFloat(q + k * 4, wn[k]);
           }
           for (size_t f = 0; f < frames; ++f) {
             const size_t bAt = 12 + 24 * f, tAt = 24 + 24 * f;
             float b[3], t[3];
             for (int k = 0; k < 3; ++k) {
-              b[k] = ReadBigFloat(p + bAt + k * 4);
-              t[k] = ReadBigFloat(p + tAt + k * 4);
+              b[k] = ReadBEFloat(p + bAt + k * 4);
+              t[k] = ReadBEFloat(p + tAt + k * 4);
             }
             const float handed = (n[1] * t[2] - n[2] * t[1]) * b[0] + (n[2] * t[0] - n[0] * t[2]) * b[1] +
                                          (n[0] * t[1] - n[1] * t[0]) * b[2] < 0.f ? -sign : sign;
@@ -615,8 +622,8 @@ std::vector< uint8_t > MergeCmdl(const std::vector< uint8_t >& source, const CCu
             const float wb[3] = {(wn[1] * wt[2] - wn[2] * wt[1]) * handed, (wn[2] * wt[0] - wn[0] * wt[2]) * handed,
                                  (wn[0] * wt[1] - wn[1] * wt[0]) * handed};
             for (int k = 0; k < 3; ++k) {
-              WriteBigFloat(q + bAt + k * 4, wb[k]);
-              WriteBigFloat(q + tAt + k * 4, wt[k]);
+              WriteBEFloat(q + bAt + k * 4, wb[k]);
+              WriteBEFloat(q + tAt + k * 4, wt[k]);
             }
           }
         }
@@ -624,7 +631,7 @@ std::vector< uint8_t > MergeCmdl(const std::vector< uint8_t >& source, const CCu
           const uint8_t* const p = src + v * normalSize;
           float n[3];
           for (int k = 0; k < 3; ++k) {
-            n[k] = format > 0 ? float(int16_t(p[k * 2] << 8 | p[k * 2 + 1])) / 16384.f : ReadBigFloat(p + k * 4);
+            n[k] = format > 0 ? float(int16_t(p[k * 2] << 8 | p[k * 2 + 1])) / 16384.f : ReadBEFloat(p + k * 4);
           }
           // Row r of the world matrix's cofactors dotted with the normal.
           float w[3];
@@ -640,29 +647,29 @@ std::vector< uint8_t > MergeCmdl(const std::vector< uint8_t >& source, const CCu
               q[k * 2] = uint8_t(uint16_t(s) >> 8);
               q[k * 2 + 1] = uint8_t(s);
             } else {
-              WriteBigFloat(q + k * 4, value);
+              WriteBEFloat(q + k * 4, value);
             }
           }
         }
       }
     } else if (i >= in.surfaces && i < in.surfaces + in.surfaceCount) {
       const size_t s = i - in.surfaces;
-      const uint32_t extra = ReadBig(src + 0x1c);
+      const uint32_t extra = ReadBE32(src + 0x1c);
       const size_t headerSize = (0x4b + size_t(extra)) & ~size_t(31);
       std::memcpy(dst, src, headerSize);
       const CVector3f centre = bounds.GetCenterPoint();
-      WriteBigFloat(dst, centre.GetX());
-      WriteBigFloat(dst + 4, centre.GetY());
-      WriteBigFloat(dst + 8, centre.GetZ());
-      WriteBig(dst + 0x10, (ReadBig(src + 0x10) & 0x80000000) | uint32_t(lists[s].size()));
+      WriteBEFloat(dst, centre.GetX());
+      WriteBEFloat(dst + 4, centre.GetY());
+      WriteBEFloat(dst + 8, centre.GetZ());
+      WriteBE32(dst + 0x10, (ReadBE32(src + 0x10) & 0x80000000) | uint32_t(lists[s].size()));
       if (extra != 0) {
         for (int k = 0; k < 6; ++k) {
-          WriteBigFloat(dst + 0x2c + k * 4, box[k]);
+          WriteBEFloat(dst + 0x2c + k * 4, box[k]);
         }
       }
       if (surfaces[s].bases[0] != 0 || surfaces[s].bases[1] != 0) {
-        WriteBig(dst + 0x48, 0); // folded into the indices
-        WriteBig(dst + 0x4c, 0);
+        WriteBE32(dst + 0x48, 0); // folded into the indices
+        WriteBE32(dst + 0x4c, 0);
       }
       std::memcpy(dst + headerSize, lists[s].data(), lists[s].size());
     } else {
@@ -871,25 +878,7 @@ void BindMaterialValues() {
 
 // The whole file, in one read when its size is known. The stream is left as a read
 // through istreambuf_iterator leaves it: failed only when the file did not open.
-std::vector< uint8_t > ReadAll(std::ifstream& in) {
-  std::vector< uint8_t > data;
-  if (!in) {
-    return data;
-  }
-  in.seekg(0, std::ios::end);
-  const std::streamoff size = in.tellg();
-  in.seekg(0, std::ios::beg);
-  if (in && size > 0) {
-    data.resize(size_t(size));
-    in.read(reinterpret_cast< char* >(data.data()), std::streamsize(size));
-    data.resize(size_t(in.gcount()));
-  } else {
-    in.clear();
-    data.assign(std::istreambuf_iterator< char >(in), std::istreambuf_iterator< char >());
-  }
-  in.clear();
-  return data;
-}
+using port::ReadAll;
 
 // The seconds a clip takes to play once, first frame to last.
 float ClipLength(const Instance::AnimClip& clip) {
@@ -943,12 +932,25 @@ CTransform4f Pose(const Instance::AnimClip& clip, double seconds) {
                       r[7], r[8], a[6] + (b[6] - a[6]) * w);
 }
 
+void RegisterNodes(Area& area);
+
 // The script objects as the file has them: a counter at 0, the camera in no volume.
 void ResetNodes(Area& area) {
   area.nodes.assign(area.script.nodes.size(), NodeState());
   area.groupShown.clear();
   for (size_t i = 0; i < area.nodes.size(); ++i) {
     area.nodes[i].active = area.script.nodes[i].active;
+  }
+  RegisterNodes(area);
+  // CacheTargetFlags (0xd5f1bc), at InitializedInArea: each modulator owns
+  // a copy of the actual target state, not an inferred Normal endpoint.
+  for (const ScriptEdge& edge : area.script.edges) {
+    if (edge.retail || edge.action != kGroupModulate || edge.from >= area.nodes.size() ||
+        edge.to >= area.groups.size()) continue;
+    for (size_t i : area.groups[edge.to]) {
+      const Placed& item = area.items[i];
+      area.nodes[edge.from].targetFlags.push_back({i, item.modulated, item.alpha, item.modulation});
+    }
   }
 }
 
@@ -970,6 +972,31 @@ void ReadLods() {
   }
 }
 
+// An area's file, read and parsed: all of the load that needs nothing of the game's, so
+// it can run on a worker while the game streams the area in (Prefetch).
+struct Parsed {
+  bool ok = false;
+  std::string error;
+  std::vector< Instance > instances;
+  Script script;
+};
+
+Parsed ReadAndParse(const std::string& path) {
+  Parsed parsed;
+  std::ifstream in(PortGci::PathFromString(path), std::ios::binary);
+  const std::vector< uint8_t > data = ReadAll(in);
+  parsed.ok = in && Parse(data, parsed.instances, parsed.error, &parsed.script);
+  return parsed;
+}
+
+// Prefetches by MREA, with the path each was read from: the main thread only.
+struct Prefetched {
+  std::string path;
+  std::future< Parsed > parsed;
+};
+std::unordered_map< uint32_t, Prefetched > sPrefetched;
+constexpr size_t kMaxPrefetched = 16;
+
 void Load(uint32_t mrea, Area& area) {
   const std::string path = PortMods::RoomGeoPath(mrea);
   if (path.empty() || gpResourceFactory == nullptr) {
@@ -978,15 +1005,24 @@ void Load(uint32_t mrea, Area& area) {
   if (!sLodsRead) {
     ReadLods();
   }
-  std::ifstream in(PortGci::PathFromString(path), std::ios::binary);
-  const std::vector< uint8_t > data = ReadAll(in);
-  std::string error;
-  if (!in || !Parse(data, area.instances, error, &area.script)) {
-    PortLog::Write("room geo: %s: %s\n", path.c_str(), error.empty() ? "cannot read" : error.c_str());
+  Parsed parsed;
+  const auto prefetched = sPrefetched.find(mrea);
+  if (prefetched != sPrefetched.end() && prefetched->second.path == path && prefetched->second.parsed.valid()) {
+    parsed = prefetched->second.parsed.get(); // waits only if the worker is not done yet
+  } else {
+    parsed = ReadAndParse(path);
+  }
+  if (prefetched != sPrefetched.end()) {
+    sPrefetched.erase(prefetched);
+  }
+  if (!parsed.ok) {
+    PortLog::Write("room geo: %s: %s\n", path.c_str(), parsed.error.empty() ? "cannot read" : parsed.error.c_str());
     area.instances.clear();
     area.script = Script();
     return;
   }
+  area.instances = std::move(parsed.instances);
+  area.script = std::move(parsed.script);
   // A model the import could not convert leaves its instances behind.
   std::unordered_map< uint32_t, size_t > index;
   size_t missing = 0;
@@ -1036,6 +1072,7 @@ void Load(uint32_t mrea, Area& area) {
     item.shown = item.active = instance.active;
     item.glows = instance.glows;
     item.sky = instance.sky;
+    item.worldSky = instance.sky && instance.worldSky;
     std::copy(instance.skyRadiance, instance.skyRadiance + 3, item.skyRadiance);
     std::copy(instance.glow, instance.glow + 3, item.glow);
     std::copy(instance.lightmap, instance.lightmap + 3, item.lightmap);
@@ -1065,6 +1102,12 @@ void Load(uint32_t mrea, Area& area) {
       }
     }
     for (const Link& link : instance.links) {
+      if (link.action == kActorTransform) {
+        item.platform = link.sender;
+        item.actorTransform = true;
+        item.actorLocal = item.xf;
+        continue;
+      }
       if (link.action == kFollow) {
         // GetIdForScript wants the layer bits too.
         item.follow = link.sender;
@@ -1151,8 +1194,50 @@ void Send(Area& area, uint32_t node, uint8_t event, int depth) {
   }
 }
 
+void RegisterNodes(Area& area) {
+  // Registered precedes InitializedInArea's target snapshot. Use the same
+  // Decrement state transition and target writes as AcceptScriptMsg0xd5fdb8.
+  for (size_t i = 0; i < area.nodes.size(); ++i) {
+    const ScriptNode& node = area.script.nodes[i];
+    NodeState& state = area.nodes[i];
+    if (node.kind == kAlphaModulate && state.modulation.Registered(node.AlphaConfig(), state.active)) {
+      sApplyBudget = kApplyBudget;
+      Send(area, uint32_t(i), 3, 0);
+    }
+  }
+}
+
 void Apply(Area& area, const ScriptEdge& edge, int depth) {
   --sApplyBudget;
+  if (edge.action == kGroupModulate) {
+    if (edge.to >= area.groups.size()) {
+      return;
+    }
+    const auto& state = area.nodes[edge.from].modulation;
+    const auto config = area.script.nodes[edge.from].AlphaConfig();
+    for (size_t i : area.groups[edge.to]) {
+      Placed& item = area.items[i];
+      if (state.restore) {
+        for (const auto& cached : area.nodes[edge.from].targetFlags) {
+          if (cached.item != i) continue;
+          item.modulated = cached.modulated;
+          item.alpha = cached.alpha;
+          item.modulation = cached.flags;
+          break;
+        }
+        continue;
+      }
+      item.modulated = true;
+      item.alpha = state.alpha;
+      CModelFlags flags = item.alpha == 1.f ? CModelFlags::Normal() : CModelFlags::AlphaBlended(item.alpha);
+      flags = flags.DepthCompareUpdate((config.flags & 4) != 0, (config.flags & 8) != 0);
+      unsigned extra = flags.GetOtherFlags();
+      if (config.flags & 16) extra |= CModelFlags::kF_DepthGreater;
+      if ((config.flags & 512) && item.alpha != 1.f) extra |= CModelFlags::kF_DrawNormal;
+      item.modulation = CModelFlags(flags, extra);
+    }
+    return;
+  }
   if (edge.action == kGroupNextClip) {
     if (edge.to >= area.groups.size()) {
       return;
@@ -1211,6 +1296,12 @@ void Apply(Area& area, const ScriptEdge& edge, int depth) {
   if (!node.active) {
     return;
   }
+  if (kind.kind == kAlphaModulate && (edge.action == kIncrement || edge.action == kDecrement)) {
+    if (node.modulation.Message(kind.AlphaConfig(), edge.action == kIncrement)) {
+      Send(area, edge.to, 3, depth);
+    }
+    return;
+  }
   if (edge.action == kFire && kind.kind == kRelay) {
     Send(area, edge.to, 0, depth);
   } else if (edge.action == kIncrement && kind.kind == kCounter) {
@@ -1232,6 +1323,33 @@ void Apply(Area& area, const ScriptEdge& edge, int depth) {
 }
 
 } // namespace
+
+void Prefetch(uint32_t mrea) {
+  if (GetMode() == Mode::Off || Areas().count(mrea) != 0 || sPrefetched.count(mrea) != 0) {
+    return;
+  }
+  std::string path = PortMods::RoomGeoPath(mrea);
+  if (path.empty()) {
+    return;
+  }
+  // Areas streamed in and dropped again before they loaded: the finished ones go first.
+  for (auto it = sPrefetched.begin(); sPrefetched.size() >= kMaxPrefetched && it != sPrefetched.end();) {
+    if (it->second.parsed.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+      it = sPrefetched.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  if (sPrefetched.size() >= kMaxPrefetched) {
+    return;
+  }
+  try {
+    std::future< Parsed > parsed = std::async(std::launch::async, ReadAndParse, path);
+    sPrefetched.emplace(mrea, Prefetched{std::move(path), std::move(parsed)});
+  } catch (...) {
+    // No thread to spare: Load reads the file itself.
+  }
+}
 
 void SetLoadedAreas(const uint32_t* mreas, size_t count) {
   auto& areas = Areas();
@@ -1310,6 +1428,7 @@ void DrawShadowReceivers(const float lo[3], const float hi[3]) {
         b.GetZ() < lo[2] || a.GetZ() > hi[2]) {
       continue;
     }
+    const PortRoomGeometryHandedness::CullScope cull(PortRoomGeometryHandedness::Mirrored(*r.xf));
     gpRender->SetModelMatrix(*r.xf);
     r.model->DrawUnsortedParts(CModelFlags::Normal());
   }
@@ -1326,6 +1445,7 @@ bool Draw(const CStateManager& mgr, const CGameArea& gameArea, const CFrustumPla
   }
   Area& area = found->second;
   area.sorted.clear();
+  area.hot.clear();
   if (!area.placed) {
     for (Placed& item : area.items) {
       item.xf = gameArea.GetTM() * item.xf;
@@ -1342,6 +1462,15 @@ bool Draw(const CStateManager& mgr, const CGameArea& gameArea, const CFrustumPla
     }
     const CActor* const platform =
         TCastToConstPtr< CActor >(mgr.GetObjectById(mgr.GetIdForScript(TEditorId(item.platform))));
+    if (item.actorTransform) {
+      // A shared transform does not replace this entity's script activation.
+      item.actorVisible = platform != nullptr && platform->GetActive();
+      if (platform != nullptr) {
+        item.xf = item.base = platform->GetTransform() * item.actorLocal;
+        item.bounded = false;
+      }
+      continue;
+    }
     if (platform == nullptr) {
       continue;
     }
@@ -1437,7 +1566,14 @@ bool Draw(const CStateManager& mgr, const CGameArea& gameArea, const CFrustumPla
       item.following = false;
     }
   }
-  const bool baked = !AreaLights() && PortRoomEnv::HasVolume(gameArea.GetAreaAssetId());
+  const bool volumes = !AreaLights() && PortRoomEnv::HasVolume(gameArea.GetAreaAssetId());
+  // A room with a lightmap and no grid: what has a lookup into the lightmap is lit by it, as
+  // Remastered's world models are; the rest (a merged cluster, an instance without a lookup)
+  // keeps the area's lights, there being no grid to light it.
+  const bool lightmapOnly = !AreaLights() && !volumes && PortRoomEnv::HasLightmapOnly(gameArea.GetAreaAssetId());
+  const auto bakes = [&](const float* lookup) {
+    return volumes || (lightmapOnly && lookup != nullptr && HasLightmapLookup(lookup));
+  };
   CScriptLayerManager* const layers =
       area.gated ? const_cast< CStateManager& >(mgr).WorldLayerState().GetPtr() : nullptr;
   if (area.drawOrder.size() != area.items.size()) {
@@ -1474,7 +1610,10 @@ bool Draw(const CStateManager& mgr, const CGameArea& gameArea, const CFrustumPla
     return (bounds.GetMaxPoint() - bounds.GetMinPoint()).Magnitude() < minSpan * std::sqrt(distanceSq(bounds));
   };
   // Remastered's switch distances are the model's own, so a scaled item's are scaled with it.
-  const float lodScaleSq = LodDistance() * LodDistance();
+  // Performance mode switches at half the distance.
+  const float lodScale =
+      LodDistance() * ((GXPortGetPerformance() & GX_PORT_PERF_COARSE_LOD) != 0 ? 0.5f : 1.f);
+  const float lodScaleSq = lodScale * lodScale;
   // The last level loaded whose distance the bounds are past, -1 for the full model. `usable`
   // caps it, for a cluster's merged levels.
   const auto pickLevel = [&](const Model& model, size_t usable, const CAABox& bounds, float scaleSq) {
@@ -1490,7 +1629,7 @@ bool Draw(const CStateManager& mgr, const CGameArea& gameArea, const CFrustumPla
     }
     return picked;
   };
-  const auto light = [&](std::unique_ptr< CActorLights >& lights, bool& areaLit, const CAABox& bounds) {
+  const auto light = [&](std::unique_ptr< CActorLights >& lights, bool& areaLit, const CAABox& bounds, bool baked) {
     if (lights == nullptr || areaLit == baked) {
       // The baked ambient already holds the area's lights, so that set has room for none:
       // one that expects area lights and has none drops its dynamic lights too. Its
@@ -1532,6 +1671,7 @@ bool Draw(const CStateManager& mgr, const CGameArea& gameArea, const CFrustumPla
     // volume instead)
     const float* lightmap;
     const Placed* driven; // its float driver's instance, or null
+    const CModelFlags* flags;
   };
   static std::vector< Visible > visible;
   visible.clear();
@@ -1541,9 +1681,9 @@ bool Draw(const CStateManager& mgr, const CGameArea& gameArea, const CFrustumPla
   static const CTransform4f kIdentity = CTransform4f::Identity();
   const auto add = [&](Model& model, const CModel& drawn, const CTransform4f& xf, CActorLights* lights,
                        const CAABox& bounds, const float* glow = nullptr, const float* lightmap = nullptr,
-                       bool inView = true, const Placed* driven = nullptr) {
+                        bool inView = true, const Placed* driven = nullptr, const CModelFlags* flags = nullptr) {
     (inView ? visible : casters)
-        .push_back({cutout(model), distanceSq(bounds), &drawn, &xf, lights, &bounds, glow, lightmap, driven});
+        .push_back({cutout(model), distanceSq(bounds), &drawn, &xf, lights, &bounds, glow, lightmap, driven, flags});
     if (inView && !visible.back().cutout) {
       sShadowReceivers.push_back({&drawn, &xf, bounds});
     }
@@ -1570,7 +1710,7 @@ bool Draw(const CStateManager& mgr, const CGameArea& gameArea, const CFrustumPla
         (!inView(area.models[cluster.model], cluster.bounds, casts) && !casts)) {
       continue;
     }
-    light(cluster.lights, cluster.areaLit, cluster.bounds);
+    light(cluster.lights, cluster.areaLit, cluster.bounds, bakes(nullptr));
     const int level = pickLevel(area.models[cluster.model], cluster.levels.size(), cluster.bounds, cluster.scaleSq);
     add(area.models[cluster.model], level < 0 ? *cluster.merged : *cluster.levels[level].merged, kIdentity,
         cluster.lights.get(), cluster.bounds, nullptr, nullptr, !casts);
@@ -1585,7 +1725,7 @@ bool Draw(const CStateManager& mgr, const CGameArea& gameArea, const CFrustumPla
   for (const size_t index : area.drawOrder) {
     Placed& item = area.items[index];
     Model& model = area.models[item.model];
-    if (item.sky || !model.loaded || model.hidden || !item.shown || item.alpha <= 0.f ||
+    if (item.sky || !model.loaded || model.hidden || !item.shown || !item.actorVisible || item.alpha <= 0.f ||
         (item.cluster != SIZE_MAX && !area.clusters[item.cluster].split)) {
       continue;
     }
@@ -1601,7 +1741,8 @@ bool Draw(const CStateManager& mgr, const CGameArea& gameArea, const CFrustumPla
     if (tooSmall(item.bounds) || (!inView(model, item.bounds, casts) && (!casts || item.alpha < 1.f))) {
       continue;
     }
-    light(item.lights, item.areaLit, item.bounds);
+    const bool baked = bakes(item.lightmap);
+    light(item.lights, item.areaLit, item.bounds, baked);
     item.volume = baked ? gameArea.GetAreaAssetId() : 0;
     // Blended surfaces (glass, decals) wait for the sorted pass, where they are drawn
     // back to front among the actors.
@@ -1615,6 +1756,16 @@ bool Draw(const CStateManager& mgr, const CGameArea& gameArea, const CFrustumPla
     }
     if (item.level >= 0) {
       ++sDrawnCoarse;
+    }
+    if (item.modulated) {
+      const auto plan = PlanAlphaRender(item.alpha, (item.modulation.GetOtherFlags() & CModelFlags::kF_DrawNormal) != 0);
+      if (plan.unsorted) {
+        add(model, cmodel, item.xf, item.lights.get(), item.bounds, item.glows ? item.glow : nullptr,
+            item.lightmap, true, item.driven ? &item : nullptr, &item.modulation);
+      }
+      if (plan.sortedOpaque || !cmodel.IsDefinitelyOpaque()) area.sorted.push_back(&item);
+      ++sDrawn;
+      continue;
     }
     if (item.alpha < 1.f) {
       area.sorted.push_back(&item);
@@ -1635,8 +1786,12 @@ bool Draw(const CStateManager& mgr, const CGameArea& gameArea, const CFrustumPla
       return a.cutout != b.cutout ? b.cutout : a.distanceSq < b.distanceSq;
     });
   }
+  for (const Visible& draw : visible) {
+    area.hot.emplace_back(draw.model, draw.xf);
+  }
   const auto drawOne = [&](const Visible& draw) {
-    if (baked) {
+    const PortRoomGeometryHandedness::CullScope cull(PortRoomGeometryHandedness::Mirrored(*draw.xf));
+    if (bakes(draw.lightmap)) {
       const CVector3f centre = draw.bounds->GetCenterPoint();
       const float at[3] = {centre.GetX(), centre.GetY(), centre.GetZ()};
       PortRoomEnv::SetVolumeHint(gameArea.GetAreaAssetId(), at);
@@ -1651,7 +1806,7 @@ bool Draw(const CStateManager& mgr, const CGameArea& gameArea, const CFrustumPla
     if (draw.driven != nullptr) {
       CCubeModel::PortSetKindParam(draw.driven->driverSlot, draw.driven->driverValue);
     }
-    draw.model->DrawUnsortedParts(CModelFlags::Normal());
+    draw.model->DrawUnsortedParts(draw.flags != nullptr ? *draw.flags : CModelFlags::Normal());
     if (draw.driven != nullptr) {
       CCubeModel::PortSetKindParam(-1, 0.f);
     }
@@ -1660,16 +1815,20 @@ bool Draw(const CStateManager& mgr, const CGameArea& gameArea, const CFrustumPla
     }
   };
   // With the sort, the cut-outs come last, after every opaque model: they go twice, depth only
-  // and then shaded where the depth is equal, so the grass hidden behind grass isn't shaded.
-  const auto firstCutout = sFrontToBack && sDepthPrepass
-                               ? std::find_if(visible.begin(), visible.end(), [](const Visible& v) { return v.cutout; })
-                               : visible.end();
-  std::for_each(visible.begin(), firstCutout, drawOne);
-  if (firstCutout != visible.end()) {
+  // and then shaded where the depth is equal, so the grass hidden behind grass isn't shaded. The
+  // opaque pre-pass does the same with every model.
+  auto firstPrepass = visible.end();
+  if (sOpaquePrepass) {
+    firstPrepass = visible.begin();
+  } else if (sFrontToBack && sDepthPrepass) {
+    firstPrepass = std::find_if(visible.begin(), visible.end(), [](const Visible& v) { return v.cutout; });
+  }
+  std::for_each(visible.begin(), firstPrepass, drawOne);
+  if (firstPrepass != visible.end()) {
     GXPortSetDepthPrepass(1);
-    std::for_each(firstCutout, visible.end(), drawOne);
+    std::for_each(firstPrepass, visible.end(), drawOne);
     GXPortSetDepthPrepass(2);
-    std::for_each(firstCutout, visible.end(), drawOne);
+    std::for_each(firstPrepass, visible.end(), drawOne);
     GXPortSetDepthPrepass(0);
   }
   if (sCasterFrame != CGraphics::GetFrameCounter()) {
@@ -1685,10 +1844,33 @@ bool Draw(const CStateManager& mgr, const CGameArea& gameArea, const CFrustumPla
   }
   gpRender->SetAmbientColor(CColor::White());
   CGraphics::DisableAllLights();
-  if (baked) {
+  if (volumes || lightmapOnly) {
     PortRoomEnv::ClearVolumeHint();
   }
   return GetMode() == Mode::Replace;
+}
+
+void DrawThermalHot(const CStateManager&, const CGameArea& gameArea, const CFrustumPlanes&) {
+  const auto found = Areas().find(gameArea.GetAreaAssetId());
+  if (found == Areas().end()) {
+    return;
+  }
+  // Remastered's hot pass (RenderPrimaryPass, 0xfb11f0): the meshes with bit 19 and without
+  // 22, unsorted and depth-sorted, through the thermal override at the world's global
+  // (1.0, 0.2509804), taken as they are (no actor data to scale them).
+  CCubeModel::PortSetThermalPass(PortVisorMesh::kTP_Hot);
+  CCubeModel::PortSetThermalOverrideConstants(1.f, 0.2509804f);
+  CGraphics::DisableAllLights();
+  for (const auto& [model, xf] : found->second.hot) {
+    const CCubeModel* const cube = model->GetCubeModel();
+    if (cube == nullptr || !cube->TryLockTextures()) {
+      continue;
+    }
+    gpRender->SetModelMatrix(*xf);
+    cube->PortDrawThermalOverride(nullptr, nullptr, CModelFlags::Normal(), kSS_All);
+  }
+  CCubeModel::PortClearThermalOverride();
+  CCubeModel::PortSetThermalPass(PortVisorMesh::kTP_None);
 }
 
 void AddSorted(const CGameArea& gameArea) {
@@ -1729,6 +1911,7 @@ void DrawSorted(const void* drawable) {
     PortRoomEnv::SetVolumeHint(item.volume, at);
     PortRoomEnv::SetLightmapHint(item.lightmap);
   }
+  const PortRoomGeometryHandedness::CullScope cull(PortRoomGeometryHandedness::Mirrored(item.xf));
   gpRender->SetModelMatrix(item.xf);
   item.lights->ActivateLights();
   const CModelData& data =
@@ -1740,7 +1923,19 @@ void DrawSorted(const void* drawable) {
   if (item.driven) {
     CCubeModel::PortSetKindParam(item.driverSlot, item.driverValue);
   }
-  if (item.alpha < 1.f) {
+  if (item.modulated) {
+    const auto plan = PlanAlphaRender(item.alpha, (item.modulation.GetOtherFlags() & CModelFlags::kF_DrawNormal) != 0);
+    // The retail wrappers interpret DrawNormal as an extra colour draw. The
+    // Remastered state (0xb42074) instead requests a depth-only opaque group.
+    const CModelFlags flags(item.modulation, item.modulation.GetOtherFlags() & ~CModelFlags::kF_DrawNormal);
+    if (plan.depthOpaque) {
+      GXPortSetDepthPrepass(1);
+      cmodel.DrawUnsortedParts(flags.DepthCompareUpdate((flags.GetOtherFlags() & CModelFlags::kF_DepthCompare) != 0, true));
+      GXPortSetDepthPrepass(0);
+    }
+    if (plan.sortedOpaque) cmodel.DrawUnsortedParts(flags);
+    if (plan.visible) cmodel.DrawSortedParts(flags);
+  } else if (item.alpha < 1.f) {
     cmodel.Draw(CModelFlags(CModelFlags::kT_Blend, item.alpha));
   } else {
     cmodel.DrawSortedParts(CModelFlags::Normal());
@@ -1773,7 +1968,7 @@ bool Hides(const CGameArea& gameArea, uint32_t editorId) {
       gpGameState != nullptr ? gpGameState->CurrentWorldState().GetLayerState().GetPtr() : nullptr;
   for (const auto& [id, at] : found->second.hides) {
     const Placed& item = found->second.items[at];
-    if (id == editorId && item.shown &&
+    if (id == editorId && item.shown && item.actorVisible &&
         (item.layer == kEveryLayer || layers == nullptr ||
          layers->IsLayerActive(gameArea.GetAreaId(), item.layer))) {
       return true;
@@ -1782,9 +1977,10 @@ bool Hides(const CGameArea& gameArea, uint32_t editorId) {
   return false;
 }
 
-// The room's sky instances that are shown and on a layer that is on.
+// The room's sky instances that are shown and on a layer that is on: its own, or (`world`)
+// the world's (Instance::worldSky).
 template < typename Fn >
-void ForEachSky(const CGameArea& gameArea, Fn&& fn) {
+void ForEachSky(const CGameArea& gameArea, bool world, Fn&& fn) {
   if (GetMode() == Mode::Off || gpGameState == nullptr) {
     return;
   }
@@ -1796,7 +1992,7 @@ void ForEachSky(const CGameArea& gameArea, Fn&& fn) {
   const Area& area = found->second;
   const CScriptLayerManager* const layers = gpGameState->CurrentWorldState().GetLayerState().GetPtr();
   for (const Placed& item : area.items) {
-    if (!item.sky || !item.shown || area.models[item.model].hidden ||
+    if (!item.sky || item.worldSky != world || !item.shown || area.models[item.model].hidden ||
         (item.layer != kEveryLayer && layers != nullptr && !layers->IsLayerActive(gameArea.GetAreaId(), item.layer))) {
       continue;
     }
@@ -1806,12 +2002,12 @@ void ForEachSky(const CGameArea& gameArea, Fn&& fn) {
   }
 }
 
-int Skies(const CGameArea& gameArea, SkyLayer (&out)[kMaxSkyLayers]) {
+int Skies(const CGameArea& gameArea, SkyLayer (&out)[kMaxSkyLayers], bool world) {
   int count = 0;
   bool loading = false;
   float corners[kMaxSkyLayers];
   float largest = 0.f;
-  ForEachSky(gameArea, [&](const Area& area, const Placed& item) {
+  ForEachSky(gameArea, world, [&](const Area& area, const Placed& item) {
     const Model& model = area.models[item.model];
     if (!model.data->IsLoaded(0)) {
       // Draw loads the area's models, but only while the area is drawn.
@@ -1859,7 +2055,7 @@ int Skies(const CGameArea& gameArea, SkyLayer (&out)[kMaxSkyLayers]) {
 
 bool HasSky(const CGameArea& gameArea) {
   bool has = false;
-  ForEachSky(gameArea, [&](const Area&, const Placed&) {
+  ForEachSky(gameArea, false, [&](const Area&, const Placed&) {
     has = true;
     return false;
   });
@@ -1870,15 +2066,18 @@ uint32_t sSkyDrawnFor = 0;
 
 bool HidesSky(const CGameArea& gameArea, const CActor& actor) {
   // Retail's sky domes are 314 to 1867 units across (scaled); the next largest actor in a room
-  // with a sky of its own is 139 (Artifact Temple's bird eyes).
+  // with a sky of its own is 139 (Artifact Temple's bird eyes). A dome is that big across two
+  // axes at least; a box long in one only is no dome (Sun Tower's spiked door cover F6EAE8D8
+  // reaches 5000 units down and is 4 across).
   constexpr float kDomeSize = 250.f;
   if (sSkyDrawnFor == 0 || TCastToConstPtr< CScriptActor >(&actor) == nullptr || !actor.HasModelData()) {
     return false;
   }
   const CAABox box = actor.GetModelData()->GetBounds();
   const CVector3f size = box.GetMaxPoint() - box.GetMinPoint();
-  return std::max({std::fabs(size.GetX()), std::fabs(size.GetY()), std::fabs(size.GetZ())}) > kDomeSize &&
-         HasSky(gameArea);
+  float extents[3] = {std::fabs(size.GetX()), std::fabs(size.GetY()), std::fabs(size.GetZ())};
+  std::sort(extents, extents + 3);
+  return extents[1] > kDomeSize && HasSky(gameArea);
 }
 
 void OnScriptState(CStateManager& mgr, uint32_t editorId, int state) {
@@ -1990,6 +2189,12 @@ void Think(CStateManager& mgr, float dt) {
     for (size_t n = 0; n < area.nodes.size(); ++n) {
       const ScriptNode& node = area.script.nodes[n];
       NodeState& state = area.nodes[n];
+      if (node.kind == kAlphaModulate && state.active && state.modulation.enabled) {
+        const bool ended = state.modulation.Tick(node.AlphaConfig(), dt);
+        sApplyBudget = kApplyBudget;
+        Send(area, uint32_t(n), 3, 0);
+        if (ended) Send(area, uint32_t(n), 2, 0);
+      }
       // An inactive trigger does not think (CScriptTrigger::Think), so it sees nothing.
       if (node.kind != kCameraVolume || !state.active) {
         continue;
@@ -2077,7 +2282,6 @@ int GroupShown(uint32_t mrea, uint32_t group) {
 
 void ResetScriptState() {
   for (auto& [mrea, area] : Areas()) {
-    ResetNodes(area);
     area.animTime = 0.;
     area.clock = 0.;
     area.pending.clear();
@@ -2088,11 +2292,14 @@ void ResetScriptState() {
       item.clipStart = 0.;
       item.following = false;
       item.alpha = 1.f;
+      item.modulated = false;
+      item.modulation = CModelFlags::Normal();
       if (item.driven) {
         item.startAt = 1e300;
         item.driverValue = item.driverSpline.Eval(item.driverSpline.FirstTime());
       }
     }
+    ResetNodes(area);
   }
 }
 
@@ -2337,6 +2544,7 @@ int ClearMaterialValues() {
 
 void Reset() {
   CCubeModel::PortClearPBROverrides();
+  sPrefetched.clear(); // waits for any still reading: the files are about to change
   Areas().clear();
   sLods.clear();
   sLodsRead = false;
@@ -2394,6 +2602,10 @@ void SetDepthPrepass(bool on) { sDepthPrepass = on; }
 
 bool DepthPrepass() { return sDepthPrepass; }
 
+void SetOpaquePrepass(bool on) { sOpaquePrepass = on; }
+
+bool OpaquePrepass() { return sOpaquePrepass; }
+
 void SetMode(Mode mode) {
   sMode = int(mode);
   if (mode == Mode::Off) {
@@ -2413,7 +2625,7 @@ Mode GetMode() {
     return Mode::Off;
   }
   if (sMode < 0) {
-    const char* const env = std::getenv("MP_ROOM_GEO");
+    const char* const env = port::EnvString("MP_ROOM_GEO");
     sMode = int(env == nullptr || env[0] == '\0' ? Mode::Replace
                 : env[0] == '0'                  ? Mode::Off
                 : env[0] == 'o'                  ? Mode::Overlay

@@ -45,6 +45,10 @@ namespace aurora::dvd::impl {
   bool s_overlayCallbacksSet = false;
   AuroraOverlayCallbacks s_overlayCallbacks;
   std::mutex s_fstLock;
+  std::string s_rootDir;
+  std::string s_dolFile;
+  s32 s_dolFileEntryNum = k_invalidFstEntry;
+  std::vector<u8> s_dolFileData;
 }
 
 namespace {
@@ -124,6 +128,10 @@ void clearState() {
   s_currentDir = 0;
   s_currentPath = "/";
   s_diskID = {};
+  s_rootDir.clear();
+  s_dolFile.clear();
+  s_dolFileEntryNum = k_invalidFstEntry;
+  s_dolFileData.clear();
   s_initialized = false;
 }
 
@@ -254,14 +262,28 @@ s32 readFromHandle(CommandDataBase* handle, void* out, s32 length, s32 offset, u
   u8* writePtr = static_cast<u8*>(out);
   s32 totalRead = 0;
   s32 remaining = length;
+  bool retried = false;
   while (remaining > 0) {
     const int64_t read = handle->read(writePtr + totalRead, static_cast<size_t>(remaining));
     if (read < 0) {
       return DVD_RESULT_FATAL_ERROR;
     }
     if (read == 0) {
-      break;
+      // Port: 0 is end of file only at the file's end. Short of it (a failed
+      // block fetch), it used to finish the read as a silent success with the
+      // buffer unfilled; retry once from where it stopped, then fail.
+      const int64_t end = handle->seek(0, 2);
+      const int64_t at = static_cast<int64_t>(offset) + totalRead;
+      if (end >= 0 && at >= end) {
+        break;
+      }
+      if (retried || end < 0 || handle->seek(at, 0) != at) {
+        return DVD_RESULT_FATAL_ERROR;
+      }
+      retried = true;
+      continue;
     }
+    retried = false;
     totalRead += static_cast<s32>(read);
     remaining -= static_cast<s32>(read);
   }
@@ -726,6 +748,34 @@ bool aurora_dvd_open(const char* disc_path) {
   return true;
 }
 
+bool aurora_dvd_set_root(const char* root_dir, const char* dol_file) {
+  if (s_partition == nullptr) {
+    return false;
+  }
+  const std::string oldRoot = s_rootDir;
+  const std::string oldDol = s_dolFile;
+  {
+    std::lock_guard lock(s_fstLock);
+    s_rootDir = root_dir != nullptr ? root_dir : "";
+    s_dolFile = dol_file != nullptr ? dol_file : "";
+    s_dolFileEntryNum = k_invalidFstEntry;
+    s_dolFileData.clear();
+  }
+  if (!rebuildFST() || (!s_dolFile.empty() && s_dolFileEntryNum == k_invalidFstEntry)) {
+    Log.error("Disc has no root directory {} or DOL {}", s_rootDir, s_dolFile);
+    {
+      std::lock_guard lock(s_fstLock);
+      s_rootDir = oldRoot;
+      s_dolFile = oldDol;
+    }
+    rebuildFST();
+    return false;
+  }
+  s_currentDir = 0;
+  s_currentPath = "/";
+  return true;
+}
+
 void aurora_dvd_close(void) {
   s_worker.stop();
   clearState();
@@ -737,6 +787,34 @@ const u8* DVDGetDOLLocation(s32* out_size) {
   if (s_partition == nullptr) {
     *out_size = 0;
     return nullptr;
+  }
+
+  if (!s_dolFile.empty()) {
+    std::lock_guard lock(s_fstLock);
+    if (s_dolFileData.empty() && s_dolFileEntryNum > 0) {
+      NodHandle* handle = nullptr;
+      if (nod_partition_open_file(s_partition, s_dolFileEntryNum, &handle) == NOD_RESULT_OK && handle != nullptr) {
+        const int64_t size = nod_seek(handle, 0, SEEK_END);
+        if (size > 0 && nod_seek(handle, 0, SEEK_SET) == 0) {
+          s_dolFileData.resize(static_cast<size_t>(size));
+          size_t done = 0;
+          while (done < s_dolFileData.size()) {
+            const int64_t got = nod_read(handle, s_dolFileData.data() + done, s_dolFileData.size() - done);
+            if (got <= 0) {
+              break;
+            }
+            done += static_cast<size_t>(got);
+          }
+          if (done != s_dolFileData.size()) {
+            Log.error("Could not read DOL {}", s_dolFile);
+            s_dolFileData.clear();
+          }
+        }
+        nod_free(handle);
+      }
+    }
+    *out_size = static_cast<s32>(s_dolFileData.size());
+    return s_dolFileData.empty() ? nullptr : s_dolFileData.data();
   }
 
   NodPartitionMeta meta{};

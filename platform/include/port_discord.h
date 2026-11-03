@@ -1,5 +1,6 @@
 #pragma once
 
+#include "port_json_writer.h"
 #include "port_strings.h"
 
 #include <cstdint>
@@ -70,9 +71,6 @@ inline bool TakeFrame(std::string& buffer, Frame& out, bool& bad) {
   buffer.erase(0, 8 + static_cast<size_t>(length));
   return true;
 }
-
-// A JSON string literal, quotes included. Input is UTF-8 and passes through.
-inline std::string JsonString(const std::string& text) { return port::JsonQuote(text); }
 
 // Discord takes 2 to 128 characters in details/state; longer text is cut on a
 // UTF-8 boundary and a single character is padded.
@@ -159,33 +157,38 @@ struct Presence {
 constexpr const char* kLargeImage = "logo";
 
 inline std::string HandshakePayload(const std::string& appId) {
-  return "{\"v\":1,\"client_id\":" + JsonString(appId) + "}";
+  port::JsonWriter json;
+  json.BeginObject().Key("v").Number(1).Key("client_id").String(appId).EndObject();
+  return json.Take();
 }
 
 inline std::string ActivityPayload(long pid, const Presence& presence, const std::string& nonce) {
-  std::string activity = "{\"details\":" + JsonString(FitField(presence.details));
-  if (!presence.state.empty())
-    activity += ",\"state\":" + JsonString(FitField(presence.state));
-  if (presence.start > 0)
-    activity += ",\"timestamps\":{\"start\":" + std::to_string(presence.start) + "}";
   const std::string defaultText = "Metroid Prime native port";
-  activity += ",\"assets\":{\"large_image\":" +
-              JsonString(presence.image.empty() ? std::string(kLargeImage) : presence.image) +
-              ",\"large_text\":" +
-              JsonString(presence.hover.empty() ? defaultText : FitField(presence.hover));
+  port::JsonWriter json;
+  json.BeginObject().Key("cmd").String("SET_ACTIVITY").Key("args").BeginObject().Key("pid").Number(pid);
+  json.Key("activity").BeginObject();
+  json.Key("details").String(FitField(presence.details));
+  if (!presence.state.empty())
+    json.Key("state").String(FitField(presence.state));
+  if (presence.start > 0)
+    json.Key("timestamps").BeginObject().Key("start").Number(presence.start).EndObject();
+  json.Key("assets").BeginObject();
+  json.Key("large_image").String(presence.image.empty() ? std::string(kLargeImage) : presence.image);
+  json.Key("large_text").String(presence.hover.empty() ? defaultText : FitField(presence.hover));
   // A world picture takes the large image, so the logo moves to the corner.
   if (!presence.image.empty())
-    activity += ",\"small_image\":" + JsonString(kLargeImage) +
-                ",\"small_text\":" + JsonString(defaultText);
-  activity += "}}";
-  return "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":" + std::to_string(pid) +
-         ",\"activity\":" + activity + "},\"nonce\":" + JsonString(nonce) + "}";
+    json.Key("small_image").String(kLargeImage).Key("small_text").String(defaultText);
+  json.EndObject().EndObject().EndObject();
+  json.Key("nonce").String(nonce).EndObject();
+  return json.Take();
 }
 
 // Clears the activity (presence turned off while connected).
 inline std::string ClearPayload(long pid, const std::string& nonce) {
-  return "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":" + std::to_string(pid) +
-         "},\"nonce\":" + JsonString(nonce) + "}";
+  port::JsonWriter json;
+  json.BeginObject().Key("cmd").String("SET_ACTIVITY").Key("args").BeginObject().Key("pid").Number(pid);
+  json.EndObject().Key("nonce").String(nonce).EndObject();
+  return json.Take();
 }
 
 // The art asset for a world's picture (MLVL id), or empty for one with none

@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.25)
 project(metroid_prime_port LANGUAGES C CXX)
+if(IOS)
+    # platform/port_ios.mm. Enabled here: enabled where the target is made, it
+    # comes after the subdirectories and leaves CMake without its compile rules.
+    enable_language(OBJCXX)
+endif()
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING "Build type" FORCE)
@@ -82,6 +87,9 @@ endfunction()
 # /vmg uses the general representation everywhere, as Itanium's fixed one does.
 if(MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/vmg>)
+    # cl.exe reports __cplusplus as 199711L without this whatever the standard,
+    # so the SDK's AUTO fell back to __typeof__, which it lacks (issue #170).
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
 endif()
 
 if(MP_ANDROID_NOD_STUB)
@@ -97,7 +105,11 @@ endif()
 # threads) experimental; the flag unlocks them and links libc++experimental.
 if(APPLE)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX,OBJCXX>:-fexperimental-library>)
-    add_link_options(-fexperimental-library)
+    # The iOS Simulator SDK ships no libc++experimental; jthread and stop_token
+    # are header-only, so its build compiles with the flag and links without it.
+    if(NOT CMAKE_OSX_SYSROOT MATCHES "[Ss]imulator")
+        add_link_options(-fexperimental-library)
+    endif()
 endif()
 
 # Aurora provides the GameCube/Wii compatibility layer (MIT): GX, OS, PAD, DVD,
@@ -105,6 +117,13 @@ endif()
 add_subdirectory(extern/aurora EXCLUDE_FROM_ALL)
 if(TARGET aurora_mtx)
     target_compile_definitions(aurora_mtx PRIVATE MTX_USE_PS=1)
+endif()
+# EXCLUDE_FROM_ALL also keeps Aurora's tests out of the default build, but ctest still runs them,
+# so a stale binary from an older build passed or failed in place of the current code.
+if(AURORA_ENABLE_TESTS)
+    get_property(aurora_test_targets DIRECTORY extern/aurora/tests PROPERTY BUILDSYSTEM_TARGETS)
+    add_custom_target(aurora_tests ALL)
+    add_dependencies(aurora_tests ${aurora_test_targets})
 endif()
 
 # MusyX is the game's audio engine; the vendored fork is portable.
@@ -127,10 +146,26 @@ list(FILTER MP_GAME_SOURCES EXCLUDE REGEX "^src/NESemu/")
 # The game entry is included now that it is adapted to Aurora (its `main` is
 # renamed to `metroid_main` and driven by platform/main.cpp).
 list(APPEND MP_GAME_SOURCES src/MetroidPrime/main.cpp)
+# Port code moved out of decomp files that must still compile exactly as the game
+# sources do (same flags, definitions and forced include as the file it came from).
+list(APPEND MP_GAME_SOURCES
+    platform/port_remastered_movers.cpp
+    platform/port_raster_font.cpp
+    platform/port_morph_ball.cpp
+    platform/port_automapper.cpp
+    platform/port_particle_vfx_read.cpp
+    platform/port_element_gen.cpp
+    platform/port_entity_schema.cpp
+    src/MetroidPrime/CPortNestedLights.cpp)
 # The port has an explicit source manifest, including registration-only and
 # shim-dependent translation units. Link those objects directly on both ELF and
 # COFF rather than relying on archive extraction or suppressing duplicate symbols.
 add_library(mp_game OBJECT ${MP_GAME_SOURCES})
+# The entity schema table holds a few thousand accessor lambdas, each its own COMDAT
+# section on COFF: past the 65k sections an object holds without /bigobj.
+if(MSVC)
+    set_source_files_properties(platform/port_entity_schema.cpp PROPERTIES COMPILE_OPTIONS /bigobj)
+endif()
 mp_signed_char(mp_game)
 target_include_directories(mp_game PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/platform/include
@@ -146,6 +181,12 @@ target_link_libraries(mp_game PUBLIC
 if(MSVC)
     target_compile_options(mp_game PRIVATE /W3
         /FI${CMAKE_CURRENT_SOURCE_DIR}/platform/compat.h)
+    # C++20 makes cl.exe /permissive-, which rejects a string literal bound to
+    # char* (C2440, CZipSupport.cpp); the decomp does that, as -Wno-write-strings
+    # allows elsewhere (issue #170). clang-cl only warns.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(mp_game PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/Zc:strictStrings->)
+    endif()
 else()
     target_compile_options(mp_game PRIVATE
         -Wformat -Werror=return-type -Wno-narrowing -Wno-multichar -Wno-write-strings
@@ -157,6 +198,32 @@ endif()
 set(MP_PORT_SOURCES
     platform/main.cpp
     platform/debug_ui.cpp
+    platform/debug_ui/android_jni.cpp
+    platform/debug_ui/archipelago.cpp
+    platform/debug_ui/audio.cpp
+    platform/debug_ui/cheats.cpp
+    platform/debug_ui/controls.cpp
+    platform/debug_ui/debug.cpp
+    platform/debug_ui/file_dialogs.cpp
+    platform/debug_ui/gallery.cpp
+    platform/debug_ui/game_sections.cpp
+    platform/debug_ui/input.cpp
+    platform/debug_ui/mods.cpp
+    platform/debug_ui/options.cpp
+    platform/debug_ui/overlays.cpp
+    platform/debug_ui/performance.cpp
+    platform/debug_ui/randomizer.cpp
+    platform/debug_ui/remastered.cpp
+    platform/debug_ui/runtime.cpp
+    platform/debug_ui/savestates.cpp
+    platform/debug_ui/search.cpp
+    platform/debug_ui/settings.cpp
+    platform/debug_ui/tabs.cpp
+    platform/debug_ui/touch_overlay.cpp
+    platform/debug_ui/tracker.cpp
+    platform/debug_ui/ui_common.cpp
+    platform/debug_ui/video.cpp
+    platform/debug_ui/window.cpp
     platform/port_input_settings.cpp
     platform/port_gyro_motion.cpp
     platform/disc.cpp
@@ -164,12 +231,16 @@ set(MP_PORT_SOURCES
     platform/sdk_stubs.cpp
     platform/port_embedded.cpp
     platform/port_textures.cpp
+    platform/port_zip.cpp
     platform/port_prompts.cpp
     platform/port_controls.cpp
     platform/input/port_input_devices.cpp
     platform/input/port_input_engine.cpp
     platform/input/port_input_bindings.cpp
     platform/input/port_input_remap_ui.cpp
+    platform/input/port_input_user_presets.cpp
+    platform/input/port_input_user_presets_store.cpp
+    platform/input/port_custom_actions.cpp
     platform/port_randomizer.cpp
     platform/port_ap_metroidprime.cpp
     platform/port_ap_protocol.cpp
@@ -177,6 +248,7 @@ set(MP_PORT_SOURCES
     platform/port_ap_world.cpp
     platform/port_rando_gen.cpp
     platform/port_apclient.cpp
+    platform/port_apclient_worker.cpp
     platform/port_ap_solo.cpp
     platform/port_rando_seed.cpp
     platform/port_json.cpp
@@ -185,21 +257,38 @@ set(MP_PORT_SOURCES
     platform/port_update_check.cpp
     platform/port_livesplit.cpp
     platform/port_tracker.cpp
+    platform/port_beam_doors.cpp
+    platform/port_beam_doors_side.cpp
     platform/port_map_pickups.cpp
+    platform/port_map_marks.cpp
+    platform/port_map_side.cpp
+    platform/port_map_side_paths.cpp
     platform/port_map_pickups_index.cpp
     platform/port_viewmodel.cpp
     platform/port_actor_shadow.cpp
     platform/port_freecam.cpp
+    platform/port_third_person.cpp
+    platform/port_third_person_body.cpp
+    platform/port_world_holders.cpp
     platform/port_photo.cpp
+    platform/port_radial.cpp
     platform/port_console.cpp
     platform/port_log_file.cpp
     platform/port_crash.cpp
     platform/port_memory_log.cpp
     platform/port_watchdog.cpp
+    platform/port_motion_watch.cpp
     platform/port_savestate.cpp
     platform/port_savestate_format.cpp
     platform/port_dynamic_res.cpp
     platform/port_savestate_room.cpp
+    platform/port_savestate_boss.cpp
+    platform/port_savestate_fields.cpp
+    platform/port_statedump.cpp
+    platform/port_boss_flaahgra.cpp
+    platform/port_boss_prime.cpp
+    platform/port_boss_ridley.cpp
+    platform/port_boss_thardus.cpp
     platform/port_skip_cutscenes.cpp
     platform/port_revision_scripts.cpp
     platform/port_skip_streams.cpp
@@ -211,6 +300,8 @@ set(MP_PORT_SOURCES
     platform/port_mods_pak.cpp
     platform/port_pal_languages.cpp
     platform/port_pal_languages_import.cpp
+    platform/port_flaahgra_music.cpp
+    platform/port_flaahgra_music_import.cpp
     platform/port_actor_collision_bounds.cpp
     platform/port_importers.cpp
     platform/port_importers_lines.cpp
@@ -218,6 +309,9 @@ set(MP_PORT_SOURCES
     platform/port_remastered_nso.cpp
     platform/port_remastered_pak.cpp
     platform/port_remastered_txtr.cpp
+    platform/port_remastered_tegra_swizzle.cpp
+    platform/port_remastered_bcdec.cpp
+    platform/port_remastered_astc_decode.cpp
     platform/port_hd_font.cpp
     platform/port_hd_font_file.cpp
     platform/port_font_accent_file.cpp
@@ -229,11 +323,27 @@ set(MP_PORT_SOURCES
     platform/port_remastered_map.cpp
     platform/port_remastered_movie.cpp
     platform/port_room_env.cpp
+    platform/port_clustered_lights.cpp
+    platform/port_room_env_script.cpp
+    platform/port_room_env_load.cpp
     platform/port_room_env_file.cpp
     platform/port_room_env_tiles.cpp
+    platform/port_envfx_assets.cpp
+    platform/port_envfx_file.cpp
+    platform/port_shell.cpp
+    platform/port_shell_assets.cpp
+    platform/port_shell_file.cpp
+    platform/port_icy_assets.cpp
+    platform/port_icy_file.cpp
     platform/port_room_geo.cpp
     platform/port_room_geo_file.cpp
     platform/port_room_liquid.cpp
+    platform/port_room_effects.cpp
+    platform/port_queen_barrier.cpp
+    platform/port_queen_barrier_validate.cpp
+    platform/port_room_effects_file.cpp
+    platform/port_retail_placement.cpp
+    platform/port_retail_placement_file.cpp
     platform/port_collision_view.cpp
     platform/port_pointer.cpp
     platform/port_pointer_menu.cpp
@@ -242,6 +352,10 @@ set(MP_PORT_SOURCES
     platform/port_remastered_image.cpp
     platform/port_remastered_table.cpp
     platform/port_remastered_convert.cpp
+    platform/port_remastered_convert_retail.cpp
+    platform/port_remastered_convert_material.cpp
+    platform/port_remastered_convert_pbr.cpp
+    platform/port_remastered_convert_skin.cpp
     platform/port_remastered_ball_light.cpp
     platform/port_remastered_effect.cpp
     platform/port_vfx_particles.cpp
@@ -250,14 +364,37 @@ set(MP_PORT_SOURCES
     platform/port_remastered_effect_import.cpp
     platform/port_remastered_report.cpp
     platform/port_remastered_import.cpp
+    platform/port_storage_report.cpp
+    platform/port_remastered_import_retail.cpp
+    platform/port_remastered_import_remastered.cpp
+    platform/port_dread_samus_import.cpp
+    platform/port_dread_samus.cpp
+    platform/port_dread_pkg.cpp
+    platform/port_dread_bcmdl.cpp
+    platform/port_dread_bsmat.cpp
+    platform/port_dread_bctex.cpp
+    platform/port_dread_reskin.cpp
+    platform/port_dread_material.cpp
     platform/port_remastered_jpeg.cpp
     platform/port_gallery.cpp
     platform/port_remastered_room.cpp
+    platform/port_remastered_room_file.cpp
+    platform/port_remastered_room_retail.cpp
+    platform/port_remastered_room_scripts.cpp
+    platform/port_remastered_room_effects.cpp
     platform/port_remastered_anim.cpp
     platform/port_remastered_text.cpp
     platform/port_custom_res.cpp
+    platform/port_ball_looks.cpp
+    platform/port_ball_looks_disc.cpp
+    platform/port_disc_reader.cpp
+    platform/port_suit_colours.cpp
+    platform/port_suit_colours_disc.cpp
     platform/port_hints.cpp
     platform/port_ws.cpp
+    platform/port_disc_verify.cpp
+    platform/port_disc_replace.cpp
+    platform/port_disc_verify_core.cpp
     platform/touch_pad.cpp
     platform/glibc_compat.c
     platform/ai_dma.cpp)
@@ -275,11 +412,15 @@ endif()
 # FourCC constants. -Wno-unused-parameter and -Wno-ignored-qualifiers: every hit
 # is inside decompiled headers (include/) that platform sources include and that
 # must not be edited (named-but-unused params and const-qualified return types
-# are the decomp style); platform sources themselves have none. MSVC gets nothing
-# here (its own flags live elsewhere).
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+# are the decomp style); platform sources themselves have none. clang-cl reads
+# -Wall as -Weverything (540k warnings per Windows CI run), so it gets /W4, its
+# spelling of -Wall -Wextra. cl.exe gets nothing here (its own flags live elsewhere).
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
     set_source_files_properties(${MP_PORT_SOURCES} platform/smoke.cpp PROPERTIES
         COMPILE_OPTIONS "-Wall;-Wextra;-Wno-multichar;-Wno-unused-parameter;-Wno-ignored-qualifiers")
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    set_source_files_properties(${MP_PORT_SOURCES} platform/smoke.cpp PROPERTIES
+        COMPILE_OPTIONS "/W4;-Wno-multichar;-Wno-unused-parameter;-Wno-ignored-qualifiers")
 endif()
 if(ANDROID)
     add_library(metroid_prime_port SHARED ${MP_PORT_SOURCES})
@@ -294,8 +435,39 @@ if(ANDROID)
         set_target_properties(mport_vkshim PROPERTIES C_VISIBILITY_PRESET hidden)
         target_link_libraries(metroid_prime_port PRIVATE adrenotools z)
     endif()
+elseif(IOS)
+    # An iOS app is a flat bundle: the executable, Info.plist and the icons side
+    # by side. Nothing signs it here; tools/ios_package.sh finishes the bundle
+    # (icons, an ad hoc signature) and players re-sign the .ipa with their own
+    # Apple ID when they sideload it.
+    add_executable(metroid_prime_port MACOSX_BUNDLE ${MP_PORT_SOURCES} platform/port_ios.mm)
+    set_source_files_properties(platform/port_ios.mm PROPERTIES COMPILE_OPTIONS -fobjc-arc)
+    target_link_libraries(metroid_prime_port PRIVATE "-framework UIKit" "-framework UniformTypeIdentifiers")
+    file(STRINGS android/app/build.gradle _mp_version_line REGEX "versionName \"[^\"]+\"")
+    string(REGEX REPLACE ".*versionName \"([^\"]+)\".*" "\\1" MP_IOS_VERSION "${_mp_version_line}")
+    set_target_properties(metroid_prime_port PROPERTIES
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/packaging/ios/Info.plist.in"
+        MACOSX_BUNDLE_GUI_IDENTIFIER io.github.odrannnn.metroidprimeport
+        MACOSX_BUNDLE_BUNDLE_NAME "Metroid Prime"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${MP_IOS_VERSION}"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${MP_IOS_VERSION}")
 else()
     add_executable(metroid_prime_port ${MP_PORT_SOURCES})
+endif()
+# Touch settings and the virtual pad on phones and tablets. Android draws the
+# controls in Java (TouchControlsView); iOS draws them in C++ (touch_overlay.cpp).
+# The desktop switch builds the C++ overlay on a host build so its drawing and
+# event handling can be tried without a device; the console's `finger` command
+# sends the touches.
+option(MP_TOUCH_OVERLAY_DESKTOP "Draw the touch controls on a desktop build (testing)" OFF)
+if(ANDROID OR IOS)
+    target_compile_definitions(metroid_prime_port PRIVATE PORT_TOUCH_CONTROLS)
+endif()
+if(IOS)
+    target_compile_definitions(metroid_prime_port PRIVATE PORT_TOUCH_OVERLAY)
+endif()
+if(MP_TOUCH_OVERLAY_DESKTOP AND NOT ANDROID)
+    target_compile_definitions(metroid_prime_port PRIVATE PORT_TOUCH_CONTROLS PORT_TOUCH_OVERLAY)
 endif()
 # disc.cpp and port_pal_languages.cpp inflate compressed images and fonts. Aurora
 # provides ZLIB::ZLIB everywhere (its zlib-ng on Windows).
@@ -321,9 +493,14 @@ if(NOT ANDROID)
         tests/port_remastered_effect_tool.cpp platform/port_remastered_effect.cpp
         platform/port_remastered_effect_convert.cpp platform/port_remastered_effect_import.cpp
         platform/port_remastered_image.cpp platform/port_remastered_txtr.cpp platform/port_remastered_pak.cpp
+        platform/port_remastered_tegra_swizzle.cpp platform/port_remastered_bcdec.cpp
+        platform/port_remastered_astc_decode.cpp
         platform/port_remastered_convert.cpp platform/port_remastered_cmdl.cpp platform/port_remastered_anuv.cpp
+        platform/port_remastered_convert_retail.cpp platform/port_remastered_convert_material.cpp
+        platform/port_remastered_convert_pbr.cpp platform/port_remastered_convert_skin.cpp
         platform/port_remastered_report.cpp)
-    target_include_directories(remastered_effect_tool PRIVATE platform/include)
+    target_include_directories(remastered_effect_tool PRIVATE platform/include include extern/aurora/include)
+    target_compile_definitions(remastered_effect_tool PRIVATE TARGET_PC VERSION=0)
     target_link_libraries(remastered_effect_tool PRIVATE astcenc ${CMAKE_THREAD_LIBS_INIT})
     set_target_properties(remastered_effect_tool PROPERTIES EXCLUDE_FROM_ALL ON)
 endif()
@@ -405,6 +582,11 @@ if(MP_EMBED_RESOURCES)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     file(GLOB_RECURSE MP_EMBED_INPUTS CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/textures/*")
+    # A deleted texture leaves every remaining input older than the output, so the
+    # file list itself is an input; file(CONFIGURE) rewrites it only when it changes.
+    string(JOIN "\n" MP_EMBED_LIST ${MP_EMBED_INPUTS})
+    set(MP_EMBED_LIST_FILE "${CMAKE_CURRENT_BINARY_DIR}/generated/port_embedded_inputs.txt")
+    file(CONFIGURE OUTPUT "${MP_EMBED_LIST_FILE}" CONTENT "${MP_EMBED_LIST}\n" @ONLY)
     set(MP_EMBED_SEED "${CMAKE_CURRENT_SOURCE_DIR}/assets/initial_pipeline_cache.db")
     set(MP_EMBED_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/port_embedded_data.cpp")
     add_custom_command(
@@ -414,19 +596,22 @@ if(MP_EMBED_RESOURCES)
             "${MP_EMBED_SOURCE}"
             --dir "${CMAKE_CURRENT_SOURCE_DIR}/textures" textures
             --file "${MP_EMBED_SEED}" initial_pipeline_cache.db
-        DEPENDS ${MP_EMBED_INPUTS} "${MP_EMBED_SEED}"
+        DEPENDS ${MP_EMBED_INPUTS} "${MP_EMBED_LIST_FILE}" "${MP_EMBED_SEED}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_resources.py"
         COMMENT "Embedding textures and the pipeline cache seed"
         VERBATIM)
     target_sources(metroid_prime_port PRIVATE "${MP_EMBED_SOURCE}")
     target_compile_definitions(metroid_prime_port PRIVATE MP_EMBED_RESOURCES)
 else()
-    # Keep the HD texture replacements next to the executable, which is where the
-    # port looks for them by default, so a built binary picks them up without a
-    # manual copy. Regenerate them with tools/make_prompt_glyphs.py. The generated
-    # sets are cleared first: copy_directory only adds, and an icon the generator
-    # no longer writes would otherwise keep replacing a texture it no longer claims
-    # (two retired legend hashes kept drawing L/R over the map's [M] and [S] icons).
+    # Keep the prompt icons next to the executable, which is where the port looks
+    # for them by default, so a built binary picks them up without a manual copy.
+    # Regenerate them with tools/make_prompt_glyphs.py. The folders are cleared
+    # first: copy_directory only adds, and a file an older build or generator left
+    # would otherwise keep replacing a texture it no longer claims (two retired
+    # legend hashes kept drawing L/R over the map's [M] and [S] icons). The old
+    # per-device sets (keyboard, playstation, switch, xbox) are in the list for the
+    # same reason: a stale copy beside the executable would still register by
+    # filename and replace the prompts the port now serves itself.
     set(PORT_TEXTURE_SETS bindings keyboard playstation switch xbox)
     list(TRANSFORM PORT_TEXTURE_SETS PREPEND "$<TARGET_FILE_DIR:metroid_prime_port>/textures/")
     add_custom_command(TARGET metroid_prime_port POST_BUILD
@@ -485,7 +670,9 @@ endif()
 # <SDL_GetBasePath()> + "textures", and Aurora's pipeline cache is opened by name
 # beside the binary. They are installed to bin/ for that reason, not by accident.
 include(GNUInstallDirs)
-install(TARGETS metroid_prime_port RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS metroid_prime_port
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    BUNDLE DESTINATION .)
 if(NOT MP_EMBED_RESOURCES)
     install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/textures/
         DESTINATION ${CMAKE_INSTALL_BINDIR}/textures)
@@ -529,431 +716,876 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(port_remastered_ground_contacts PRIVATE -fno-fast-math -ffp-contract=off)
 endif()
 
+# NCollidablePairs::Sphere_Sphere_Swept 0xc012d0: the sphere-vs-sphere swept query
+# over the shared contact/failsafe helpers. Geometry only; the pair table, materials
+# and the mover's policy stay outside. Same exact-IEEE contract as the library above,
+# which it links for Source::NormalizeWithMagnitude and RaySphere.
+add_library(port_remastered_sphere_sweep STATIC
+    platform/port_remastered_sphere_sweep.cpp)
+target_link_libraries(port_remastered_sphere_sweep PUBLIC port_remastered_ground_contacts)
+target_include_directories(port_remastered_sphere_sweep PUBLIC platform/include)
+set_target_properties(port_remastered_sphere_sweep PROPERTIES CXX_STANDARD 17)
+if(MSVC)
+    target_compile_options(port_remastered_sphere_sweep PRIVATE /fp:strict)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(port_remastered_sphere_sweep PRIVATE -fno-fast-math -ffp-contract=off)
+endif()
+
+# NCollisionRayCast::Capsule 0xbf6f10 with CMath::SolveQuadratic 0x699b0 and
+# NCollisionRayCast::InfiniteCylinder 0xbf73c0: the source ray-vs-capsule query the
+# Remastered ball mover sweeps. Geometry only - no caller, materials or contacts; it links
+# the contact library for the shared 0x6b030/0x6b0b0/0x65f70 helpers. Same exact-IEEE
+# contract as the libraries above.
+add_library(port_remastered_capsule_ray STATIC
+    platform/port_remastered_capsule_ray.cpp)
+target_link_libraries(port_remastered_capsule_ray PUBLIC port_remastered_ground_contacts)
+target_include_directories(port_remastered_capsule_ray PUBLIC platform/include)
+set_target_properties(port_remastered_capsule_ray PROPERTIES CXX_STANDARD 17)
+if(MSVC)
+    target_compile_options(port_remastered_capsule_ray PRIVATE /fp:strict)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(port_remastered_capsule_ray PRIVATE -fno-fast-math -ffp-contract=off)
+endif()
+
 if(MP_BUILD_TESTS)
     enable_testing()
+    include(cmake/PortTests.cmake)
     add_test(NAME port_version COMMAND metroid_prime_port --version)
     set_tests_properties(port_version PROPERTIES TIMEOUT 15 LABELS port
         PASS_REGULAR_EXPRESSION "Metroid Prime native port")
-    add_executable(port_buffer_tests
-        tests/port_buffers.cpp
-        tests/port_forward_owner.cpp
-        src/Kyoto/Streams/CInputStream.cpp
-        src/Kyoto/Streams/CMemoryInStream.cpp
-        src/Kyoto/Streams/COutputStream.cpp
-        src/Kyoto/Streams/CMemoryStreamOut.cpp)
-    target_include_directories(port_buffer_tests PRIVATE include extern/aurora/include)
-    target_compile_definitions(port_buffer_tests PRIVATE TARGET_PC VERSION=0)
-    add_executable(port_ai_tests tests/port_ai.cpp platform/ai_dma.cpp)
-    target_include_directories(port_ai_tests PRIVATE platform/include extern/aurora/include)
-    target_compile_definitions(port_ai_tests PRIVATE TARGET_PC)
-    target_link_libraries(port_ai_tests PRIVATE ${AURORA_SDL3_TARGET})
-    add_executable(port_map_pickups_tests tests/port_map_pickups.cpp platform/port_map_pickups_index.cpp)
-    target_include_directories(port_map_pickups_tests PRIVATE platform/include extern/aurora/include)
-    target_compile_definitions(port_map_pickups_tests PRIVATE TARGET_PC)
-    add_executable(port_randomizer_tests
-        tests/port_randomizer.cpp
-        platform/port_randomizer.cpp
-        platform/port_json.cpp)
-    target_include_directories(port_randomizer_tests PRIVATE
-        platform/include extern/aurora/include include)
-    target_compile_definitions(port_randomizer_tests PRIVATE TARGET_PC VERSION=0)
-    target_link_libraries(port_randomizer_tests PRIVATE ${AURORA_SDL3_TARGET})
-    add_executable(port_apclient_tests
-        tests/port_apclient.cpp
-        platform/port_ap_metroidprime.cpp
-        platform/port_ap_protocol.cpp
-        platform/port_ap_logic.cpp
-        platform/port_ap_world.cpp
-        platform/port_json.cpp
-        platform/port_randomizer.cpp)
-    target_include_directories(port_apclient_tests PRIVATE
-        platform/include extern/aurora/include include)
-    target_compile_definitions(port_apclient_tests PRIVATE TARGET_PC VERSION=0)
-    target_link_libraries(port_apclient_tests PRIVATE ${AURORA_SDL3_TARGET})
-    add_executable(port_ap_solo_tests
-        tests/port_ap_solo.cpp
-        platform/port_ap_solo.cpp
-        platform/port_rando_seed.cpp
-        platform/port_ap_metroidprime.cpp
-        platform/port_ap_protocol.cpp
-        platform/port_ap_logic.cpp
-        platform/port_ap_world.cpp
-        platform/port_json.cpp
-        platform/port_randomizer.cpp)
-    target_include_directories(port_ap_solo_tests PRIVATE
-        platform/include extern/aurora/include include)
-    target_compile_definitions(port_ap_solo_tests PRIVATE TARGET_PC VERSION=0)
-    target_link_libraries(port_ap_solo_tests PRIVATE ${AURORA_SDL3_TARGET})
-    add_executable(port_ap_logic_tests
-        tests/port_ap_logic.cpp
-        platform/port_ap_logic.cpp
-        platform/port_ap_metroidprime.cpp)
-    target_include_directories(port_ap_logic_tests PRIVATE
-        platform/include extern/aurora/include include)
-    target_compile_definitions(port_ap_logic_tests PRIVATE TARGET_PC VERSION=0)
-    add_executable(port_rando_gen_tests
-        tests/port_rando_gen.cpp
-        platform/port_rando_gen.cpp
-        platform/port_ap_metroidprime.cpp
-        platform/port_ap_logic.cpp
-        platform/port_ap_world.cpp
-        platform/port_json.cpp)
-    target_include_directories(port_rando_gen_tests PRIVATE
-        platform/include extern/aurora/include include)
-    target_compile_definitions(port_rando_gen_tests PRIVATE TARGET_PC VERSION=0)
-    add_executable(port_musyx_tests tests/port_musyx.c)
-    target_link_libraries(port_musyx_tests PRIVATE musyx)
+    # The Remastered model converter and the readers it sits on, which several tests
+    # build against. An object library, so each test links every object as it did when
+    # it listed these sources itself.
+    add_library(mp_test_remastered_convert OBJECT
+        platform/port_remastered_convert.cpp
+        platform/port_remastered_convert_retail.cpp
+        platform/port_remastered_convert_material.cpp
+        platform/port_remastered_convert_pbr.cpp
+        platform/port_remastered_convert_skin.cpp
+        platform/port_remastered_anuv.cpp
+        platform/port_remastered_image.cpp
+        platform/port_remastered_pak.cpp)
+    target_include_directories(mp_test_remastered_convert PUBLIC platform/include extern/aurora/include)
+    target_link_libraries(mp_test_remastered_convert PUBLIC astcenc)
+    mp_port_test(port_buffer_tests
+        SOURCES tests/port_buffers.cpp tests/port_forward_owner.cpp
+            src/Kyoto/Streams/CInputStream.cpp src/Kyoto/Streams/CMemoryInStream.cpp
+            src/Kyoto/Streams/COutputStream.cpp src/Kyoto/Streams/CMemoryStreamOut.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0)
+    mp_port_test(port_ai_tests
+        SOURCES tests/port_ai.cpp platform/ai_dma.cpp
+        INCLUDES platform/include extern/aurora/include
+        DEFINITIONS TARGET_PC
+        LIBRARIES ${AURORA_SDL3_TARGET})
+    mp_port_test(port_map_pickups_tests
+        SOURCES tests/port_map_pickups.cpp platform/port_map_pickups_index.cpp
+        INCLUDES platform/include extern/aurora/include
+        DEFINITIONS TARGET_PC)
+    mp_port_test(port_map_marks_tests SOURCES tests/port_map_marks.cpp INCLUDES platform/include)
+    mp_port_test(port_map_side_tests
+        SOURCES tests/port_map_side.cpp platform/port_map_side.cpp
+        INCLUDES platform/include extern/aurora/include
+        DEFINITIONS TARGET_PC)
+    mp_port_test(port_randomizer_tests
+        SOURCES tests/port_randomizer.cpp platform/port_randomizer.cpp platform/port_json.cpp
+        INCLUDES platform/include extern/aurora/include include
+        DEFINITIONS TARGET_PC VERSION=0
+        LIBRARIES ${AURORA_SDL3_TARGET})
+    mp_port_test(port_apclient_tests
+        SOURCES tests/port_apclient.cpp
+            platform/port_ap_metroidprime.cpp platform/port_ap_protocol.cpp
+            platform/port_ap_logic.cpp platform/port_ap_world.cpp platform/port_json.cpp
+            platform/port_randomizer.cpp
+        INCLUDES platform/include extern/aurora/include include
+        DEFINITIONS TARGET_PC VERSION=0
+        LIBRARIES ${AURORA_SDL3_TARGET})
+    mp_port_test(port_beam_doors_tests
+        SOURCES tests/port_beam_doors.cpp platform/port_beam_doors_side.cpp platform/port_map_side.cpp
+            platform/port_ap_world.cpp platform/port_json.cpp platform/port_randomizer.cpp
+            platform/port_ap_logic.cpp platform/port_ap_metroidprime.cpp
+        INCLUDES platform/include extern/aurora/include include
+        DEFINITIONS TARGET_PC VERSION=0
+        LIBRARIES ${AURORA_SDL3_TARGET})
+    mp_port_test(port_ap_solo_tests
+        SOURCES tests/port_ap_solo.cpp
+            platform/port_ap_solo.cpp platform/port_rando_seed.cpp
+            platform/port_ap_metroidprime.cpp platform/port_ap_protocol.cpp
+            platform/port_ap_logic.cpp platform/port_ap_world.cpp platform/port_json.cpp
+            platform/port_randomizer.cpp
+        INCLUDES platform/include extern/aurora/include include
+        DEFINITIONS TARGET_PC VERSION=0
+        LIBRARIES ${AURORA_SDL3_TARGET})
+    mp_port_test(port_ap_logic_tests
+        SOURCES tests/port_ap_logic.cpp platform/port_ap_logic.cpp platform/port_ap_metroidprime.cpp
+        INCLUDES platform/include extern/aurora/include include
+        DEFINITIONS TARGET_PC VERSION=0)
+    # 200+ seeds, each a few hundred logic sweeps.
+    mp_port_test(port_rando_gen_tests
+        SOURCES tests/port_rando_gen.cpp
+            platform/port_rando_gen.cpp platform/port_ap_metroidprime.cpp
+            platform/port_ap_logic.cpp platform/port_ap_world.cpp platform/port_json.cpp
+        INCLUDES platform/include extern/aurora/include include
+        DEFINITIONS TARGET_PC VERSION=0
+        TIMEOUT 120)
+    mp_port_test(port_musyx_tests SOURCES tests/port_musyx.c LIBRARIES musyx)
     # A break must retire a looping voice in the PC mixer, as it does on the DSP.
-    add_executable(port_musyx_charge_loop_tests tests/port_musyx_charge_loop.c)
-    target_link_libraries(port_musyx_charge_loop_tests PRIVATE musyx)
-    add_executable(port_skip_streams_tests tests/port_skip_streams.cpp
-        platform/port_skip_streams.cpp platform/port_skip_cutscenes_ops.cpp)
-    target_include_directories(port_skip_streams_tests PRIVATE platform/include platform)
-    add_executable(port_revision_scripts_tests tests/port_revision_scripts.cpp
-        platform/port_revision_scripts.cpp platform/port_skip_cutscenes_ops.cpp)
-    target_include_directories(port_revision_scripts_tests PRIVATE platform/include platform)
-    add_executable(port_disc_tests tests/port_disc.cpp platform/disc.cpp)
-    target_include_directories(port_disc_tests PRIVATE platform/include extern/aurora/include)
-    target_compile_definitions(port_disc_tests PRIVATE TARGET_PC)
-    target_link_libraries(port_disc_tests PRIVATE ZLIB::ZLIB)
-    add_executable(port_mouse_tests tests/port_mouse.cpp)
-    target_include_directories(port_mouse_tests PRIVATE platform/include)
+    mp_port_test(port_musyx_charge_loop_tests SOURCES tests/port_musyx_charge_loop.c LIBRARIES musyx)
+    mp_port_test(port_skip_streams_tests
+        SOURCES tests/port_skip_streams.cpp
+            platform/port_skip_streams.cpp platform/port_skip_cutscenes_ops.cpp
+        INCLUDES platform/include platform)
+    mp_port_test(port_revision_scripts_tests
+        SOURCES tests/port_revision_scripts.cpp
+            platform/port_revision_scripts.cpp platform/port_skip_cutscenes_ops.cpp
+        INCLUDES platform/include platform)
+    mp_port_test(port_disc_tests
+        SOURCES tests/port_disc.cpp platform/disc.cpp
+        INCLUDES platform/include extern/aurora/include
+        DEFINITIONS TARGET_PC
+        LIBRARIES ZLIB::ZLIB)
+    mp_port_test(port_disc_verify_tests
+        SOURCES tests/port_disc_verify.cpp platform/port_disc_verify_core.cpp
+        INCLUDES platform/include platform
+        LIBRARIES ZLIB::ZLIB)
+    mp_port_test(port_zip_tests
+        SOURCES tests/port_zip.cpp platform/port_zip.cpp
+        INCLUDES platform/include
+        LIBRARIES ZLIB::ZLIB)
+    mp_port_test(port_mouse_tests SOURCES tests/port_mouse.cpp INCLUDES platform/include)
+    # Header-only (port_flick_stick.h): Flick Stick's flicks, rotation and smoothing.
+    mp_port_test(port_flick_stick_tests SOURCES tests/port_flick_stick.cpp INCLUDES platform/include)
+    # Header-only (port_input_gate.h): pad 0's neutral-while-F1-is-open gate.
+    mp_port_test(port_input_gate_tests SOURCES tests/port_input_gate.cpp INCLUDES platform/include)
     # Drives a real SDL virtual gamepad through the touch overlay's own code.
     # That code was Android-only and untested, so a wrong button mapping could
     # not fail anywhere except on a phone.
-    add_executable(port_touch_pad_tests tests/touch_pad.cpp platform/touch_pad.cpp)
-    target_include_directories(port_touch_pad_tests PRIVATE
-        platform/include extern/aurora/include)
-    target_compile_definitions(port_touch_pad_tests PRIVATE TARGET_PC)
-    target_link_libraries(port_touch_pad_tests PRIVATE ${AURORA_SDL3_TARGET})
-    add_executable(port_json_tests tests/port_json.cpp platform/port_json.cpp)
-    target_include_directories(port_json_tests PRIVATE platform/include)
-    target_compile_definitions(port_json_tests PRIVATE TARGET_PC)
+    mp_port_test(port_touch_pad_tests
+        SOURCES tests/touch_pad.cpp platform/touch_pad.cpp
+        INCLUDES platform/include extern/aurora/include
+        DEFINITIONS TARGET_PC
+        LIBRARIES ${AURORA_SDL3_TARGET})
+    mp_port_test(port_json_tests
+        SOURCES tests/port_json.cpp platform/port_json.cpp
+        INCLUDES platform/include
+        DEFINITIONS TARGET_PC)
     # The `status --json` physics components: a non-finite value must be JSON null,
     # checked by parsing the production helper's output with the strict reader above.
-    add_executable(port_console_physics_tests tests/port_console_physics.cpp
-        platform/port_json.cpp)
-    target_include_directories(port_console_physics_tests PRIVATE platform/include)
-    target_compile_definitions(port_console_physics_tests PRIVATE TARGET_PC)
-    add_executable(port_ws_tests tests/port_ws.cpp platform/port_ws.cpp)
-    target_include_directories(port_ws_tests PRIVATE platform/include)
-    target_compile_definitions(port_ws_tests PRIVATE TARGET_PC)
+    # The generated entity field schema (tools/gen_entity_schema.py): it compiles the
+    # accessors against every entity header as mp_game does, forced include and all.
+    mp_port_test(port_entity_schema_tests
+        SOURCES tests/port_entity_schema.cpp platform/port_entity_schema.cpp
+        INCLUDES platform/include include extern/aurora/include extern/musyx/include
+        DEFINITIONS TARGET_PC AURORA AURORA_ENABLE_GX MUSY_TARGET=MUSY_TARGET_PC)
+    mp_signed_char(port_entity_schema_tests)
+    if(MSVC)
+        target_compile_options(port_entity_schema_tests PRIVATE /FI${CMAKE_CURRENT_SOURCE_DIR}/platform/compat.h)
+    else()
+        target_compile_options(port_entity_schema_tests PRIVATE -Wno-narrowing -Wno-multichar
+            -Wno-write-strings -include ${CMAKE_CURRENT_SOURCE_DIR}/platform/compat.h)
+    endif()
+    mp_port_test(port_console_physics_tests
+        SOURCES tests/port_console_physics.cpp platform/port_json.cpp
+        INCLUDES platform/include
+        DEFINITIONS TARGET_PC)
+    # The TLS end-to-end test runs tools/ap_fake_server.py from the source tree. It
+    # starts an openssl-generated CA and a python TLS server, which is not instant on a
+    # loaded runner; 15 seconds is enough to time it out and report nothing about which
+    # part was slow.
+    mp_port_test(port_ws_tests
+        SOURCES tests/port_ws.cpp platform/port_ws.cpp
+        INCLUDES platform/include
+        DEFINITIONS TARGET_PC "MP_SOURCE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\""
+        TIMEOUT 120)
     if(WIN32)
         target_link_libraries(port_ws_tests PRIVATE ws2_32)
     endif()
     mp_websocket_tls(port_ws_tests)
-    # The TLS end-to-end test runs tools/ap_fake_server.py from the source tree.
-    target_compile_definitions(port_ws_tests PRIVATE
-        "MP_SOURCE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
-    add_executable(port_pal_languages_tests tests/port_pal_languages.cpp platform/port_pal_languages.cpp
-        platform/port_mods_pak.cpp)
-    target_include_directories(port_pal_languages_tests PRIVATE platform/include)
-    target_link_libraries(port_pal_languages_tests PRIVATE ZLIB::ZLIB)
-    add_executable(port_mods_tests tests/port_mods.cpp platform/port_mods_pak.cpp)
-    target_include_directories(port_mods_tests PRIVATE platform/include)
+    mp_port_test(port_pal_languages_tests
+        SOURCES tests/port_pal_languages.cpp platform/port_pal_languages.cpp
+            platform/port_mods_pak.cpp
+        INCLUDES platform/include
+        LIBRARIES ZLIB::ZLIB)
+    mp_port_test(port_flaahgra_music_tests
+        SOURCES tests/port_flaahgra_music.cpp platform/port_flaahgra_music.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_mods_tests
+        SOURCES tests/port_mods.cpp platform/port_mods_pak.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_mods_restart_tests
+        SOURCES tests/port_mods_restart.cpp platform/port_mods.cpp platform/port_mods_pak.cpp
+            platform/port_room_geo_file.cpp
+        INCLUDES platform/include include extern/aurora/include
+        DEFINITIONS TARGET_PC AURORA AURORA_ENABLE_GX
+        LIBRARIES ${AURORA_SDL3_TARGET})
     # The collision-box reader indexes PAK tables and inflates them; a test
     # drives it over synthetic PAKs instead of a disc, so the DVD calls the
     # production source is built from are stubbed out.
-    add_executable(port_actor_collision_bounds_tests tests/port_actor_collision_bounds.cpp
-        platform/port_actor_collision_bounds.cpp platform/port_mods_pak.cpp platform/port_ws.cpp)
-    target_include_directories(port_actor_collision_bounds_tests PRIVATE platform/include)
-    target_compile_definitions(port_actor_collision_bounds_tests PRIVATE PORT_ACTOR_COLLISION_BOUNDS_NO_DVD)
+    mp_port_test(port_actor_collision_bounds_tests
+        SOURCES tests/port_actor_collision_bounds.cpp
+            platform/port_actor_collision_bounds.cpp platform/port_mods_pak.cpp platform/port_ws.cpp
+        INCLUDES platform/include
+        DEFINITIONS PORT_ACTOR_COLLISION_BOUNDS_NO_DVD)
     if(WIN32)
         target_link_libraries(port_actor_collision_bounds_tests PRIVATE ws2_32)
     endif()
-    add_executable(port_room_env_tests tests/port_room_env.cpp platform/port_room_env_file.cpp platform/port_room_env_tiles.cpp)
-    target_include_directories(port_room_env_tests PRIVATE platform/include)
-    add_executable(port_room_env_tiles_tests tests/port_room_env_tiles.cpp platform/port_room_env_tiles.cpp)
-    target_include_directories(port_room_env_tiles_tests PRIVATE platform/include)
-    add_executable(port_room_geo_tests tests/port_room_geo.cpp platform/port_room_geo_file.cpp)
-    target_include_directories(port_room_geo_tests PRIVATE platform/include)
-    add_executable(port_hd_font_tests tests/port_hd_font.cpp platform/port_hd_font_file.cpp platform/port_remastered_font.cpp platform/port_font_accent_file.cpp)
-    target_include_directories(port_hd_font_tests PRIVATE platform/include)
-    add_executable(port_remastered_nso_tests tests/port_remastered_nso.cpp platform/port_remastered_nso.cpp)
-    target_include_directories(port_remastered_nso_tests PRIVATE platform/include)
-    add_executable(port_remastered_text_tests tests/port_remastered_text.cpp platform/port_remastered_text.cpp)
-    target_include_directories(port_remastered_text_tests PRIVATE platform/include)
-    add_executable(port_remastered_effect_tests tests/port_remastered_effect.cpp platform/port_remastered_effect.cpp)
-    target_include_directories(port_remastered_effect_tests PRIVATE platform/include)
-    add_executable(port_remastered_effect_convert_tests
-        tests/port_remastered_effect_convert.cpp platform/port_remastered_effect_convert.cpp platform/port_remastered_effect.cpp
-        src/Kyoto/Particles/CVectorElement.cpp src/Kyoto/Math/CQuaternion.cpp src/Kyoto/Math/CVector3f.cpp
-        src/Kyoto/Math/CMatrix3f.cpp)
-    target_include_directories(port_remastered_effect_convert_tests PRIVATE platform/include include extern/aurora/include)
-    target_compile_definitions(port_remastered_effect_convert_tests PRIVATE TARGET_PC VERSION=0)
-    if(MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
-        target_compile_options(port_remastered_effect_convert_tests PRIVATE /Gy)
-        target_link_options(port_remastered_effect_convert_tests PRIVATE /OPT:REF /FORCE:UNRESOLVED)
-    elseif(APPLE)
-        target_link_options(port_remastered_effect_convert_tests PRIVATE -Wl,-dead_strip)
-    else()
-        target_compile_options(port_remastered_effect_convert_tests PRIVATE -ffunction-sections -fdata-sections)
-        target_link_options(port_remastered_effect_convert_tests PRIVATE -Wl,--gc-sections)
+    mp_port_test(port_room_env_tests
+        SOURCES tests/port_room_env.cpp
+            platform/port_room_env_file.cpp platform/port_room_env_tiles.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_room_env_tiles_tests
+        SOURCES tests/port_room_env_tiles.cpp platform/port_room_env_tiles.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_room_geo_tests
+        SOURCES tests/port_room_geo.cpp platform/port_room_geo_file.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_room_geometry_handedness_tests
+        SOURCES tests/port_room_geometry_handedness.cpp
+        INCLUDES platform/include extern/aurora/include)
+    mp_port_test(port_gunship_scenery_tests
+        SOURCES tests/port_gunship_scenery.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_room_effects_tests
+        SOURCES tests/port_room_effects.cpp platform/port_room_effects_file.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_retail_placement_tests
+        SOURCES tests/port_retail_placement_tests.cpp platform/port_retail_placement_file.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_hd_font_tests
+        SOURCES tests/port_hd_font.cpp platform/port_hd_font_file.cpp
+            platform/port_remastered_font.cpp platform/port_font_accent_file.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_remastered_nso_tests
+        SOURCES tests/port_remastered_nso.cpp platform/port_remastered_nso.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_remastered_text_tests
+        SOURCES tests/port_remastered_text.cpp platform/port_remastered_text.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_remastered_effect_tests
+        SOURCES tests/port_remastered_effect.cpp platform/port_remastered_effect.cpp
+        INCLUDES platform/include)
+    # CVectorElement.cpp references particle globals and streams these tests never
+    # reach; GC_SECTIONS has the linker drop them.
+    mp_port_test(port_remastered_effect_convert_tests
+        SOURCES tests/port_remastered_effect_convert.cpp
+            platform/port_remastered_effect_convert.cpp platform/port_remastered_effect.cpp
+            src/Kyoto/Particles/CVectorElement.cpp src/Kyoto/Math/CQuaternion.cpp
+            src/Kyoto/Math/CVector3f.cpp src/Kyoto/Math/CMatrix3f.cpp
+        INCLUDES platform/include include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    # Element batch 2 (NEGT, PLNV counts, CRCV, SPEV, ELPS): converter output.
+    mp_port_test(port_elem2_convert_tests
+        SOURCES tests/port_elem2_convert.cpp
+            platform/port_remastered_effect_convert.cpp platform/port_remastered_effect.cpp
+            src/Kyoto/Particles/CVectorElement.cpp src/Kyoto/Math/CQuaternion.cpp
+            src/Kyoto/Math/CVector3f.cpp src/Kyoto/Math/CMatrix3f.cpp
+        INCLUDES platform/include include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    # Element batch 3 (T2S_, SCLE, NFOM, DIVD, swoosh SUST): converter output.
+    mp_port_test(port_elem3_convert_tests
+        SOURCES tests/port_elem3_convert.cpp
+            platform/port_remastered_effect_convert.cpp platform/port_remastered_effect.cpp
+            src/Kyoto/Particles/CVectorElement.cpp src/Kyoto/Particles/CRealElement.cpp
+            src/Kyoto/Particles/CIntElement.cpp src/Kyoto/Math/CQuaternion.cpp
+            src/Kyoto/Math/CVector3f.cpp src/Kyoto/Math/CMatrix3f.cpp
+        INCLUDES platform/include include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    mp_port_test(port_remastered_effect_convert_vars_tests
+        SOURCES tests/port_remastered_effect_convert_vars.cpp
+            platform/port_remastered_effect_convert.cpp platform/port_remastered_effect.cpp
+            src/Kyoto/Particles/CVectorElement.cpp src/Kyoto/Math/CQuaternion.cpp
+            src/Kyoto/Math/CVector3f.cpp src/Kyoto/Math/CMatrix3f.cpp
+        INCLUDES platform/include include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    # ADV9 / IAV0..3 / PAP0 / PAP9 converter output (PPVR).
+    mp_port_test(port_remastered_effect_convert_pap_tests
+        SOURCES tests/port_remastered_effect_convert_pap.cpp
+            platform/port_remastered_effect_convert.cpp platform/port_remastered_effect.cpp
+            src/Kyoto/Particles/CVectorElement.cpp src/Kyoto/Math/CQuaternion.cpp
+            src/Kyoto/Math/CVector3f.cpp src/Kyoto/Math/CMatrix3f.cpp
+        INCLUDES platform/include include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+
+    mp_port_test(port_electric2_bolt_tests
+        SOURCES tests/port_electric2_bolt.cpp
+        INCLUDES platform/include)
+    # Remastered's clustered light gather on the CPU: the grid, the 80-byte records and the mask.
+    mp_port_test(port_clustered_lights_tests
+        SOURCES tests/port_clustered_lights.cpp platform/port_clustered_lights.cpp
+        INCLUDES platform/include)
+    # Curl noise math, the VECF field and PCRM; the token half (CPortCurlNoiseField.cpp) is
+    # left out and GC_SECTIONS drops what refers to it.
+    mp_port_test(port_curl_noise_tests
+        SOURCES tests/port_curl_noise.cpp src/Kyoto/Particles/CPortCurlNoise.cpp
+            src/Kyoto/Streams/CInputStream.cpp src/Kyoto/Streams/CMemoryInStream.cpp
+            src/Kyoto/Math/CVector3f.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    mp_port_test(port_curl_noise_octave_tests
+        SOURCES tests/port_curl_noise_octave.cpp src/Kyoto/Particles/CPortCurlNoise.cpp
+            src/Kyoto/Streams/CInputStream.cpp src/Kyoto/Streams/CMemoryInStream.cpp
+            src/Kyoto/Math/CVector3f.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    mp_port_test(port_remastered_effect_convert_crlnoct_tests
+        SOURCES tests/port_remastered_effect_convert_crlnoct.cpp
+            platform/port_remastered_effect_convert.cpp platform/port_remastered_effect.cpp
+            src/Kyoto/Particles/CVectorElement.cpp src/Kyoto/Math/CQuaternion.cpp
+            src/Kyoto/Math/CVector3f.cpp src/Kyoto/Math/CMatrix3f.cpp
+        INCLUDES platform/include include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    # ABS_, COSE, RSGN and PIRS: header-only elements (CPortParticleVars.hpp).
+    mp_port_test(port_scalar_elements_tests
+        SOURCES tests/port_scalar_elements.cpp src/Kyoto/Particles/CParticleGlobals.cpp src/Kyoto/CRandom16.cpp src/Kyoto/Math/CVector3f.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    # ADV9, IAV0..3 and the constant-after-start rule (CPortPartVars).
+    mp_port_test(port_part_vars_tests
+        SOURCES tests/port_part_vars.cpp src/Kyoto/Particles/CParticleGlobals.cpp src/Kyoto/CRandom16.cpp src/Kyoto/Math/CVector3f.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    # MPAC, MPCN and ANCM (Remastered's vector elements).
+    mp_port_test(port_vector_elements_tests
+        SOURCES tests/port_vector_elements.cpp src/Kyoto/Particles/CParticleGlobals.cpp src/Kyoto/CRandom16.cpp
+            src/Kyoto/Particles/CVectorElement.cpp src/Kyoto/Math/CQuaternion.cpp
+            src/Kyoto/Math/CVector3f.cpp src/Kyoto/Math/CMatrix3f.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    # PNCV and ROTV outside a component tree (Remastered's CVENormalizedCompensatedVelocity and
+    # CVERotateVector).
+    mp_port_test(port_rotv_pncv_tests
+        SOURCES tests/port_rotv_pncv.cpp src/Kyoto/Particles/CParticleGlobals.cpp src/Kyoto/CRandom16.cpp
+            src/Kyoto/Math/CTransform4f.cpp
+            src/Kyoto/Particles/CVectorElement.cpp src/Kyoto/Math/CQuaternion.cpp
+            src/Kyoto/Math/CVector3f.cpp src/Kyoto/Math/CMatrix3f.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    mp_port_test(port_remastered_effect_convert_rotv_tests
+        SOURCES tests/port_remastered_effect_convert_rotv.cpp
+            platform/port_remastered_effect_convert.cpp platform/port_remastered_effect.cpp
+            src/Kyoto/Particles/CVectorElement.cpp src/Kyoto/Math/CQuaternion.cpp
+            src/Kyoto/Math/CVector3f.cpp src/Kyoto/Math/CMatrix3f.cpp
+        INCLUDES platform/include include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    # KEYF (Remastered's CREKeyframeInput): header-only, and its converter output.
+    mp_port_test(port_keyf_tests
+        SOURCES tests/port_keyf.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    mp_port_test(port_remastered_effect_convert_keyf_tests
+        SOURCES tests/port_remastered_effect_convert_keyf.cpp
+            platform/port_remastered_effect_convert.cpp platform/port_remastered_effect.cpp
+            src/Kyoto/Particles/CVectorElement.cpp src/Kyoto/Math/CQuaternion.cpp
+            src/Kyoto/Math/CVector3f.cpp src/Kyoto/Math/CMatrix3f.cpp
+        INCLUDES platform/include include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    # SLTW (Remastered's lifetime tween on the system slot): the element and its converter output.
+    mp_port_test(port_system_tween_tests
+        SOURCES tests/port_system_tween.cpp src/Kyoto/Particles/CParticleGlobals.cpp src/Kyoto/CRandom16.cpp
+            src/Kyoto/Math/CVector3f.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    mp_port_test(port_remastered_effect_convert_sltw_tests
+        SOURCES tests/port_remastered_effect_convert_sltw.cpp
+            platform/port_remastered_effect_convert.cpp platform/port_remastered_effect.cpp
+            src/Kyoto/Particles/CVectorElement.cpp src/Kyoto/Math/CQuaternion.cpp
+            src/Kyoto/Math/CVector3f.cpp src/Kyoto/Math/CMatrix3f.cpp
+        INCLUDES platform/include include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    # PLNE and PLNV (Remastered's plane emitters), their spread and PLNV's shuffler.
+    mp_port_test(port_plane_emitters_tests
+        SOURCES tests/port_plane_emitters.cpp src/Kyoto/Particles/CParticleGlobals.cpp src/Kyoto/CRandom16.cpp
+            src/Kyoto/Particles/CEmitterElement.cpp
+            src/Kyoto/Math/CVector3f.cpp src/Kyoto/Math/CMatrix3f.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    # SPEV and ELPS (Remastered's sphere with variance and ellipsoid, the port-only PSPV and PELP).
+    mp_port_test(port_sphere_emitters_tests
+        SOURCES tests/port_sphere_emitters.cpp src/Kyoto/Particles/CParticleGlobals.cpp src/Kyoto/CRandom16.cpp
+            src/Kyoto/Particles/CEmitterElement.cpp
+            src/Kyoto/Math/CVector3f.cpp src/Kyoto/Math/CMatrix3f.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    # ASPV and LINV (Remastered's angle sphere and line with variance, the port-only PASV and PLWV).
+    mp_port_test(port_variance_emitters_tests
+        SOURCES tests/port_variance_emitters.cpp src/Kyoto/Particles/CParticleGlobals.cpp src/Kyoto/CRandom16.cpp
+            src/Kyoto/Particles/CEmitterElement.cpp src/Kyoto/Particles/CVectorElement.cpp
+            src/Kyoto/Math/CQuaternion.cpp src/Kyoto/Math/CVector3f.cpp src/Kyoto/Math/CMatrix3f.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    # DBIS (Remastered's particle depth bias, the port-only PDBS): the projection m22 offset.
+    mp_port_test(port_particle_depth_bias_tests
+        SOURCES tests/port_particle_depth_bias.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    # CRCV (Remastered's circle with variance, the port-only PCRC).
+    mp_port_test(port_circle_variance_tests
+        SOURCES tests/port_circle_variance.cpp src/Kyoto/Particles/CParticleGlobals.cpp src/Kyoto/CRandom16.cpp
+            src/Kyoto/Particles/CVectorElement.cpp src/Kyoto/Math/CQuaternion.cpp
+            src/Kyoto/Math/CVector3f.cpp src/Kyoto/Math/CMatrix3f.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    mp_port_test(port_ice_rotation_element_tests
+        SOURCES tests/port_ice_rotation_element.cpp
+            src/Kyoto/Particles/CVectorElement.cpp src/Kyoto/Math/CQuaternion.cpp
+            src/Kyoto/Math/CVector3f.cpp src/Kyoto/Math/CMatrix3f.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    mp_port_test(port_remastered_anim_tests
+        SOURCES tests/port_remastered_anim_tests.cpp platform/port_remastered_anim.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_nested_light_tests
+        SOURCES tests/port_nested_light_math.cpp
+            src/Kyoto/Graphics/CLight.cpp src/Kyoto/Graphics/CColor.cpp
+            src/Kyoto/Math/RMathUtils.cpp src/Kyoto/Math/CVector3f.cpp
+            src/Kyoto/Streams/CInputStream.cpp src/Kyoto/Streams/COutputStream.cpp
+        INCLUDES include extern/aurora/include platform/include
+        DEFINITIONS TARGET_PC VERSION=0)
+    mp_port_test(port_remastered_effect_import_tests
+        SOURCES tests/port_remastered_effect_import.cpp
+            platform/port_remastered_effect_import.cpp platform/port_remastered_effect_convert.cpp
+            platform/port_remastered_effect.cpp platform/port_remastered_image.cpp
+        INCLUDES platform/include include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        LIBRARIES astcenc)
+    mp_port_test(port_remastered_import_tests
+        SOURCES tests/port_remastered_import.cpp platform/port_remastered_effect.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_queen_barrier_validate_tests
+        SOURCES tests/port_queen_barrier_validate.cpp
+            platform/port_queen_barrier_validate.cpp
+            platform/port_remastered_effect_convert.cpp platform/port_remastered_effect.cpp
+        INCLUDES platform/include include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0)
+    # Where the built-in Remastered import lives and how a scan picks it up
+    # (port_remastered_storage.h): policy plus the folder walk, so it gets a scratch folder of its own.
+    mp_port_test(port_remastered_storage_tests
+        SOURCES tests/port_remastered_storage.cpp
+        INCLUDES platform/include
+        ARGS "${CMAKE_CURRENT_BINARY_DIR}/remastered-storage-test")
+    mp_port_test(port_envfx_file_tests
+        SOURCES tests/port_envfx_file.cpp platform/port_envfx_file.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_pause_lighting_tests
+        SOURCES tests/port_pause_lighting.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_shell_file_tests
+        SOURCES tests/port_shell_file.cpp platform/port_shell_file.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_icy_file_tests
+        SOURCES tests/port_icy_file.cpp platform/port_icy_file.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_hud_bars_tests
+        SOURCES tests/port_hud_bars.cpp platform/port_hud_bars_file.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_remastered_hud_tests
+        SOURCES tests/port_remastered_hud.cpp platform/port_remastered_hud.cpp
+            platform/port_hud_bars_file.cpp platform/port_remastered_image.cpp
+            platform/port_remastered_pak.cpp
+        INCLUDES platform/include
+        LIBRARIES astcenc)
+    mp_port_test(port_remastered_movie_tests
+        SOURCES tests/port_remastered_movie.cpp platform/port_remastered_movie.cpp
+            platform/port_remastered_jpeg.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_gallery_tests
+        SOURCES tests/port_gallery.cpp platform/port_gallery.cpp platform/port_remastered_jpeg.cpp
+        INCLUDES platform/include
+        LIBRARIES aurora::thp)
+    mp_port_test(port_remastered_uv_tests
+        SOURCES tests/port_remastered_uv_tests.cpp
+        LIBRARIES mp_test_remastered_convert)
+    mp_port_test(port_remastered_source_file_tests
+        SOURCES tests/port_remastered_source_file.cpp
+            platform/port_remastered_nsp.cpp platform/port_remastered_nso.cpp
+        INCLUDES platform/include
+        LIBRARIES ${CMAKE_THREAD_LIBS_INIT})
+    if(OpenSSL_FOUND)
+        # A synthetic encrypted image with made-up keys (no console keys needed).
+        mp_port_test(port_remastered_nsp_tests
+            SOURCES tests/port_remastered_nsp.cpp
+                platform/port_remastered_nsp.cpp platform/port_remastered_nso.cpp
+            INCLUDES platform/include
+            TIMEOUT 30)
+        mp_websocket_tls(port_remastered_nsp_tests)
     endif()
-    add_executable(port_electric2_bolt_tests tests/port_electric2_bolt.cpp)
-    target_include_directories(port_electric2_bolt_tests PRIVATE platform/include)
-    add_executable(port_ice_rotation_element_tests
-        tests/port_ice_rotation_element.cpp
-        src/Kyoto/Particles/CVectorElement.cpp
-        src/Kyoto/Math/CQuaternion.cpp
-        src/Kyoto/Math/CVector3f.cpp
-        src/Kyoto/Math/CMatrix3f.cpp)
-    target_include_directories(port_ice_rotation_element_tests PRIVATE include extern/aurora/include)
-    target_compile_definitions(port_ice_rotation_element_tests PRIVATE TARGET_PC VERSION=0)
-    # CVectorElement.cpp references particle globals and streams the test never reaches; the
-    # linker drops them. lld-link resolves symbols before /OPT:REF, so they only warn there.
-    if(MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
-        target_compile_options(port_ice_rotation_element_tests PRIVATE /Gy)
-        target_link_options(port_ice_rotation_element_tests PRIVATE /OPT:REF /FORCE:UNRESOLVED)
-    elseif(APPLE)
-        target_link_options(port_ice_rotation_element_tests PRIVATE -Wl,-dead_strip)
-    else()
-        target_compile_options(port_ice_rotation_element_tests PRIVATE -ffunction-sections -fdata-sections)
-        target_link_options(port_ice_rotation_element_tests PRIVATE -Wl,--gc-sections)
-    endif()
-    add_executable(port_remastered_anim_tests tests/port_remastered_anim_tests.cpp platform/port_remastered_anim.cpp)
-    target_include_directories(port_remastered_anim_tests PRIVATE platform/include)
-    add_test(NAME port_remastered_anim_tests COMMAND port_remastered_anim_tests)
-    set_tests_properties(port_remastered_anim_tests PROPERTIES TIMEOUT 15 LABELS port)
-    add_test(NAME port_ice_rotation_element_tests COMMAND port_ice_rotation_element_tests)
-    set_tests_properties(port_ice_rotation_element_tests PROPERTIES TIMEOUT 15 LABELS port)
-    add_executable(port_nested_light_tests tests/port_nested_light_math.cpp
-        src/Kyoto/Graphics/CLight.cpp src/Kyoto/Graphics/CColor.cpp src/Kyoto/Math/RMathUtils.cpp
-        src/Kyoto/Math/CVector3f.cpp src/Kyoto/Streams/CInputStream.cpp src/Kyoto/Streams/COutputStream.cpp)
-    target_include_directories(port_nested_light_tests PRIVATE include extern/aurora/include platform/include)
-    target_compile_definitions(port_nested_light_tests PRIVATE TARGET_PC VERSION=0)
-    add_executable(port_remastered_effect_import_tests tests/port_remastered_effect_import.cpp platform/port_remastered_effect_import.cpp platform/port_remastered_effect_convert.cpp platform/port_remastered_effect.cpp platform/port_remastered_image.cpp)
-    target_include_directories(port_remastered_effect_import_tests PRIVATE platform/include)
-    target_link_libraries(port_remastered_effect_import_tests PRIVATE astcenc)
-    add_executable(port_remastered_import_tests tests/port_remastered_import.cpp platform/port_remastered_effect.cpp)
-    target_include_directories(port_remastered_import_tests PRIVATE platform/include)
-    add_executable(port_hud_bars_tests tests/port_hud_bars.cpp platform/port_hud_bars_file.cpp)
-    target_include_directories(port_hud_bars_tests PRIVATE platform/include)
-    add_executable(port_remastered_hud_tests tests/port_remastered_hud.cpp platform/port_remastered_hud.cpp platform/port_hud_bars_file.cpp platform/port_remastered_image.cpp platform/port_remastered_pak.cpp)
-    target_include_directories(port_remastered_hud_tests PRIVATE platform/include)
-    target_link_libraries(port_remastered_hud_tests PRIVATE astcenc)
-    add_executable(port_remastered_movie_tests tests/port_remastered_movie.cpp platform/port_remastered_movie.cpp platform/port_remastered_jpeg.cpp)
-    target_include_directories(port_remastered_movie_tests PRIVATE platform/include)
-    add_executable(port_gallery_tests tests/port_gallery.cpp platform/port_gallery.cpp platform/port_remastered_jpeg.cpp)
-    target_include_directories(port_gallery_tests PRIVATE platform/include)
-    target_link_libraries(port_gallery_tests PRIVATE aurora::thp)
-    add_executable(port_remastered_uv_tests tests/port_remastered_uv_tests.cpp platform/port_remastered_convert.cpp platform/port_remastered_anuv.cpp platform/port_remastered_image.cpp platform/port_remastered_pak.cpp)
-    target_include_directories(port_remastered_uv_tests PRIVATE platform/include)
-    target_link_libraries(port_remastered_uv_tests PRIVATE astcenc)
-    add_executable(port_remastered_report_tests tests/port_remastered_report_tests.cpp platform/port_remastered_report.cpp)
-    target_include_directories(port_remastered_report_tests PRIVATE platform/include)
-    add_executable(port_remastered_anuv_tests tests/port_remastered_anuv_tests.cpp platform/port_remastered_anuv.cpp)
-    target_include_directories(port_remastered_anuv_tests PRIVATE platform/include)
-    add_executable(port_remastered_lits_tests tests/port_remastered_lits_tests.cpp platform/port_remastered_convert.cpp platform/port_remastered_anuv.cpp platform/port_remastered_image.cpp platform/port_remastered_pak.cpp)
-    target_include_directories(port_remastered_lits_tests PRIVATE platform/include)
-    target_link_libraries(port_remastered_lits_tests PRIVATE astcenc)
-    add_executable(port_remastered_ice_tests tests/port_remastered_ice_tests.cpp platform/port_remastered_convert.cpp platform/port_remastered_anuv.cpp platform/port_remastered_image.cpp platform/port_remastered_pak.cpp)
-    target_include_directories(port_remastered_ice_tests PRIVATE platform/include)
-    target_link_libraries(port_remastered_ice_tests PRIVATE astcenc)
-    add_executable(port_remastered_driver_tests tests/port_remastered_driver_tests.cpp platform/port_remastered_convert.cpp platform/port_remastered_anuv.cpp platform/port_remastered_image.cpp platform/port_remastered_pak.cpp platform/port_remastered_anim.cpp platform/port_remastered_cmdl.cpp platform/port_remastered_txtr.cpp platform/port_room_env_file.cpp platform/port_room_env_tiles.cpp platform/port_room_geo_file.cpp)
-    target_include_directories(port_remastered_driver_tests PRIVATE platform/include include extern/aurora/include)
-    target_compile_definitions(port_remastered_driver_tests PRIVATE TARGET_PC VERSION=0)
-    target_link_libraries(port_remastered_driver_tests PRIVATE astcenc)
-    add_executable(port_remastered_blend_tests tests/port_remastered_blend_tests.cpp platform/port_remastered_convert.cpp platform/port_remastered_anuv.cpp platform/port_remastered_image.cpp platform/port_remastered_pak.cpp)
-    target_include_directories(port_remastered_blend_tests PRIVATE platform/include)
-    target_link_libraries(port_remastered_blend_tests PRIVATE astcenc)
-    add_executable(port_inventory_visor_tests tests/port_inventory_visor_tests.cpp platform/port_remastered_convert.cpp platform/port_remastered_anuv.cpp platform/port_remastered_image.cpp platform/port_remastered_pak.cpp)
-    target_include_directories(port_inventory_visor_tests PRIVATE platform/include include extern/aurora/include)
-    target_compile_definitions(port_inventory_visor_tests PRIVATE TARGET_PC VERSION=0)
-    target_link_libraries(port_inventory_visor_tests PRIVATE astcenc)
-    add_executable(port_remastered_astc_tests tests/port_remastered_astc.cpp platform/port_remastered_image.cpp)
-    target_include_directories(port_remastered_astc_tests PRIVATE platform/include)
-    target_link_libraries(port_remastered_astc_tests PRIVATE astcenc)
-    add_executable(port_remastered_image_tests tests/port_remastered_image_tests.cpp platform/port_remastered_image.cpp)
-    target_include_directories(port_remastered_image_tests PRIVATE platform/include)
-    target_link_libraries(port_remastered_image_tests PRIVATE astcenc)
-    add_executable(port_importers_tests tests/port_importers.cpp platform/port_importers_lines.cpp)
-    target_include_directories(port_importers_tests PRIVATE platform/include)
-    add_executable(port_custom_res_tests tests/port_custom_res.cpp platform/port_custom_res.cpp)
-    target_include_directories(port_custom_res_tests PRIVATE platform/include)
-    add_executable(port_env_tests tests/port_env.cpp)
-    target_include_directories(port_env_tests PRIVATE platform/include)
-    add_executable(port_air_mover_contact_tests tests/port_air_mover_contact.cpp
-        src/Collision/CMaterialFilter.cpp platform/port_remastered_ground_contacts.cpp
-        platform/port_remastered_ground_world.cpp)
+    mp_port_test(port_remastered_parsers_tests
+        SOURCES tests/port_remastered_parsers.cpp
+            platform/port_remastered_pak.cpp platform/port_remastered_txtr.cpp
+            platform/port_remastered_tegra_swizzle.cpp platform/port_remastered_bcdec.cpp
+            platform/port_remastered_astc_decode.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_shot_aim_tests SOURCES tests/port_shot_aim.cpp INCLUDES platform/include)
+    mp_port_test(port_remastered_report_tests
+        SOURCES tests/port_remastered_report_tests.cpp platform/port_remastered_report.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_remastered_anuv_tests
+        SOURCES tests/port_remastered_anuv_tests.cpp platform/port_remastered_anuv.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_remastered_lits_tests
+        SOURCES tests/port_remastered_lits_tests.cpp
+        LIBRARIES mp_test_remastered_convert)
+    mp_port_test(port_remastered_orient_normal_tests
+        SOURCES tests/port_remastered_orient_normal_tests.cpp
+        LIBRARIES mp_test_remastered_convert)
+    mp_port_test(port_remastered_ice_tests
+        SOURCES tests/port_remastered_ice_tests.cpp
+        LIBRARIES mp_test_remastered_convert)
+    mp_port_test(port_remastered_driver_tests
+        SOURCES tests/port_remastered_driver_tests.cpp
+            platform/port_remastered_room_file.cpp platform/port_remastered_room_retail.cpp
+            platform/port_remastered_room_scripts.cpp
+            platform/port_remastered_room_effects.cpp platform/port_room_effects_file.cpp
+            platform/port_remastered_anim.cpp platform/port_remastered_cmdl.cpp
+            platform/port_remastered_txtr.cpp platform/port_room_env_file.cpp
+            platform/port_remastered_tegra_swizzle.cpp platform/port_remastered_bcdec.cpp
+            platform/port_remastered_astc_decode.cpp
+            platform/port_room_env_tiles.cpp platform/port_room_geo_file.cpp
+        INCLUDES platform/include include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        LIBRARIES mp_test_remastered_convert)
+    # The world master's script resolver and the rooms' effect actors, over synthetic ROOM files.
+    mp_port_test(port_remastered_room_scripts_tests
+        SOURCES tests/port_remastered_room_scripts.cpp
+            platform/port_remastered_room_file.cpp platform/port_remastered_room_retail.cpp
+            platform/port_remastered_room_scripts.cpp
+            platform/port_remastered_room_effects.cpp platform/port_room_effects_file.cpp
+            platform/port_remastered_anim.cpp platform/port_remastered_cmdl.cpp
+            platform/port_remastered_txtr.cpp platform/port_room_env_file.cpp
+            platform/port_remastered_tegra_swizzle.cpp platform/port_remastered_bcdec.cpp
+            platform/port_remastered_astc_decode.cpp
+            platform/port_room_env_tiles.cpp platform/port_room_geo_file.cpp
+        INCLUDES platform/include platform include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        LIBRARIES mp_test_remastered_convert)
+    mp_port_test(port_remastered_blend_tests
+        SOURCES tests/port_remastered_blend_tests.cpp
+        LIBRARIES mp_test_remastered_convert)
+    mp_port_test(port_inventory_visor_tests
+        SOURCES tests/port_inventory_visor_tests.cpp
+        INCLUDES platform/include include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        LIBRARIES mp_test_remastered_convert)
+    mp_port_test(port_remastered_astc_tests
+        SOURCES tests/port_remastered_astc.cpp platform/port_remastered_image.cpp
+            platform/port_remastered_txtr.cpp platform/port_remastered_tegra_swizzle.cpp
+            platform/port_remastered_bcdec.cpp platform/port_remastered_astc_decode.cpp
+        INCLUDES platform/include
+        LIBRARIES astcenc)
+    mp_port_test(port_remastered_image_tests
+        SOURCES tests/port_remastered_image_tests.cpp platform/port_remastered_image.cpp
+        INCLUDES platform/include
+        LIBRARIES astcenc)
+    mp_port_test(port_importers_tests
+        SOURCES tests/port_importers.cpp platform/port_importers_lines.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_ball_looks_tests
+        SOURCES tests/port_ball_looks.cpp platform/port_ball_looks.cpp
+            platform/port_remastered_image.cpp
+        INCLUDES platform/include
+        LIBRARIES astcenc)
+    mp_port_test(port_suit_colours_tests
+        SOURCES tests/port_suit_colours.cpp platform/port_suit_colours.cpp
+        INCLUDES platform/include
+        LIBRARIES astcenc)
+    mp_port_test(port_custom_res_tests
+        SOURCES tests/port_custom_res.cpp platform/port_custom_res.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_env_tests SOURCES tests/port_env.cpp INCLUDES platform/include)
+    mp_port_test(port_bytes_hash_tests SOURCES tests/port_bytes_hash.cpp INCLUDES platform/include)
+    mp_port_test(port_air_mover_contact_tests
+        SOURCES tests/port_air_mover_contact.cpp
+            src/Collision/CMaterialFilter.cpp platform/port_remastered_ground_contacts.cpp
+            platform/port_remastered_ground_world.cpp
+        INCLUDES platform/include include extern/sdk/include)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(port_air_mover_contact_tests PRIVATE -ffp-contract=off -fno-fast-math)
     endif()
-    target_include_directories(port_air_mover_contact_tests PRIVATE platform/include include
-        extern/sdk/include)
-    add_test(NAME port_air_mover_contact_tests COMMAND port_air_mover_contact_tests)
-    set_tests_properties(port_air_mover_contact_tests PROPERTIES TIMEOUT 15 LABELS port)
-    add_executable(port_octree_frontonly_tests tests/port_octree_frontonly.cpp
-        src/WorldFormat/CAreaOctTree_Tests.cpp src/WorldFormat/CAreaOctTree.cpp
-        src/WorldFormat/CCollisionSurface.cpp src/Collision/CMaterialFilter.cpp
-        src/Kyoto/Math/CAABox.cpp src/Kyoto/Math/CVector3i.cpp src/Kyoto/Math/CVector3f.cpp
-        src/Kyoto/Streams/CInputStream.cpp src/Kyoto/Streams/CMemoryInStream.cpp
-        src/Kyoto/Streams/COutputStream.cpp src/Kyoto/Math/CVector2f.cpp
-        src/Kyoto/Math/CTransform4f.cpp src/Kyoto/Math/CUnitVector3f.cpp src/Kyoto/Math/CPlane.cpp
-        src/Kyoto/Math/RMathUtils.cpp)
-    target_include_directories(port_octree_frontonly_tests PRIVATE include extern/aurora/include
-        extern/sdk/include)
-    target_compile_definitions(port_octree_frontonly_tests PRIVATE TARGET_PC VERSION=0)
-    add_test(NAME port_octree_frontonly_tests COMMAND port_octree_frontonly_tests)
-    set_tests_properties(port_octree_frontonly_tests PROPERTIES TIMEOUT 15 LABELS port)
-    foreach(t port_remastered_ground_contacts port_collision_failsafe)
-        add_executable(${t}_tests tests/${t}.cpp)
-        target_link_libraries(${t}_tests PRIVATE port_remastered_ground_contacts)
-        set_target_properties(${t}_tests PROPERTIES CXX_STANDARD 17)
-        if(MSVC)
-            target_compile_options(${t}_tests PRIVATE /fp:strict)
-        elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-            target_compile_options(${t}_tests PRIVATE -fno-fast-math -ffp-contract=off)
-        endif()
-        add_test(NAME ${t}_tests COMMAND ${t}_tests)
-        set_tests_properties(${t}_tests PROPERTIES TIMEOUT 15 LABELS port)
+    mp_port_test(port_octree_frontonly_tests
+        SOURCES tests/port_octree_frontonly.cpp
+            src/WorldFormat/CAreaOctTree_Tests.cpp src/WorldFormat/CAreaOctTree.cpp
+            src/WorldFormat/CCollisionSurface.cpp src/Collision/CMaterialFilter.cpp
+            src/Kyoto/Math/CAABox.cpp src/Kyoto/Math/CVector3i.cpp src/Kyoto/Math/CVector3f.cpp
+            src/Kyoto/Streams/CInputStream.cpp src/Kyoto/Streams/CMemoryInStream.cpp
+            src/Kyoto/Streams/COutputStream.cpp src/Kyoto/Math/CVector2f.cpp
+            src/Kyoto/Math/CTransform4f.cpp src/Kyoto/Math/CUnitVector3f.cpp src/Kyoto/Math/CPlane.cpp
+            src/Kyoto/Math/RMathUtils.cpp
+        INCLUDES include extern/aurora/include extern/sdk/include
+        DEFINITIONS TARGET_PC VERSION=0)
+    # The exact-IEEE Remastered collision kernels, under the same flags as their libraries.
+    # The box-actor landing query is header-only over the 0xbf61b4 impacts and links the
+    # same contact library.
+    foreach(t port_remastered_ground_contacts port_collision_failsafe port_remastered_box_landing)
+        mp_port_test(${t}_tests
+            SOURCES tests/${t}.cpp
+            LIBRARIES port_remastered_ground_contacts
+            CXX_STANDARD 17 EXACT_IEEE)
     endforeach()
+    # The sphere-vs-sphere swept query: the hand cases of its spec plus the shared
+    # NormalizeWithMagnitude helper.
+    mp_port_test(port_remastered_sphere_sweep_tests
+        SOURCES tests/port_remastered_sphere_sweep.cpp
+        LIBRARIES port_remastered_sphere_sweep
+        CXX_STANDARD 17 EXACT_IEEE)
+    # The ray-vs-capsule kernel: the capsule spec's hand cases, its threshold and sentinel
+    # behaviour, and the shared quadratic/cylinder/reciprocal prerequisites.
+    mp_port_test(port_remastered_capsule_ray_tests
+        SOURCES tests/port_remastered_capsule_ray.cpp
+        LIBRARIES port_remastered_capsule_ray
+        CXX_STANDARD 17 EXACT_IEEE)
     # The Remastered grounded mover's pure policy (header-only): the entry, response,
     # snap and retained-object-state decisions.
-    add_executable(port_remastered_ground_policy_tests tests/port_remastered_ground_policy.cpp)
-    target_include_directories(port_remastered_ground_policy_tests PRIVATE platform/include)
-    if(MSVC)
-        target_compile_options(port_remastered_ground_policy_tests PRIVATE /fp:strict)
-    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(port_remastered_ground_policy_tests PRIVATE -fno-fast-math
-            -ffp-contract=off)
-    endif()
-    add_test(NAME port_remastered_ground_policy_tests COMMAND port_remastered_ground_policy_tests)
-    set_tests_properties(port_remastered_ground_policy_tests PROPERTIES TIMEOUT 15 LABELS port)
-    add_executable(port_hdr_scene_policy_tests tests/port_hdr_scene_policy.cpp)
-    target_include_directories(port_hdr_scene_policy_tests PRIVATE include extern/aurora/include)
-    target_compile_definitions(port_hdr_scene_policy_tests PRIVATE TARGET_PC VERSION=0)
-    add_test(NAME port_hdr_scene_policy_tests COMMAND port_hdr_scene_policy_tests)
-    set_tests_properties(port_hdr_scene_policy_tests PROPERTIES TIMEOUT 15 LABELS port)
-    add_executable(port_actor_shadow_tests tests/port_actor_shadow.cpp)
-    target_include_directories(port_actor_shadow_tests PRIVATE platform/include)
-    add_test(NAME port_actor_shadow_tests COMMAND port_actor_shadow_tests)
-    set_tests_properties(port_actor_shadow_tests PROPERTIES TIMEOUT 15 LABELS port)
-    add_executable(port_visor_mesh_tests tests/port_visor_mesh.cpp)
-    target_include_directories(port_visor_mesh_tests PRIVATE platform/include)
-    add_test(NAME port_visor_mesh_tests COMMAND port_visor_mesh_tests)
-    set_tests_properties(port_visor_mesh_tests PROPERTIES TIMEOUT 15 LABELS port)
-    add_executable(port_hold_toggle_tests tests/port_hold_toggle.cpp)
-    target_include_directories(port_hold_toggle_tests PRIVATE platform/include)
-    add_executable(port_pointer_tests tests/port_pointer.cpp)
-    target_include_directories(port_pointer_tests PRIVATE platform/include)
-    add_executable(port_input_engine_tests tests/port_input_engine.cpp platform/input/port_input_engine.cpp)
-    target_include_directories(port_input_engine_tests PRIVATE platform/include)
-    add_executable(port_input_bindings_tests tests/port_input_bindings.cpp platform/input/port_input_bindings.cpp platform/input/port_input_engine.cpp)
-    target_include_directories(port_input_bindings_tests PRIVATE platform/include)
-    add_executable(port_tick_pair_tests tests/port_tick_pair.cpp)
-    target_include_directories(port_tick_pair_tests PRIVATE platform/include)
-    add_executable(port_dynamic_res_tests tests/port_dynamic_res.cpp platform/port_dynamic_res.cpp)
-    target_include_directories(port_dynamic_res_tests PRIVATE platform/include)
-    add_executable(port_presentation_rules_tests tests/port_presentation_rules.cpp)
-    target_include_directories(port_presentation_rules_tests PRIVATE platform/include)
-    add_executable(port_input_map_tests tests/port_input_map.cpp)
-    target_include_directories(port_input_map_tests PRIVATE platform/include)
-    add_test(NAME port_input_map_tests COMMAND port_input_map_tests)
-    set_tests_properties(port_input_map_tests PROPERTIES TIMEOUT 15 LABELS port)
-    aurora_copy_runtime_dlls(port_input_map_tests)
-    add_executable(port_input_settings_tests tests/port_input_settings.cpp platform/port_input_settings.cpp)
-    target_include_directories(port_input_settings_tests PRIVATE platform/include)
-    add_test(NAME port_input_settings_tests COMMAND port_input_settings_tests)
-    set_tests_properties(port_input_settings_tests PROPERTIES TIMEOUT 15 LABELS port)
-    add_executable(port_gyro_motion_tests tests/port_gyro_motion.cpp platform/port_gyro_motion.cpp)
-    target_include_directories(port_gyro_motion_tests PRIVATE platform/include)
-    add_test(NAME port_gyro_motion_tests COMMAND port_gyro_motion_tests)
-    set_tests_properties(port_gyro_motion_tests PROPERTIES TIMEOUT 15 LABELS port)
-    aurora_copy_runtime_dlls(port_input_settings_tests)
-    add_executable(port_log_redact_tests tests/port_log_redact.cpp)
-    target_include_directories(port_log_redact_tests PRIVATE platform/include)
-    add_test(NAME port_log_redact_tests COMMAND port_log_redact_tests)
-    set_tests_properties(port_log_redact_tests PROPERTIES TIMEOUT 15 LABELS port)
-    aurora_copy_runtime_dlls(port_log_redact_tests)
-    add_executable(port_data_folder_tests tests/port_data_folder.cpp platform/port_data_folder.cpp)
-    target_include_directories(port_data_folder_tests PRIVATE platform/include)
-    target_link_libraries(port_data_folder_tests PRIVATE ${AURORA_SDL3_TARGET})
-    add_test(NAME port_data_folder_tests COMMAND port_data_folder_tests "${CMAKE_CURRENT_BINARY_DIR}/data-folder-test")
-    set_tests_properties(port_data_folder_tests PROPERTIES TIMEOUT 15 LABELS port)
-    aurora_copy_runtime_dlls(port_data_folder_tests)
-    add_executable(port_config_reset_tests tests/port_config_reset.cpp)
-    target_include_directories(port_config_reset_tests PRIVATE platform/include)
-    add_test(NAME port_config_reset_tests COMMAND port_config_reset_tests "${CMAKE_CURRENT_BINARY_DIR}/config-reset-test")
-    set_tests_properties(port_config_reset_tests PROPERTIES TIMEOUT 15 LABELS port)
-    aurora_copy_runtime_dlls(port_config_reset_tests)
-    add_executable(port_discord_tests tests/port_discord.cpp platform/port_json.cpp)
-    target_include_directories(port_discord_tests PRIVATE platform/include)
-    target_compile_definitions(port_discord_tests PRIVATE TARGET_PC)
-    add_executable(port_update_check_tests tests/port_update_check.cpp platform/port_update_check.cpp
-        platform/port_ws.cpp platform/port_json.cpp)
-    target_include_directories(port_update_check_tests PRIVATE platform/include)
-    target_compile_definitions(port_update_check_tests PRIVATE TARGET_PC)
+    mp_port_test(port_remastered_ground_policy_tests
+        SOURCES tests/port_remastered_ground_policy.cpp
+        INCLUDES platform/include
+        EXACT_IEEE)
+    # Moving platforms under the Remastered grounded mover (issue #117 slice 1): the tree
+    # walk, contact order, rider choice and decay, carry, admission and exactly-once carry.
+    mp_port_test(port_ground_rider_tests
+        SOURCES tests/port_ground_rider.cpp
+            src/Collision/CMaterialFilter.cpp platform/port_remastered_ground_contacts.cpp
+            platform/port_remastered_ground_world.cpp platform/port_collision_failsafe.cpp
+        INCLUDES platform/include include extern/sdk/include
+        EXACT_IEEE)
+    # Remastered MP1 collision material translation and filter policy (header-only).
+    mp_port_test(port_remastered_collision_material_tests
+        SOURCES tests/port_remastered_collision_material.cpp
+        INCLUDES platform/include
+        LIBRARIES port_remastered_ground_contacts
+        EXACT_IEEE)
+    mp_port_test(port_hdr_scene_policy_tests
+        SOURCES tests/port_hdr_scene_policy.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0)
+    mp_port_test(port_actor_shadow_tests SOURCES tests/port_actor_shadow.cpp INCLUDES platform/include)
+    mp_port_test(port_visor_mesh_tests SOURCES tests/port_visor_mesh.cpp INCLUDES platform/include)
+    mp_port_test(port_hold_toggle_tests SOURCES tests/port_hold_toggle.cpp INCLUDES platform/include)
+    mp_port_test(port_pointer_tests SOURCES tests/port_pointer.cpp INCLUDES platform/include)
+    mp_port_test(port_input_engine_tests
+        SOURCES tests/port_input_engine.cpp platform/input/port_input_engine.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_input_bindings_tests
+        SOURCES tests/port_input_bindings.cpp
+            platform/input/port_input_bindings.cpp platform/input/port_input_engine.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_input_user_presets_tests
+        SOURCES tests/port_input_user_presets.cpp
+            platform/input/port_input_user_presets.cpp
+            platform/input/port_input_bindings.cpp platform/input/port_input_engine.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_tick_pair_tests SOURCES tests/port_tick_pair.cpp INCLUDES platform/include)
+    mp_port_test(port_dynamic_res_tests
+        SOURCES tests/port_dynamic_res.cpp platform/port_dynamic_res.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_presentation_rules_tests
+        SOURCES tests/port_presentation_rules.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_input_map_tests SOURCES tests/port_input_map.cpp INCLUDES platform/include)
+    mp_port_test(port_input_settings_tests
+        SOURCES tests/port_input_settings.cpp platform/port_input_settings.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_gyro_motion_tests
+        SOURCES tests/port_gyro_motion.cpp platform/port_gyro_motion.cpp
+        INCLUDES platform/include)
+    # The Windows renderer choice (issue #135): the names the settings file and
+    # MP_GRAPHICS_BACKEND carry, the per-run override that outranks the file, and the
+    # status the Video page draws (platform/include/port_graphics_backend.h). The
+    # settings key's own read/write is covered by port_settings_roundtrip.
+    mp_port_test(port_graphics_backend_tests
+        SOURCES tests/port_graphics_backend.cpp
+        INCLUDES platform/include extern/aurora/include)
+    mp_port_test(port_log_redact_tests SOURCES tests/port_log_redact.cpp INCLUDES platform/include)
+    mp_port_test(port_data_folder_tests
+        SOURCES tests/port_data_folder.cpp platform/port_data_folder.cpp
+        INCLUDES platform/include
+        LIBRARIES ${AURORA_SDL3_TARGET}
+        ARGS "${CMAKE_CURRENT_BINARY_DIR}/data-folder-test")
+    mp_port_test(port_config_reset_tests
+        SOURCES tests/port_config_reset.cpp
+        INCLUDES platform/include
+        ARGS "${CMAKE_CURRENT_BINARY_DIR}/config-reset-test")
+    mp_port_test(port_discord_tests
+        SOURCES tests/port_discord.cpp platform/port_json.cpp
+        INCLUDES platform/include
+        DEFINITIONS TARGET_PC)
+    mp_port_test(port_update_check_tests
+        SOURCES tests/port_update_check.cpp platform/port_update_check.cpp
+            platform/port_ws.cpp platform/port_json.cpp
+        INCLUDES platform/include
+        DEFINITIONS TARGET_PC)
     if(WIN32)
         target_link_libraries(port_update_check_tests PRIVATE ws2_32)
     endif()
     mp_websocket_tls(port_update_check_tests)
-    add_executable(port_livesplit_tests tests/port_livesplit.cpp)
-    target_include_directories(port_livesplit_tests PRIVATE platform/include)
-    add_executable(port_savestate_tests tests/port_savestate.cpp platform/port_savestate_format.cpp)
-    target_include_directories(port_savestate_tests PRIVATE platform/include)
-    add_executable(port_timing_tests tests/port_timing.cpp)
-    target_include_directories(port_timing_tests PRIVATE platform/include)
-    add_executable(port_audio_math_tests tests/port_audio_math.c)
-    target_include_directories(port_audio_math_tests PRIVATE extern/musyx/include)
-    add_executable(port_card_tests tests/port_card.cpp)
-    target_link_libraries(port_card_tests PRIVATE aurora::card)
-    add_test(NAME port_card_tests COMMAND port_card_tests "${CMAKE_CURRENT_BINARY_DIR}/card-test-data")
-    set_tests_properties(port_card_tests PROPERTIES TIMEOUT 15 LABELS port)
-    aurora_copy_runtime_dlls(port_card_tests)
-    add_executable(port_gci_tests tests/port_gci.cpp platform/port_gci.cpp platform/port_save_convert.cpp)
-    target_include_directories(port_gci_tests PRIVATE platform/include)
-    target_link_libraries(port_gci_tests PRIVATE aurora::card)
+    mp_port_test(port_livesplit_tests SOURCES tests/port_livesplit.cpp INCLUDES platform/include)
+    mp_port_test(port_savestate_tests
+        SOURCES tests/port_savestate.cpp platform/port_savestate_format.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_timing_tests SOURCES tests/port_timing.cpp INCLUDES platform/include)
+    mp_port_test(port_audio_math_tests
+        SOURCES tests/port_audio_math.c
+        INCLUDES extern/musyx/include)
+    mp_port_test(port_card_tests
+        SOURCES tests/port_card.cpp
+        LIBRARIES aurora::card
+        ARGS "${CMAKE_CURRENT_BINARY_DIR}/card-test-data")
+    mp_port_test(port_gci_tests
+        SOURCES tests/port_gci.cpp platform/port_gci.cpp platform/port_save_convert.cpp
+        INCLUDES platform/include
+        LIBRARIES aurora::card)
     if(WIN32)
         target_link_libraries(port_gci_tests PRIVATE shell32 ole32 advapi32)
     endif()
-    add_test(NAME port_gci_tests COMMAND port_gci_tests)
-    set_tests_properties(port_gci_tests PROPERTIES TIMEOUT 15 LABELS port)
-    aurora_copy_runtime_dlls(port_gci_tests)
     # Save converter. Fixtures (real saves and scripts/wii2gci.py) are local
     # data: point PORT_SAVE_FIXTURES at them, or the fixture checks are skipped.
     set(PORT_SAVE_FIXTURES "${CMAKE_SOURCE_DIR}/../wii-save" CACHE PATH "Save converter fixtures (saves/, scripts/)")
-    add_executable(port_save_convert_tests tests/port_save_convert.cpp platform/port_save_convert.cpp)
-    target_include_directories(port_save_convert_tests PRIVATE platform/include)
-    add_test(NAME port_save_convert_tests COMMAND port_save_convert_tests "${PORT_SAVE_FIXTURES}")
-    set_tests_properties(port_save_convert_tests PROPERTIES TIMEOUT 120 LABELS port)
-    aurora_copy_runtime_dlls(port_save_convert_tests)
-    add_executable(port_charge_locator_tests tests/port_charge_locator.cpp)
-    target_include_directories(port_charge_locator_tests PRIVATE include extern/aurora/include)
-    target_compile_definitions(port_charge_locator_tests PRIVATE TARGET_PC VERSION=0)
-    add_test(NAME port_charge_locator_tests COMMAND port_charge_locator_tests)
-    add_executable(port_particle_math_tests tests/port_particle_math.cpp src/Kyoto/Particles/CParticleGlobals.cpp
-        src/Kyoto/Math/CVector3f.cpp)
-    target_include_directories(port_particle_math_tests PRIVATE include extern/aurora/include)
-    target_compile_definitions(port_particle_math_tests PRIVATE TARGET_PC VERSION=0)
-    if(MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
-        target_compile_options(port_particle_math_tests PRIVATE /Gy)
-        target_link_options(port_particle_math_tests PRIVATE /OPT:REF /FORCE:UNRESOLVED)
-    elseif(APPLE)
-        target_link_options(port_particle_math_tests PRIVATE -Wl,-dead_strip)
-    else()
-        target_compile_options(port_particle_math_tests PRIVATE -ffunction-sections -fdata-sections)
-        target_link_options(port_particle_math_tests PRIVATE -Wl,--gc-sections)
-    endif()
-    add_test(NAME port_particle_math_tests COMMAND port_particle_math_tests)
-    set_tests_properties(port_particle_math_tests PROPERTIES TIMEOUT 15 LABELS port)
-    set_tests_properties(port_charge_locator_tests PROPERTIES TIMEOUT 15 LABELS port)
-    add_executable(port_swoosh_ring_tests tests/port_swoosh_ring.cpp)
-    target_include_directories(port_swoosh_ring_tests PRIVATE platform/include)
-    add_test(NAME port_swoosh_ring_tests COMMAND port_swoosh_ring_tests)
-    set_tests_properties(port_swoosh_ring_tests PROPERTIES TIMEOUT 15 LABELS port)
-    foreach(test IN ITEMS port_remastered_report_tests port_buffer_tests port_ai_tests port_map_pickups_tests port_randomizer_tests port_apclient_tests port_ap_solo_tests port_ap_logic_tests port_rando_gen_tests port_musyx_tests port_musyx_charge_loop_tests port_disc_tests port_skip_streams_tests port_revision_scripts_tests port_mouse_tests port_touch_pad_tests port_json_tests port_console_physics_tests port_ws_tests port_mods_tests port_pal_languages_tests port_actor_collision_bounds_tests port_room_env_tests port_room_env_tiles_tests port_room_geo_tests port_hd_font_tests port_hud_bars_tests port_remastered_astc_tests port_remastered_hud_tests port_remastered_movie_tests port_gallery_tests port_remastered_nso_tests port_remastered_text_tests port_remastered_uv_tests port_remastered_anuv_tests port_remastered_lits_tests port_remastered_ice_tests port_remastered_driver_tests port_remastered_blend_tests port_inventory_visor_tests port_remastered_image_tests port_remastered_effect_tests port_remastered_effect_convert_tests port_electric2_bolt_tests port_nested_light_tests port_remastered_effect_import_tests port_remastered_import_tests port_importers_tests port_custom_res_tests port_hold_toggle_tests port_pointer_tests port_input_engine_tests port_input_bindings_tests port_env_tests port_tick_pair_tests port_dynamic_res_tests port_presentation_rules_tests port_livesplit_tests port_discord_tests port_update_check_tests port_savestate_tests port_timing_tests port_audio_math_tests)
-        add_test(NAME ${test} COMMAND ${test})
-        set_tests_properties(${test} PROPERTIES TIMEOUT 15 LABELS port)
-        aurora_copy_runtime_dlls(${test})
-    endforeach()
-    # port_ws_tests starts an openssl-generated CA and a python TLS server, which
-    # is not instant on a loaded runner; 15 seconds is enough to time it out and
-    # report nothing about which part was slow.
-    set_tests_properties(port_ws_tests PROPERTIES TIMEOUT 120)
-    # 200+ seeds, each a few hundred logic sweeps.
-    set_tests_properties(port_rando_gen_tests PROPERTIES TIMEOUT 120)
-    # Every port_settings.ini key reads back as written (platform/debug_ui/settings.inc,
+    mp_port_test(port_save_convert_tests
+        SOURCES tests/port_save_convert.cpp platform/port_save_convert.cpp
+        INCLUDES platform/include
+        ARGS "${PORT_SAVE_FIXTURES}"
+        TIMEOUT 120)
+    mp_port_test(port_tri_orbit_tests
+        SOURCES tests/port_tri_orbit.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_tri_reticle_tests
+        SOURCES tests/port_tri_reticle.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_charge_locator_tests
+        SOURCES tests/port_charge_locator.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0)
+    mp_port_test(port_power_charge_release_tests
+        SOURCES tests/port_power_charge_release.cpp
+        INCLUDES platform/include
+        DEFINITIONS TARGET_PC VERSION=0)
+    mp_port_test(port_particle_math_tests
+        SOURCES tests/port_particle_math.cpp src/Kyoto/Particles/CParticleGlobals.cpp src/Kyoto/CRandom16.cpp
+            src/Kyoto/Math/CVector3f.cpp src/Kyoto/Math/CTransform4f.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    # The model (mesh) opacity selection of Remastered's OpacityFresnel recipes: header-only
+    # (platform/include/port_vfx_opacity.h), so it needs no sources of its own.
+    mp_port_test(port_vfx_opacity_tests
+        SOURCES tests/port_vfx_opacity.cpp
+        INCLUDES platform/include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0)
+    # VFX_BarrierShield's fragment maths: a scalar golden reference for the breakup, the motion, the
+    # .45 sawtooth boundary and the chromatic scene samples (header-only: the maths is the shader's).
+    mp_port_test(port_vfx_barrier_tests
+        SOURCES tests/port_vfx_barrier.cpp
+        INCLUDES platform/include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0)
+    mp_port_test(port_vfx_material_tests
+        SOURCES tests/port_vfx_material.cpp
+            src/Kyoto/Particles/CPortVfxMat.cpp platform/port_vfx_particles.cpp
+            src/Kyoto/Particles/CGenDescription.cpp src/Kyoto/Particles/CColorElement.cpp
+            src/Kyoto/Graphics/DolphinCColor.cpp
+            src/Kyoto/Streams/CInputStream.cpp src/Kyoto/Streams/CMemoryInStream.cpp
+            src/Kyoto/Math/CVector3f.cpp
+        INCLUDES platform/include include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    mp_port_test(port_swoosh_ring_tests SOURCES tests/port_swoosh_ring.cpp INCLUDES platform/include)
+    # Remastered's visor goo splat manager maths (include/MetroidPrime/PortVisorGoo.hpp).
+    mp_port_test(port_visor_goo_tests
+        SOURCES tests/port_visor_goo_tests.cpp src/Kyoto/CRandom16.cpp src/Kyoto/Math/CVector3f.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0
+        GC_SECTIONS)
+    mp_port_test(port_face_reflection_tests
+        SOURCES tests/port_face_reflection_tests.cpp
+        INCLUDES include extern/aurora/include
+        DEFINITIONS TARGET_PC VERSION=0)
+    # --- Dread readers A (PKG, BCTEX, title check) ---
+    # CRC-64, .pkg table, .bctex (gzip, block-linear, BC1/3/5) and the opened image's title id,
+    # over synthetic files; real-data checks are opt-in (PORT_DREAD_ROMFS, PORT_DREAD_NSP).
+    mp_port_test(port_dread_readers_a_tests
+        SOURCES tests/port_dread_readers_a.cpp
+            platform/port_dread_pkg.cpp platform/port_dread_bctex.cpp
+            platform/port_remastered_tegra_swizzle.cpp platform/port_remastered_bcdec.cpp
+            platform/port_remastered_nsp.cpp platform/port_remastered_nso.cpp
+        INCLUDES platform/include tests
+        LIBRARIES ZLIB::ZLIB ${CMAKE_THREAD_LIBS_INIT}
+        TIMEOUT 120)
+    mp_websocket_tls(port_dread_readers_a_tests)
+    # --- end Dread readers A ---
+    # --- Dread readers B (BCMDL, BSMAT) ---
+    mp_port_test(port_dread_readers_b_tests
+        SOURCES tests/port_dread_readers_b.cpp platform/port_dread_bcmdl.cpp
+            platform/port_dread_bsmat.cpp
+        INCLUDES platform/include
+        LIBRARIES ZLIB::ZLIB)
+    # --- end Dread readers B ---
+    # --- Dread re-skin (step 4: Dread Samus onto Prime's skeletons) ---
+    # CINF parse, frame/scale fit, repose and weight mapping over synthetic stick figures;
+    # the real-data run is opt-in (PORT_DREAD_SAMUS_PKG_DIR + PORT_PRIME_SAMUS_DIR).
+    mp_port_test(port_dread_reskin_tests
+        SOURCES tests/port_dread_reskin.cpp platform/port_dread_reskin.cpp platform/port_dread_bcmdl.cpp
+        INCLUDES platform/include
+        LIBRARIES ZLIB::ZLIB)
+    # --- end Dread re-skin ---
+    # --- Dread suit material (step 5: mp_samuspbr -> synthetic Remastered PBR material) ---
+    # Channel remap, emissive and ids over synthetic fixtures, then through the converter's
+    # ReadMaterial; the real-data run is opt-in (PORT_DREAD_SAMUS_PKG_DIR).
+    mp_port_test(port_dread_material_tests
+        SOURCES tests/port_dread_material.cpp platform/port_dread_material.cpp platform/port_dread_bctex.cpp
+            platform/port_dread_bsmat.cpp platform/port_remastered_tegra_swizzle.cpp
+            platform/port_remastered_bcdec.cpp
+        INCLUDES platform platform/include
+        LIBRARIES mp_test_remastered_convert ZLIB::ZLIB ${CMAKE_THREAD_LIBS_INIT}
+        TIMEOUT 120)
+    # --- end Dread suit material ---
+    # Third-person camera: eye placement and wall pull-in maths (header-only, no game state).
+    mp_port_test(port_third_person_tests
+        SOURCES tests/port_third_person.cpp
+        INCLUDES platform/include)
+    mp_port_test(port_third_person_body_tests
+        SOURCES tests/port_third_person_body.cpp
+        INCLUDES platform/include)
+    # The order a mod reload runs in: the port's own model holders go before the PAKs reopen
+    # (port_world_holders.h), or the next world takes this one's models from the pool.
+    mp_port_test(port_world_holders_tests
+        SOURCES tests/port_world_holders.cpp platform/port_world_holders.cpp
+        INCLUDES platform/include)
+    # --- Dread Samus import (step 6: the dread-samus mod) ---
+    # The converter's explicit-weights path, the synthetic Model of a re-skinned body, the retail
+    # skin reader and the mod order rule over synthetic fixtures; the whole import on real data is
+    # opt-in (PORT_DREAD_ROMFS + PORT_PRIME_SAMUS_DIR).
+    mp_port_test(port_dread_samus_tests
+        SOURCES tests/port_dread_samus.cpp platform/port_dread_samus.cpp platform/port_dread_material.cpp
+            platform/port_dread_bctex.cpp platform/port_dread_bsmat.cpp platform/port_dread_bcmdl.cpp
+            platform/port_dread_pkg.cpp platform/port_dread_reskin.cpp
+            platform/port_remastered_tegra_swizzle.cpp platform/port_remastered_bcdec.cpp
+            platform/port_remastered_cmdl.cpp platform/port_ball_looks.cpp
+        INCLUDES platform platform/include
+        LIBRARIES mp_test_remastered_convert ZLIB::ZLIB ${CMAKE_THREAD_LIBS_INIT}
+        TIMEOUT 600)
+    # --- end Dread Samus import ---
+    # Every port_settings.ini key reads back as written (platform/debug_ui/settings.cpp,
     # kSettingKeys); the game binary checks itself and exits before starting.
     add_test(NAME port_settings_roundtrip COMMAND metroid_prime_port --settings-selftest)
     set_tests_properties(port_settings_roundtrip PROPERTIES TIMEOUT 30 LABELS port
@@ -988,9 +1620,74 @@ if(MP_BUILD_TESTS)
             COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_settings_index.py
                     ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(port_settings_index PROPERTIES TIMEOUT 15 LABELS port)
+        # The committed entity schema against the headers; skips (77) without clang-19.
+        add_test(NAME port_entity_schema_current
+            COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_entity_schema.py --check)
+        set_tests_properties(port_entity_schema_current PROPERTIES TIMEOUT 300 LABELS port
+            SKIP_RETURN_CODE 77)
         add_test(NAME port_air_mover_wiring
             COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/port_air_mover_wiring.py
-                    ${CMAKE_CURRENT_SOURCE_DIR}/src/MetroidPrime/CGameCollision.cpp)
+                    ${CMAKE_CURRENT_SOURCE_DIR}/platform/port_remastered_movers.cpp)
         set_tests_properties(port_air_mover_wiring PROPERTIES TIMEOUT 15 LABELS port)
+        # The door payload reaches its encoder and decoder from the capture
+        # and the restore (issue #131).
+        add_test(NAME port_door_save_wiring
+            COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/port_door_save_wiring.py
+                    ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(port_door_save_wiring PROPERTIES TIMEOUT 15 LABELS port)
+        # A state saved in a boss fight restores the fight: delivered activation,
+        # regenerated generator copies and the replayed script message journal.
+        add_test(NAME port_boss_save_wiring
+            COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/port_boss_save_wiring.py
+                    ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(port_boss_save_wiring PROPERTIES TIMEOUT 15 LABELS port)
+        # A totem scan, not the text refresh at room load, asks the AP server for
+        # the artifact hint (issue #170).
+        add_test(NAME port_ap_scan_hint_wiring
+            COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/port_ap_scan_hint_wiring.py
+                    ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(port_ap_scan_hint_wiring PROPERTIES TIMEOUT 15 LABELS port)
+        # No raw string literal piece grows past MSVC's 16 KB limit (issue #170).
+        add_test(NAME port_msvc_string_limit
+            COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/port_msvc_string_limit.py
+                    ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(port_msvc_string_limit PROPERTIES TIMEOUT 30 LABELS port)
+        # The map side file reaches its staging, its flush and its load from the
+        # card driver, and the save state carries the same data in its blob.
+        add_test(NAME port_map_side_wiring
+            COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/port_map_side_wiring.py
+                    ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(port_map_side_wiring PROPERTIES TIMEOUT 15 LABELS port)
+        # The Extra map UI setting gates the legend entries and the Mark room
+        # prompt alone, is off by default, and is persisted.
+        add_test(NAME port_map_extra_ui_wiring
+            COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/port_map_extra_ui_wiring.py
+                    ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(port_map_extra_ui_wiring PROPERTIES TIMEOUT 15 LABELS port)
+        # F1's Mods page holds the Remastered and Dread sections: one page, the old
+        # MP_DEBUG_TAB names opening their section, and the search rows reaching it.
+        add_test(NAME port_mods_page_wiring
+            COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/port_mods_page_wiring.py
+                    ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(port_mods_page_wiring PROPERTIES TIMEOUT 15 LABELS port)
+        # The model-opacity key must be carried by exactly one row of the converter's
+        # recipe table (port_vfx_opacity.h): the C++ tests pin that one recipe's word
+        # and the selection, not the count.
+        add_test(NAME port_vfx_opacity_wiring
+            COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/port_vfx_opacity_wiring.py
+                    ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(port_vfx_opacity_wiring PROPERTIES TIMEOUT 15 LABELS port)
+        # BarrierShield (bit 29) is wired the same way everywhere: the shader branch, both fog
+        # exclusions, both slot reads, the scene gate, the CCH rows and the time, the vertex
+        # attribute, the mesh feed and readiness, and the converter's recipe and MFC0 gate.
+        add_test(NAME port_vfx_barrier_wiring
+            COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/port_vfx_barrier_wiring.py
+                    ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(port_vfx_barrier_wiring PROPERTIES TIMEOUT 15 LABELS port)
+        # Every command in the console's table is documented in docs/CONSOLE.md.
+        add_test(NAME port_console_docs
+            COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/tests/port_console_docs.py
+                    ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(port_console_docs PROPERTIES TIMEOUT 15 LABELS port)
     endif()
 endif()

@@ -14,6 +14,7 @@
 #include "MetroidPrime/CStateManager.hpp"
 #include "MetroidPrime/CWorld.hpp"
 #include "MetroidPrime/Cameras/CCameraManager.hpp"
+#include "MetroidPrime/HUD/CSamusHud.hpp"
 #include "MetroidPrime/Player/CPlayer.hpp"
 #include "MetroidPrime/ScriptObjects/CHUDBillboardEffect.hpp"
 #include "MetroidPrime/ScriptObjects/CScriptTrigger.hpp"
@@ -36,7 +37,15 @@
 
 #ifdef TARGET_PC
 #include "MetroidPrime/CActor.hpp"
+#include "MetroidPrime/Player/CPlayerState.hpp"
+#include "MetroidPrime/PortFaceReflection.hpp"
+#include "aurora/envfx.hpp"
 #include "port_debug.h"
+#include "port_envfx_assets.h"
+#include "port_mods.h"
+#include "port_room_env.h"
+
+#include <vector>
 #endif
 
 static const float gkReal32Max = FLT_MAX;
@@ -86,6 +95,7 @@ CEnvFxManager::CEnvFxManager()
 , xPortStepGeneration(0)
 , xPortStepType(kEFX_None)
 , xPortSnowFirst(0)
+, xPortSplashFaceCounted(false)
 #endif
 {
   CRandom16 random(0);
@@ -259,6 +269,12 @@ void CEnvFxManager::MoveWrapCells(int moveX, int moveY) {
 }
 
 void CEnvFxManager::AsyncLoadResources(CStateManager& mgr) {
+#ifdef TARGET_PC
+  // Remastered builds no billboard here: UpdateVisorSplashes 0xf97ebc creates it on demand.
+  if (PortRemasteredSplash()) {
+    return;
+  }
+#endif
   xb68_envRainSplashId = mgr.AllocateUniqueId();
   CHUDBillboardEffect* effect = rs_new CHUDBillboardEffect(
       rstl::optional_object< TToken< CGenDescription > >(*xb58_envRainSplash),
@@ -267,6 +283,9 @@ void CEnvFxManager::AsyncLoadResources(CStateManager& mgr) {
       CHUDBillboardEffect::GetScaleForPOV(mgr), CColor(1.f, 1.f, 1.f, 1.f),
       CVector3f(1.f, 1.f, 1.f), CVector3f(0.f, 0.f, 0.f));
   effect->SetRunIndefinitely(true);
+#ifdef TARGET_PC
+  effect->PortSetFaceUncounted();
+#endif
   mgr.AddObject(effect);
 }
 
@@ -286,6 +305,9 @@ void CEnvFxManager::Cleanup() {
   xb6a_rainSoundActive = false;
   xb6c_leftRainSound.Clear();
   xb70_rightRainSound.Clear();
+#ifdef TARGET_PC
+  xPortSplashFaceCounted = false;
+#endif
 }
 
 void CEnvFxManager::Update(float dt, CStateManager& mgr) {
@@ -462,7 +484,7 @@ void CEnvFxManager::UpdateBlockedGrids(CStateManager& mgr, EEnvFxType type,
   x2c_lastBlockedGridIdx = -1;
   x24_enableSplash = false;
 
-  rstl::reserved_vector< TUniqueId, 1024 > blockList;
+  rstl::reserved_vector< TUniqueId, kMaxObjects > blockList;
   bool blockListBuilt = false;
   int blockedGrids = 0;
 
@@ -568,6 +590,16 @@ void CEnvFxManager::UpdateUnderwaterParticles(const CVectorFixed8_8& zVec) {
 
 void CEnvFxManager::UpdateVisorSplash(CStateManager& mgr, float dt, const CTransform4f& camXf) {
   EEnvFxType fxType = mgr.GetWorld()->GetNeededEnvFx();
+#ifdef TARGET_PC
+  if (PortRemasteredSplash()) {
+    if (!PortUpdateRemasteredSplash(mgr, fxType)) {
+      xb54_baseSplashRate = 0.f;
+      return;
+    }
+  } else {
+    PortUpdateSplashFaceCount(mgr, fxType);
+  }
+#endif
   if (xb68_envRainSplashId != kInvalidUniqueId) {
     if (CHUDBillboardEffect* splashEffect =
             TCastToPtr< CHUDBillboardEffect >(mgr.ObjectById(xb68_envRainSplashId))) {
@@ -607,6 +639,70 @@ void CEnvFxManager::UpdateVisorSplash(CStateManager& mgr, float dt, const CTrans
   SetSplashEffectRate(rate, mgr);
   xb54_baseSplashRate = 0.f;
 }
+
+#ifdef TARGET_PC
+// UpdateVisorSplashes 0xf97ebc keeps the splash billboard while the base rate is up, or while
+// it rains outside fluid and the X-Ray visor isn't on (or the player is in or entering the
+// ball), deleting it otherwise; the billboard's ctor and deletion count it for the face
+// reflection. With a converted splash the port does the same (PortUpdateRemasteredSplash); the
+// retail billboard stays for good, so its count follows that condition here.
+bool CEnvFxManager::PortSplashAlive(const CStateManager& mgr, EEnvFxType fxType) const {
+  const CPlayer* player = mgr.GetPlayer();
+  return xb54_baseSplashRate > 0.f ||
+         (x24_enableSplash && fxType == kEFX_Rain &&
+          mgr.GetCameraManager()->GetFluidCounter() == 0 &&
+          ((player != nullptr && player->GetMorphballTransitionState() != CPlayer::kMS_Unmorphed) ||
+           mgr.GetPlayerState()->GetCurrentVisor() != CPlayerState::kPV_XRay));
+}
+
+void CEnvFxManager::PortUpdateSplashFaceCount(CStateManager& mgr, EEnvFxType fxType) {
+  const bool alive = xb68_envRainSplashId != kInvalidUniqueId && PortSplashAlive(mgr, fxType);
+  if (alive != xPortSplashFaceCounted) {
+    if (alive) {
+      PortFaceReflection::AddBillboard(mgr.PortFaceReflectionManager());
+    } else {
+      PortFaceReflection::RemoveBillboard(mgr.PortFaceReflectionManager());
+    }
+    xPortSplashFaceCounted = alive;
+  }
+}
+
+bool CEnvFxManager::PortRemasteredSplash() const {
+  return xb58_envRainSplash && **xb58_envRainSplash != nullptr && (**xb58_envRainSplash)->xPortIrnd;
+}
+
+// UpdateVisorSplashes 0xf97ebc up to the rate: false when it returns without setting one. Not
+// alive deletes the billboard (DeleteObjectRequest); alive creates it once the HUD's visor data
+// is valid (CreateHUDBillboardEffect 0xd7e67c, so counted by the face reflection like any
+// billboard), then sets runIndefinitely (+0x240 bit 3) and turns emission on, every frame.
+bool CEnvFxManager::PortUpdateRemasteredSplash(CStateManager& mgr, EEnvFxType fxType) {
+  if (!PortSplashAlive(mgr, fxType)) {
+    if (xb68_envRainSplashId != kInvalidUniqueId) {
+      mgr.DeleteObjectRequest(xb68_envRainSplashId);
+      xb68_envRainSplashId = kInvalidUniqueId;
+    }
+    return false;
+  }
+  CHUDBillboardEffect* effect =
+      TCastToPtr< CHUDBillboardEffect >(mgr.ObjectById(xb68_envRainSplashId));
+  if (effect == nullptr) {
+    if (!CSamusHud::PortExists()) {
+      return false;
+    }
+    xb68_envRainSplashId = mgr.AllocateUniqueId();
+    effect = rs_new CHUDBillboardEffect(
+        rstl::optional_object< TToken< CGenDescription > >(*xb58_envRainSplash),
+        rstl::optional_object< TToken< CElectricDescription > >(), xb68_envRainSplashId, true,
+        rstl::string_l("VisorRainSplashes"), CHUDBillboardEffect::GetNearClipDistance(mgr),
+        CHUDBillboardEffect::GetScaleForPOV(mgr), CColor(1.f, 1.f, 1.f, 1.f),
+        CVector3f(1.f, 1.f, 1.f), CVector3f(0.f, 0.f, 0.f));
+    mgr.AddObject(effect);
+  }
+  effect->SetRunIndefinitely(true);
+  effect->GetParticleGen()->SetParticleEmission(true);
+  return true;
+}
+#endif
 
 void CEnvFxManager::SetSplashEffectRate(float rate, CStateManager& mgr) {
   if (CHUDBillboardEffect* splashEffect =
@@ -695,6 +791,24 @@ static const float skUnderwaterTexMtx[2][4] = {
     {0.f, 0.f, 0.f, 0.f},
     {0.f, 0.f, -10.f, 0.f},
 };
+
+#ifdef TARGET_PC
+// SetupUnderwaterTevs' water top, for the native draw.
+static float PortWaterTop(const CStateManager& mgr) {
+  float waterTop = gkReal32Max;
+  const CObjectList& objList = mgr.GetObjectListById(kOL_All);
+  for (int idx = objList.GetFirstObjectIndex(); idx != -1; idx = objList.GetNextObjectIndex(idx)) {
+    CEntity* ent = const_cast< CEntity* >(objList[idx]);
+    if (TCastToPtr< CScriptWater >(ent)) {
+      rstl::optional_object< CAABox > tb = static_cast< CActor* >(ent)->GetTouchBounds();
+      if (tb) {
+        waterTop = rstl::min_val(tb->GetMaxPoint().GetZ(), waterTop);
+      }
+    }
+  }
+  return waterTop;
+}
+#endif
 
 void CEnvFxManager::SetupUnderwaterTevs(const CTransform4f& invXf, CStateManager& mgr) {
   CGX::SetVtxDescv(skUnderwaterDesc);
@@ -811,6 +925,13 @@ void CEnvFxManager::Render(const CStateManager& mgr) {
 #endif
       CTransform4f invXf = xf.GetInverse();
       CTransform4f camXf = mgr.GetCameraManager()->GetCurrentCameraTransform(mgr);
+#ifdef TARGET_PC
+      if (PortRenderEnvFx(mgr, fxType, xf, invXf, camXf)) {
+        sPortSnowSteps = nullptr;
+        CGraphics::SetCullMode(kCM_Front);
+        return;
+      }
+#endif
       switch (fxType) {
       case kEFX_Snow:
         SetupSnowTevs(const_cast< CStateManager& >(mgr));
@@ -837,6 +958,163 @@ void CEnvFxManager::Render(const CStateManager& mgr) {
     }
   }
 }
+
+#ifdef TARGET_PC
+// Remastered's EnvironmentFX (CEnvFxContextSceneNodeMPT::RenderRain/RenderSnow/RenderUnderwater,
+// RenderScreenFacingQuads 0xc3f2b8; kb topic/rain-snow-splash-render.md section 2): every
+// visible grid's particles as one instanced draw of screen-facing quads (aurora/envfx.hpp), in
+// place of the retail TEV lines and quads, wherever the Remastered room environment renders the
+// frame and a mod supplies the textures. False: draw retail's (also outside the HDR scene).
+bool CEnvFxManager::PortRenderEnvFx(const CStateManager& mgr, EEnvFxType type, const CTransform4f& xf,
+                                    const CTransform4f& invXf, const CTransform4f& camXf) {
+  namespace envfx = aurora::gfx::envfx;
+  if (!PortRoomEnv::Enabled() || !PortMods::RoomEnvLoaded()) {
+    return false;
+  }
+  const PortEnvFx::Assets* assets = PortEnvFx::Get();
+  if (assets == nullptr) {
+    return false;
+  }
+  if (!envfx::uploaded()) {
+    static bool sFailed = false;
+    if (sFailed) {
+      return false;
+    }
+    const auto image = [](const PortEnvFx::Image& in) {
+      envfx::Image out;
+      out.width = in.width;
+      out.height = in.height;
+      out.layers = in.layers;
+      out.rgba = in.rgba.size() == size_t(in.width) * in.height * in.layers * 4 ? in.rgba.data() : nullptr;
+      return out;
+    };
+    const envfx::Image flakes[3] = {image(assets->flake[PortEnvFx::kRain]),
+                                    image(assets->flake[PortEnvFx::kSnow]),
+                                    image(assets->flake[PortEnvFx::kUnderwater])};
+    if (!envfx::upload(image(assets->gradient), flakes)) {
+      sFailed = true;
+      return false;
+    }
+  }
+
+  envfx::DrawDesc desc;
+  // Remastered's alpha scale reads CEnvFxManagerMP1's opacity (+0x50, 1 at construction, faded only
+  // by FadeOpacity 0xf99a78), not the particle density (which, as in retail, sets how many particles
+  // there are). Retail has no such fade: 1.
+  const float opacity = 1.f;
+  // The quad's edges, world directions taken into the grids' space (xf only translates and scales).
+  CVector3f edge1, edge2;
+  float alpha;
+  uint32_t flakeLayers = 64;
+  switch (type) {
+  case kEFX_Rain: {
+    // RenderRain 0xc3e89c: width 0.2, length lerp(2, 4, 1 - |camera up . world up|), alpha
+    // 0.18 x opacity (the shipped LDTA values); orient 1: the streak hangs down from the particle,
+    // across the view.
+    desc.mode = envfx::Mode::Rain;
+    const float absDot = CMath::AbsF(CVector3f::Dot(camXf.GetUp(), CVector3f::Up()));
+    const float length = 2.f + 2.f * (1.f - absDot);
+    const CVector3f down = CVector3f::Down();
+    const CVector3f fwd = camXf.GetForward();
+    CVector3f across = camXf.GetRight();
+    if (CMath::AbsF(CMath::AbsF(CVector3f::Dot(down, fwd.AsNormalized())) - 1.f) >= 1e-5f) {
+      across = CVector3f::Cross(down, fwd).AsNormalized();
+    }
+    edge1 = across * 0.2f;
+    edge2 = down * length;
+    alpha = 0.18f * opacity;
+    break;
+  }
+  case kEFX_Snow:
+    // RenderSnow 0xc3ec30: size 0.1, orient 0 (screen-facing: -right and up).
+    desc.mode = envfx::Mode::Snow;
+    edge1 = camXf.GetRight() * -0.1f;
+    edge2 = camXf.GetUp() * 0.1f;
+    alpha = opacity;
+    break;
+  case kEFX_UnderwaterFlake:
+    // RenderUnderwater 0xc3ef74: size 0.5 (the default; not overridden), orient 0. One layer.
+    desc.mode = envfx::Mode::Underwater;
+    edge1 = camXf.GetRight() * -0.5f;
+    edge2 = camXf.GetUp() * 0.5f;
+    alpha = opacity;
+    flakeLayers = 1;
+    break;
+  default:
+    return false;
+  }
+  edge1 = invXf.Rotate(edge1);
+  edge2 = invXf.Rotate(edge2);
+  desc.params[0][0] = CMath::Clamp(0.f, alpha, 1.f);
+  // The rgb gain: the effect's colour intensity (CEnvFxManagerMP1 +0x04: 1 until a room's
+  // CEnvFxDensityControllerMP1 applies its own, which the importer reads into the area's room
+  // environment; retail has none) x Remastered's inverse exposure, which cancels its tonemap's
+  // exposure. The port's HDR scene is already exposed, so the cancelled pair is the intensity alone
+  // (aurora/envfx.cpp). The area is the one the camera is in (as the room environment's other
+  // per-area values).
+  desc.params[0][1] = PortRoomEnv::EnvFxIntensity();
+  desc.params[1][0] = edge1.GetX();
+  desc.params[1][1] = edge1.GetY();
+  desc.params[1][2] = edge1.GetZ();
+  desc.params[2][0] = edge2.GetX();
+  desc.params[2][1] = edge2.GetY();
+  desc.params[2][2] = edge2.GetZ();
+
+  // Underwater: retail's gradient along z below the water top (SetupUnderwaterTevs). Remastered's
+  // RenderScreenFacingQuads writes the same (10, -10 h - 0.5) for every mode; its underwater height
+  // source is not traced, so the port keeps retail's (port choice).
+  float waterU = 0.f;
+  if (type == kEFX_UnderwaterFlake) {
+    waterU = 10.f * (invXf * (PortWaterTop(mgr) * CVector3f::Up())).GetZ() - 0.5f;
+  }
+
+  static std::vector< envfx::Instance > sInstances;
+  sInstances.clear();
+  for (int i = 0; i < x50_grids.size() && i < 64; ++i) {
+    const CEnvFxManagerGrid& grid = x50_grids[i];
+    const rstl::vector< CVectorFixed8_8 >& particles = grid.Particles();
+    if (particles.empty() || !grid.GetVisibility().first) {
+      continue;
+    }
+    float* cell = desc.grid[i];
+    cell[0] = fixed8_8_to_real(grid.GetStart().GetX());
+    cell[1] = fixed8_8_to_real(grid.GetStart().GetY());
+    if (type == kEFX_UnderwaterFlake) {
+      cell[2] = -10.f;
+      cell[3] = waterU;
+    } else {
+      // Retail's GX_TEXMTX5 row 1 and Remastered's grid_cell_data: (10, -(10 h + 0.5)), h the
+      // grid's occluder height in its space.
+      const CVector3f localUp = invXf * (grid.GetVisibility().second * CVector3f::Up());
+      cell[2] = 10.f;
+      cell[3] = -(10.f * localUp.GetZ() + 0.5f);
+    }
+    const int count = particles.size();
+    for (int j = 0; j < count; ++j) {
+      CVectorFixed8_8 p = particles[j];
+      if (sPortSnowSteps != nullptr) {
+        // UpdateSnowParticles gives particle j force (first + size-1-j) & 0xff (as RenderSnowParticles).
+        const CVectorFixed8_8& step = sPortSnowSteps[(sPortSnowFirst + (count - 1 - j)) & 0xff];
+        p.x = PortStepBack(p.x, step.x);
+        p.y = PortStepBack(p.y, step.y);
+        p.z = PortStepBack(p.z, step.z);
+      }
+      // Remastered keeps a flake layer per particle; retail has none. Port choice: a stable hash
+      // of the particle's grid and index.
+      const uint32_t h = (uint32_t(j) * 2654435761u) ^ (uint32_t(i) * 40503u);
+      const uint32_t layer = flakeLayers > 1 ? (h >> 26) & 63u : 0u;
+      envfx::Instance inst;
+      inst.pos[0] = p.x;
+      inst.pos[1] = p.y;
+      inst.pos[2] = p.z;
+      inst.w = static_cast< uint16_t >(uint32_t(i) | layer << 6);
+      sInstances.push_back(inst);
+    }
+  }
+  gpRender->SetModelMatrix(xf);
+  return envfx::draw(desc, sInstances.data(), uint32_t(sInstances.size()));
+}
+#endif
 
 static int CalcRainVolume(float f) {
   float result;
@@ -882,7 +1160,7 @@ void CEnvFxManager::SetFxDensity(int val, float density) {
   x38_maxDensityDeltaSpeed = val;
 }
 
-void CEnvFxManager::BuildBlockObjectList(rstl::reserved_vector< TUniqueId, 1024 >& list,
+void CEnvFxManager::BuildBlockObjectList(rstl::reserved_vector< TUniqueId, kMaxObjects >& list,
                                          CStateManager& mgr) {
   const CObjectList& objList = mgr.GetObjectListById(kOL_All);
   for (int idx = objList.GetFirstObjectIndex(); idx != -1; idx = objList.GetNextObjectIndex(idx)) {

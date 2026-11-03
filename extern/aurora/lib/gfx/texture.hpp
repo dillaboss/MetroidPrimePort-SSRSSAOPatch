@@ -1,7 +1,9 @@
 #pragma once
 #include <dolphin/gx.h>
 
+#include <memory>
 #include <utility>
+#include <vector>
 
 #include "types.hpp"
 
@@ -30,6 +32,8 @@ struct TextureFormatInfo {
 };
 TextureFormatInfo format_info(wgpu::TextureFormat format) noexcept;
 uint64_t calc_texture_size(wgpu::TextureFormat format, uint32_t width, uint32_t height, uint32_t mips) noexcept;
+// Refresh the cached Dawn memory totals (at most once a second); call from the thread that submits to Dawn.
+void sample_dawn_memory() noexcept;
 bool is_block_aligned(wgpu::TextureFormat format, uint32_t width, uint32_t height) noexcept;
 
 constexpr u32 InvalidTextureFormat = -1;
@@ -43,16 +47,23 @@ struct TextureRef {
   u32 gxFormat;
   bool hasArbitraryMips = false;
   bool isReplacement = false;
+  // Compatibility devices only, block-compressed formats only: the bytes uploaded (every mip, tightly packed in
+  // block rows), because such a texture can't be copied on the GPU there; the VFX atlas fills its layers from them.
+  std::shared_ptr<const std::vector<uint8_t>> cpuBytes;
+  // The creation label (interned, so it outlives the texture), for the live-texture breakdown.
+  const char* label = nullptr;
 
   TextureRef(wgpu::Texture texture, wgpu::TextureView sampleTextureView, wgpu::TextureView attachmentTextureView,
-             wgpu::Extent3D size, wgpu::TextureFormat format, uint32_t mipCount, u32 gxFormat)
+             wgpu::Extent3D size, wgpu::TextureFormat format, uint32_t mipCount, u32 gxFormat,
+             const char* label = nullptr)
   : texture(std::move(texture))
   , sampleTextureView(std::move(sampleTextureView))
   , attachmentTextureView(std::move(attachmentTextureView))
   , size(size)
   , format(format)
   , mipCount(mipCount)
-  , gxFormat(gxFormat) {
+  , gxFormat(gxFormat)
+  , label(label) {
     count_live(1);
   }
   TextureRef(const TextureRef&) = delete;
@@ -104,7 +115,7 @@ struct GXTexObj_ {
   GXTexWrapMode wrap_t() const noexcept { return static_cast<GXTexWrapMode>(get_bits(mode0, 2, 2)); }
   GXTexFilter min_filter() const noexcept {
     constexpr GXTexFilter kHwToGxFilter[8] = {
-        GX_NEAR, GX_NEAR_MIP_NEAR, GX_LIN_MIP_NEAR, GX_NEAR, GX_LINEAR, GX_NEAR_MIP_LIN, GX_LIN_MIP_LIN, GX_NEAR,
+        GX_NEAR, GX_NEAR_MIP_NEAR, GX_NEAR_MIP_LIN, GX_NEAR, GX_LINEAR, GX_LIN_MIP_NEAR, GX_LIN_MIP_LIN, GX_NEAR,
     };
     return kHwToGxFilter[get_bits(mode0, 3, 5)];
   }

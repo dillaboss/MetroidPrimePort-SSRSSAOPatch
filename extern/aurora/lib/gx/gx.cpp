@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <utility>
+#include "../gfx/texture_sites.hpp"
 
 static aurora::Module Log("aurora::gx");
 
@@ -130,7 +131,7 @@ wgpu::CompareFunction to_compare_function(GXCompare func) {
 }
 
 wgpu::BlendState to_blend_state(GXBlendMode mode, GXBlendFactor srcFac, GXBlendFactor dstFac, GXLogicOp op,
-                                u32 dstAlpha) {
+                                u32 dstAlpha, bool dualSource) {
   wgpu::BlendComponent colorBlendComponent;
   switch (mode) {
     DEFAULT_FATAL("unsupported blend mode {}", underlying(mode));
@@ -181,6 +182,20 @@ wgpu::BlendState to_blend_state(GXBlendMode mode, GXBlendFactor srcFac, GXBlendF
       break;
     }
     break;
+  }
+  if (dualSource) {
+    // The TEV alpha is the second source; the first's alpha is 1 (DstAlphaMode::DualSource).
+    const auto remap = [](wgpu::BlendFactor factor) {
+      if (factor == wgpu::BlendFactor::SrcAlpha) {
+        return wgpu::BlendFactor::Src1Alpha;
+      }
+      if (factor == wgpu::BlendFactor::OneMinusSrcAlpha) {
+        return wgpu::BlendFactor::OneMinusSrc1Alpha;
+      }
+      return factor;
+    };
+    colorBlendComponent.srcFactor = remap(colorBlendComponent.srcFactor);
+    colorBlendComponent.dstFactor = remap(colorBlendComponent.dstFactor);
   }
   wgpu::BlendComponent alphaBlendComponent;
   if (dstAlpha != UINT32_MAX) {
@@ -349,8 +364,29 @@ u16 draw_sync_token() noexcept { return sDrawSyncToken.load(std::memory_order_ac
 
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.textures[static_cast<size_t>(id)]; }
 
+DstAlphaMode dst_alpha_mode(const PipelineConfig& config) noexcept {
+  // A zero constant times any source alpha is still zero.
+  if (config.shadowPass != 0 || !config.alphaUpdate || config.dstAlpha == UINT32_MAX || config.dstAlpha == 0) {
+    return DstAlphaMode::None;
+  }
+  // The draw-id and actor-decal shaders end in their own return (alpha 1).
+  const auto& sc = config.shaderConfig;
+  if (sc.drawId || sc.shell != 0 || (sc.actorDecal != 0 && sc.lineMode == 0)) {
+    return DstAlphaMode::None;
+  }
+  const auto usesSourceAlpha = [](GXBlendFactor factor) {
+    return factor == GX_BL_SRCALPHA || factor == GX_BL_INVSRCALPHA;
+  };
+  const bool needsSourceAlpha = config.colorUpdate && config.blendMode == GX_BM_BLEND &&
+                                (usesSourceAlpha(config.blendFacSrc) || usesSourceAlpha(config.blendFacDst));
+  if (!needsSourceAlpha) {
+    return DstAlphaMode::Replace;
+  }
+  return webgpu::g_dualSourceBlendingSupported ? DstAlphaMode::DualSource : DstAlphaMode::None;
+}
+
 wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
-                                    wgpu::ShaderModule shader, const char* label) noexcept {
+                                    wgpu::ShaderModule shader, const char* label, DstAlphaMode dstAlphaMode) noexcept {
   ZoneScoped;
   if (config.shadowPass != 0) {
     // The sun's shadow map: depth only, culled as the draw is, with Remastered's shadow pass bias
@@ -398,7 +434,8 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
       .depthBiasClamp = depthBiasClamp,
   };
   const auto blendState =
-      to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp, config.dstAlpha);
+      to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp, config.dstAlpha,
+                     dstAlphaMode == DstAlphaMode::DualSource);
   const std::array colorTargets{wgpu::ColorTargetState{
       // The HDR scene's RGBA16F target is a different format from every other pass's.
       .format = config.shaderConfig.sceneHdr ? webgpu::SceneHdrFormat : g_graphicsConfig.surfaceConfiguration.format,
@@ -432,15 +469,45 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
   return g_device.CreateRenderPipeline(&descriptor);
 }
 
+// Strips the draw's own shading from a shader config: no PBR, fog, lighting, indirect or TEV state reaches the shader.
+// Shared by the actor shadow decal and the silhouette shell, which each write their own colour; the fields they
+// set differently (actorDecal, shadow, depthOnly) stay at the call sites.
+static void strip_to_flat_shading(ShaderConfig& sc) noexcept {
+  sc.pbr = 0;
+  sc.pbrKind = 0;
+  sc.pbrCut = 0;
+  sc.pbrThermal = 0;
+  sc.pbrPlain = 0;
+  sc.pbrNoDebug = 0;
+  sc.pbrBindPos = false;
+  sc.pbrBindLe = false;
+  sc.pbrLightmapAttr = GX_VA_NULL;
+  sc.sdf = 0;
+  sc.hudSample = 0;
+  sc.perPixelLight = 0;
+  sc.fogType = GX_FOG_NONE;
+  sc.fogRangeEnabled = false;
+  sc.volFog = VolFogNone;
+  sc.alphaCompare = {};
+  sc.numIndStages = 0;
+  sc.indStages = {};
+  for (auto& ts : sc.tevStages) {
+    ts = {};
+  }
+  sc.tevStageCount = 1;
+}
+
 // How a draw after the volumetric fog fogs itself. Remastered fogs its transparents per vertex,
 // over a frame the full-screen pass has already fogged: an alpha-blended surface as colour T +
 // in-scatter, an additive one as colour T, so it adds no in-scatter of its own. Blends that
 // multiply or subtract the frame are left alone: fogging them would fog what is behind twice.
 // Particles are the exception to the additive rule: Remastered's particle renderers inject only
 // the colour T + in-scatter block, and an additive or premultiplied particle (blend mode 2 or 1)
-// carries the static render state's "no fog" flag, so it is not fogged at all.
+// carries the static render state's "no fog" flag, so it is not fogged at all. So does a
+// particle with DFOG 1, whatever its blend (CreateGPSM/CreateSWSH set the flag from it).
 static u8 vol_fog_mode(bool depthOnly) noexcept {
-  if (!g_gxState.volFog || depthOnly || !g_gxState.colorUpdate) {
+  if (!g_gxState.volFog || depthOnly || !g_gxState.colorUpdate ||
+      g_gxState.particleFog == GXState::kParticleUnfogged) {
     return VolFogNone;
   }
   const auto src = g_gxState.blendFacSrc;
@@ -465,6 +532,14 @@ static u8 vol_fog_mode(bool depthOnly) noexcept {
   return VolFogNone;
 }
 
+bool depth_prepass_eligible(u8 lineMode) noexcept {
+  const auto& st = g_gxState;
+  const bool opaque = st.blendMode == GX_BM_NONE ||
+                      (st.blendMode == GX_BM_BLEND && st.blendFacSrc == GX_BL_ONE && st.blendFacDst == GX_BL_ZERO);
+  return lineMode == 0 && st.depthCompare && st.depthUpdate && st.depthFunc == GX_LEQUAL && st.colorUpdate &&
+         (st.alphaUpdate || !efb_has_alpha(st.pixelFmt)) && opaque && st.shell == 0 && !st.actorDecal;
+}
+
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
   ZoneScoped;
 
@@ -473,17 +548,22 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   // From the pass being recorded (the replayed FIFO's), so an offscreen pass or the next frame's
   // LDR scene never takes an HDR pipeline.
   config.shaderConfig.sceneHdr = gfx::scene_hdr_pass_active();
-  config.shaderConfig.fogType = g_gxState.fog.type;
+  config.shaderConfig.fogType = pipeline_fog_type(g_gxState.fog.type);
   config.shaderConfig.fogRangeEnabled = g_gxState.fog.rangeEnabled;
   config.shaderConfig.pbr = g_gxState.pbr;
   if (g_gxState.pbr != 0) {
     config.shaderConfig.pbrKind = static_cast<u8>(std::clamp(std::lround(g_gxState.pbrLayer.y()), 0L, 255L));
+    config.shaderConfig.pbrCut = pbr_cut_mode(g_gxState.pbrBacklight);
     // The lightmap's UV attribute, when the bound vertex format has it (and the device a slot for the lightmap).
     const u8 lightmapAttr = g_gxState.pbrLightmapAttr;
     if (webgpu::g_lightmapBinding && lightmapAttr >= GX_VA_TEX0 && lightmapAttr <= GX_VA_TEX7 &&
         g_gxState.vtxDesc[lightmapAttr] != GX_NONE) {
       config.shaderConfig.pbrLightmapAttr = lightmapAttr;
     }
+    config.shaderConfig.pbrThermal = config.shaderConfig.sceneHdr && g_gxState.pbrThermal.w() > 0.5f;
+    const u8 flags = pbr_static_flags();
+    config.shaderConfig.pbrPlain = (flags & 1) != 0;
+    config.shaderConfig.pbrNoDebug = (flags & 2) != 0;
   }
   if (bind_pos_active()) {
     config.shaderConfig.pbrBindPos = true;
@@ -542,6 +622,7 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   } else {
     config.shaderConfig.lineMode = 0;
   }
+  config.shaderConfig.clipPlane = g_gxState.clipPlane && config.shaderConfig.lineMode == 0;
   config.shaderConfig.tevSwapTable = g_gxState.tevSwapTable;
   for (u8 i = 0; i < g_gxState.numTevStages; ++i) {
     config.shaderConfig.tevStages[i] = g_gxState.tevStages[i];
@@ -567,17 +648,19 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
     config.shaderConfig.tcgs[i] = g_gxState.tcgs[i];
   }
   if (g_gxState.alphaCompare) {
-    config.shaderConfig.alphaCompare = g_gxState.alphaCompare;
+    config.shaderConfig.alphaCompare = pipeline_alpha_compare(g_gxState.alphaCompare);
   }
   const auto cullMode = config.shaderConfig.lineMode == 0 ? g_gxState.cullMode : GX_CULL_NONE;
   const auto [polygonOffset, polygonOffsetScale] = polygon_offset_for_cull_mode(cullMode);
   // GX_AURORA_PORT_DEPTH_PREPASS: pass 1 writes only the depth, pass 2 shades where it is equal.
   // Both keep the vertex stage and the polygon offset, so their depths match exactly (the
-  // position is @invariant).
-  const bool writesDepth = g_gxState.depthCompare && g_gxState.depthUpdate;
-  const bool depthOnly = g_gxState.depthPrepass == 1;
-  const bool depthEqual = g_gxState.depthPrepass == 2 && writesDepth;
-  config.shaderConfig.depthOnly = depthOnly;
+  // position is @invariant). Only depth_prepass_eligible draws take part: the others are left out
+  // of pass 1 (push_gx_draw) and draw unchanged in pass 2.
+  const bool depthOnly = g_gxState.depthPrepass == 1 || g_gxState.depthPrepass == 3;
+  // Pass 3's mark: only in an EFB without alpha, where nothing reads it.
+  const bool depthMark = g_gxState.depthPrepass == 3 && !efb_has_alpha(g_gxState.pixelFmt);
+  const bool depthEqual = g_gxState.depthPrepass == 2 && depth_prepass_eligible(config.shaderConfig.lineMode);
+  config.shaderConfig.depthOnly = depthMark ? 2 : depthOnly ? 1 : 0;
   // The "drawid" view: flat colours that must reach the frame as they are, so no fog and no blend (a
   // depth-only pass stays one).
   const bool drawId = g_gxState.drawIdMode && !depthOnly;
@@ -593,26 +676,21 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
     // alone, so none of the draw's own shading, fog or PBR reaches the shader.
     auto& sc = config.shaderConfig;
     sc.actorDecal = 1;
-    sc.pbr = 0;
-    sc.pbrKind = 0;
-    sc.pbrBindPos = false;
-    sc.pbrBindLe = false;
-    sc.pbrLightmapAttr = GX_VA_NULL;
-    sc.sdf = 0;
-    sc.hudSample = 0;
-    sc.perPixelLight = 0;
-    sc.fogType = GX_FOG_NONE;
-    sc.fogRangeEnabled = false;
-    sc.volFog = VolFogNone;
-    sc.alphaCompare = {};
-    sc.numIndStages = 0;
-    sc.indStages = {};
-    for (auto& ts : sc.tevStages) {
-      ts = {};
-    }
-    sc.tevStageCount = 1;
+    strip_to_flat_shading(sc);
   } else if (g_gxState.actorDecal) {
     config.shaderConfig.shadow = false;
+  }
+  // GX_AURORA_PORT_SHELL: Remastered's Model_SilhouetteShell. The shell is the model pushed out along
+  // its normals; pass 1 writes its depth alone, pass 2 shades it from the scene copy and the shell's
+  // two textures, so none of the draw's own shading reaches the shader.
+  const u8 shell = config.shaderConfig.lineMode == 0 && !drawId ? g_gxState.shell : 0;
+  config.shaderConfig.shell = shell;
+  if (shell != 0) {
+    auto& sc = config.shaderConfig;
+    sc.depthOnly = shell == 1;
+    sc.actorDecal = 0;
+    strip_to_flat_shading(sc);
+    sc.shadow = false;
   }
   // Field by field: an aggregate assignment would copy the 2.7 KB shader config twice more on
   // every pipeline switch. Every field outside shaderConfig is written here.
@@ -621,10 +699,21 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   config.depthFunc = depthEqual ? GX_EQUAL : g_gxState.depthFunc;
   config.cullMode = cullMode;
   config.blendMode = drawId ? GX_BM_NONE : g_gxState.blendMode;
-  config.blendFacSrc = g_gxState.blendFacSrc;
-  config.blendFacDst = g_gxState.blendFacDst;
+  // An EFB without alpha: its alpha reads as 1 and is never written (nor is GXSetDstAlpha's).
+  const bool hasAlpha = efb_has_alpha(g_gxState.pixelFmt);
+  const auto blendFactor = [hasAlpha](GXBlendFactor factor) {
+    if (!hasAlpha && factor == GX_BL_DSTALPHA) {
+      return GX_BL_ONE;
+    }
+    if (!hasAlpha && factor == GX_BL_INVDSTALPHA) {
+      return GX_BL_ZERO;
+    }
+    return factor;
+  };
+  config.blendFacSrc = blendFactor(g_gxState.blendFacSrc);
+  config.blendFacDst = blendFactor(g_gxState.blendFacDst);
   config.blendOp = g_gxState.blendOp;
-  config.dstAlpha = g_gxState.dstAlpha;
+  config.dstAlpha = hasAlpha && g_gxState.alphaUpdate ? g_gxState.dstAlpha : UINT32_MAX;
   config.polygonOffsetBits = std::bit_cast<uint32_t>(polygonOffset);
   config.polygonOffsetScaleBits = std::bit_cast<uint32_t>(polygonOffsetScale);
   config.polygonOffsetClampBits = std::bit_cast<uint32_t>(g_gxState.clamp);
@@ -643,8 +732,19 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
     // The receiver keeps its own cull (back faces for the world's geometry), as Remastered's
     // decal draw does.
   }
-  config.alphaUpdate = g_gxState.alphaUpdate && !depthOnly;
-  config.colorUpdate = g_gxState.colorUpdate && !depthOnly;
+  if (shell != 0) {
+    // Both passes test LEQUAL, write depth (the model flags Remastered draws them with, Normal)
+    // and keep the model's cull; the colour pass replaces the frame where the shell's depth won.
+    config.blendMode = GX_BM_NONE;
+    config.depthFunc = GX_LEQUAL;
+    config.depthCompare = true;
+    config.depthUpdate = true;
+  }
+  config.alphaUpdate = (hasAlpha && g_gxState.alphaUpdate && !depthOnly && shell != 1) || depthMark;
+  if (depthMark) {
+    config.blendMode = GX_BM_NONE;
+  }
+  config.colorUpdate = g_gxState.colorUpdate && !depthOnly && shell != 1;
   static_assert(sizeof(PipelineConfig) == sizeof(ShaderConfig) + 13 * sizeof(uint32_t) + 4 * sizeof(bool),
                 "a new PipelineConfig field must be written above");
 }
@@ -687,7 +787,8 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
     textureEntries[kShadowSamplerBinding].sampler = gfx::shadow::sampler().Get();
   }
   for (u32 i = 0; i < MaxTextures; ++i) {
-    const auto& tex = g_gxState.textures[i];
+    const auto& tex = info.shellScene && i < g_gxState.shellTextures.size() ? g_gxState.shellTextures[i]
+                                                                             : g_gxState.textures[i];
     WGPUBindGroupEntry& textureEntry = textureEntries[i * 2];
     WGPUBindGroupEntry& samplerEntry = textureEntries[i * 2 + 1];
     textureEntry.binding = i * 2;
@@ -724,6 +825,22 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
       textureEntry.textureView = sEmptyTextureView.Get();
       samplerEntry.sampler = sEmptySampler.Get();
     }
+  }
+  // The shell's colour pass reads the scene copy (CBUF, textureLod 1, bilinear, clamped) in slot 2;
+  // without this frame's copy it reads the empty texture, and the caller draws no colour pass.
+  wgpu::TextureView shellScene;
+  if (info.shellScene) {
+    static const wgpu::Sampler shellSceneSampler = gfx::sampler_ref(wgpu::SamplerDescriptor{
+        .addressModeU = wgpu::AddressMode::ClampToEdge,
+        .addressModeV = wgpu::AddressMode::ClampToEdge,
+        .magFilter = wgpu::FilterMode::Linear,
+        .minFilter = wgpu::FilterMode::Linear,
+        .mipmapFilter = wgpu::MipmapFilterMode::Linear,
+        .maxAnisotropy = 1,
+    });
+    shellScene = gfx::vfx::scene_copy_view(gfx::scene_hdr_pass_active());
+    textureEntries[GX_TEXMAP2 * 2].textureView = shellScene ? shellScene.Get() : sEmptyTextureView.Get();
+    textureEntries[GX_TEXMAP2 * 2 + 1].sampler = shellSceneSampler.Get();
   }
   const WGPUBindGroupDescriptor textureBindGroupDescriptor{
       .label = {"GX Texture Bind Group", WGPU_STRLEN},
@@ -864,6 +981,7 @@ void initialize() noexcept {
         .size = {1, 1},
         .format = wgpu::TextureFormat::RGBA8Unorm,
     };
+    AURORA_NOTE_TEXTURE(&descriptor);
     sEmptyTexture = g_device.CreateTexture(&descriptor);
     sEmptyTextureView = sEmptyTexture.CreateView();
   }
