@@ -744,6 +744,7 @@ std::vector<std::pair<int, std::string>> sRemasteredPicks;
 std::string sPalLanguagesPick;
 std::string sFlaahgraPick;
 std::string sDreadPick;
+std::string sEchoesPick;
 
 #if defined(__ANDROID__)
 // Not SDL_ShowOpenFileDialog: Android often kills the game behind the picker
@@ -799,6 +800,8 @@ void OpenRemasteredDialog(int which) {
         sFlaahgraPick = files[0];
       } else if (which == kDreadPick) {
         sDreadPick = files[0];
+      } else if (which == kEchoesPick) {
+        sEchoesPick = files[0];
       } else {
         sRemasteredPicks.emplace_back(which, files[0]);
       }

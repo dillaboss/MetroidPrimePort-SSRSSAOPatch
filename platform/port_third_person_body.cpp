@@ -1,5 +1,6 @@
 // The third-person camera's animated body; see port_third_person_body.h.
 #include "port_third_person_body.h"
+#include "port_third_person_echoes.h"
 
 #include <algorithm>
 #include <cmath>
@@ -257,6 +258,7 @@ struct State {
   float poseYaw = 0.f, posePitch = 0.f, aimYawNow = 0.f, aimPitchNow = 0.f;
   CVector3f pivot = CVector3f::Zero(); // the shoulder, as last posed (model space, unscaled)
   bool animating = false;
+  bool echoes = false; // Echoes' animations pose the legs this tick
   // The other sets (kSkeletonSets), built once the body is.
   std::vector<std::pair<uint32_t, std::unique_ptr<CModelData>>> sets;
   bool allSets = false;
@@ -325,6 +327,7 @@ int CharIdx(const CStateManager& mgr) {
 }
 
 void Drop() {
+  PortThirdPersonEchoes::Reset();
   s.suitModel.reset();
   s.suitSkin.reset();
   s.pinned = Clip();
@@ -802,6 +805,7 @@ Pose sModel;
 Pose sBlended;
 Pose sUpper;
 Pose sFreeArm;
+CQuaternion sRecoil[kSegs]; // Echoes' recoil, a turn per segment
 
 // Pose p with each rotation turned into the model's frame (its parents' rotations times its
 // own); a segment RecalcPoseBuilder doesn't set keeps the pose builder's rotation.
@@ -1206,64 +1210,71 @@ bool WalkLead(float stride, float& lead) {
 
 void PoseBody(CAnimData& data) {
   float total = 0.f;
-  const float idleDuration = std::max(data.GetAnimationDuration(s.idle), 0.1f);
-  if (s.stanceWeight[int(Stance::Idle)] > 0.f) {
-    const float turnWeight = s.turn.Valid() ? s.turnWeight : 0.f;
-    if (turnWeight < 1.f) {
-      Sample(data, s.idle, Wrap(s.clock / idleDuration), sTmp);
-      Mix(sAcc, total, sTmp, s.stanceWeight[int(Stance::Idle)] * (1.f - turnWeight), false);
-    }
-    if (turnWeight > 0.f) {
-      Sample(s.turn, std::min(TurnPhase(s.turned, s.turnYaw, kTurnSamples), 0.999f), sTmp);
-      Mix(sAcc, total, sTmp, s.stanceWeight[int(Stance::Idle)] * turnWeight, false);
-    }
-  }
-  if (s.stanceWeight[int(Stance::Stop)] > 0.f) {
-    // Played once: held on its last frame (phase 1 would wrap to its first).
-    const float duration = std::max(data.GetAnimationDuration(s.stop), 0.1f);
-    Sample(data, s.stop, std::min(s.stopStart + s.stanceTime[int(Stance::Stop)] / duration, 0.999f), sTmp);
-    Mix(sAcc, total, sTmp, s.stanceWeight[int(Stance::Stop)], false);
-  }
+  // Echoes' animations (port_third_person_echoes.h) pose the legs and stance in place of the
+  // clips below; the layers over them (scan, flinch, aim) stay.
+  const bool echoes = s.echoes && PortThirdPersonEchoes::BasePose(data, sAcc.rot, sAcc.off, kSegs);
   const float backWeight = s.stanceWeight[int(Stance::Loco)] * s.backWeight;
-  if (backWeight > 0.f) {
-    Backpedal(data, sTmp);
-    Mix(sAcc, total, sTmp, backWeight, false);
-  }
-  for (int i = 0; i < kLocoSlots; ++i) {
-    const float w = s.stanceWeight[int(Stance::Loco)] * s.locoWeight[i] * (1.f - s.backWeight);
-    if (w > 0.f) {
-      Sample(s.loco[i], Wrap(kLocoDir[i] * s.stride + s.locoPeak[i]), sTmp);
-      if (kLocoDir[i] < 0.f) {
-        // The walk-back is Samus struggling in the Phazon: its arms clutch the helmet and
-        // fling out. Only its legs; above them the ready pose.
-        Sample(data, s.ready, Wrap(s.clock / std::max(data.GetAnimationDuration(s.ready), 0.1f)), sUpper);
-        Overlay(sTmp, sUpper, 1.f, true);
+  if (echoes) {
+    total = 1.f;
+  } else {
+    const float idleDuration = std::max(data.GetAnimationDuration(s.idle), 0.1f);
+    if (s.stanceWeight[int(Stance::Idle)] > 0.f) {
+      const float turnWeight = s.turn.Valid() ? s.turnWeight : 0.f;
+      if (turnWeight < 1.f) {
+        Sample(data, s.idle, Wrap(s.clock / idleDuration), sTmp);
+        Mix(sAcc, total, sTmp, s.stanceWeight[int(Stance::Idle)] * (1.f - turnWeight), false);
       }
-      Mix(sAcc, total, sTmp, w, false);
-    }
-  }
-  const struct {
-    Stance stance;
-    const Clip& clip;
-    const OneShot& shot;
-  } shots[] = {{Stance::Jump, s.jump, kJump}, {Stance::Fall, s.fall, kFall}, {Stance::Land, s.land, kLand}};
-  for (const auto& e : shots) {
-    const float w = s.stanceWeight[int(e.stance)];
-    if (w > 0.f && e.clip.Valid()) {
-      Sample(e.clip, ShotPhase(e.clip, e.shot, s.stanceTime[int(e.stance)]), sTmp);
-      if (e.stance == Stance::Fall && s.jump.Valid()) {
-        // The descent's legs under the jump's tucked upper body: the landing clip comes out of a
-        // flip, leaning back with an arm flung up.
-        Sample(s.jump, kJump.to, sUpper);
-        UpperOver(data, sTmp, sUpper);
+      if (turnWeight > 0.f) {
+        Sample(s.turn, std::min(TurnPhase(s.turned, s.turnYaw, kTurnSamples), 0.999f), sTmp);
+        Mix(sAcc, total, sTmp, s.stanceWeight[int(Stance::Idle)] * turnWeight, false);
       }
-      Ground(sTmp);
-      Mix(sAcc, total, sTmp, w, false);
     }
-  }
-  if (total <= 0.f) {
-    // Only stances whose clip is missing: the ready pose.
-    Sample(data, s.idle, Wrap(s.clock / idleDuration), sAcc);
+    if (s.stanceWeight[int(Stance::Stop)] > 0.f) {
+      // Played once: held on its last frame (phase 1 would wrap to its first).
+      const float duration = std::max(data.GetAnimationDuration(s.stop), 0.1f);
+      Sample(data, s.stop, std::min(s.stopStart + s.stanceTime[int(Stance::Stop)] / duration, 0.999f), sTmp);
+      Mix(sAcc, total, sTmp, s.stanceWeight[int(Stance::Stop)], false);
+    }
+    if (backWeight > 0.f) {
+      Backpedal(data, sTmp);
+      Mix(sAcc, total, sTmp, backWeight, false);
+    }
+    for (int i = 0; i < kLocoSlots; ++i) {
+      const float w = s.stanceWeight[int(Stance::Loco)] * s.locoWeight[i] * (1.f - s.backWeight);
+      if (w > 0.f) {
+        Sample(s.loco[i], Wrap(kLocoDir[i] * s.stride + s.locoPeak[i]), sTmp);
+        if (kLocoDir[i] < 0.f) {
+          // The walk-back is Samus struggling in the Phazon: its arms clutch the helmet and
+          // fling out. Only its legs; above them the ready pose.
+          Sample(data, s.ready, Wrap(s.clock / std::max(data.GetAnimationDuration(s.ready), 0.1f)), sUpper);
+          Overlay(sTmp, sUpper, 1.f, true);
+        }
+        Mix(sAcc, total, sTmp, w, false);
+      }
+    }
+    const struct {
+      Stance stance;
+      const Clip& clip;
+      const OneShot& shot;
+    } shots[] = {{Stance::Jump, s.jump, kJump}, {Stance::Fall, s.fall, kFall}, {Stance::Land, s.land, kLand}};
+    for (const auto& e : shots) {
+      const float w = s.stanceWeight[int(e.stance)];
+      if (w > 0.f && e.clip.Valid()) {
+        Sample(e.clip, ShotPhase(e.clip, e.shot, s.stanceTime[int(e.stance)]), sTmp);
+        if (e.stance == Stance::Fall && s.jump.Valid()) {
+          // The descent's legs under the jump's tucked upper body: the landing clip comes out of a
+          // flip, leaning back with an arm flung up.
+          Sample(s.jump, kJump.to, sUpper);
+          UpperOver(data, sTmp, sUpper);
+        }
+        Ground(sTmp);
+        Mix(sAcc, total, sTmp, w, false);
+      }
+    }
+    if (total <= 0.f) {
+      // Only stances whose clip is missing: the ready pose.
+      Sample(data, s.idle, Wrap(s.clock / idleDuration), sAcc);
+    }
   }
   // Over the legs' upper body: the hand to the visor while scanning, a flinch from a hit.
   if (s.scanWeight > 0.f && s.scan.Valid()) {
@@ -1335,7 +1346,7 @@ void PoseBody(CAnimData& data) {
     }
   }
   // Backpedalling, the torso leans forward over the feet (over the aim, which AimArm corrects).
-  if (backWeight > 0.f && s.spine != CSegId::Invalid()) {
+  if (!echoes && backWeight > 0.f && s.spine != CSegId::Invalid()) {
     ModelRotations(data, sAcc, sModel);
     const int sp = s.spine.val();
     const CQuaternion parent = sModel.rot[sp] * sAcc.rot[sp].BuildInverted();
@@ -1345,7 +1356,8 @@ void PoseBody(CAnimData& data) {
   }
   // Strafing: the hips turn the legs the way they walk (about the model's up), and Spine_1
   // turns back, so the upper body keeps its orientation in the model.
-  if (std::fabs(s.legYaw) > 1e-4f && s.hips != CSegId::Invalid() && s.spine != CSegId::Invalid()) {
+  // (Echoes' own strafes already walk sideways with the hips forward.)
+  if (!echoes && std::fabs(s.legYaw) > 1e-4f && s.hips != CSegId::Invalid() && s.spine != CSegId::Invalid()) {
     ModelRotations(data, sAcc, sModel);
     const CQuaternion turn = CQuaternion::ZRotation(CRelAngle::FromRadians(s.legYaw));
     const int h = s.hips.val();
@@ -1354,6 +1366,12 @@ void PoseBody(CAnimData& data) {
     const CQuaternion spineParent = sModel.rot[sp] * sAcc.rot[sp].BuildInverted();
     sAcc.rot[h] = sAcc.rot[h] * hipsModel.BuildInverted() * turn * hipsModel;
     sAcc.rot[sp] = spineParent.BuildInverted() * turn.BuildInverted() * sModel.rot[sp];
+  }
+  // A shot's recoil from Echoes' animations, over everything.
+  if (echoes && PortThirdPersonEchoes::RecoilDeltas(data, sRecoil, kSegs)) {
+    for (const CSegId& seg : s.segs) {
+      sAcc.rot[seg.val()] = sAcc.rot[seg.val()] * sRecoil[seg.val()];
+    }
   }
   CHierarchyPoseBuilder& pb = data.PoseBuilder();
   for (const CSegId& seg : s.segs) {
@@ -1608,6 +1626,9 @@ void Update(CStateManager& mgr, float dt) {
   const float fwd = CVector3f::Dot(vel, xf.GetForward());
   const float side = CVector3f::Dot(vel, xf.GetRight());
   const bool grounded = player.GetPlayerMovementState() == NPlayer::kMS_OnGround;
+  // Echoes' animations, when on and read, take the legs and stance (PoseBody).
+  s.echoes = PortThirdPersonEchoes::Tick(mgr, *s.body->GetAnimationData(), dt, fwd, side, grounded, vel.GetZ(),
+                                         kBodyScale);
   s.gunUp = std::max(s.gunUp - dt, 0.f);
   const bool gunUp = s.gunUp > 0.f || player.GetPlayerGun()->IsCharging();
 

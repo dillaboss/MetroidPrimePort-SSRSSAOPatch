@@ -425,6 +425,10 @@ inline constexpr int kDreadPick = 4;
 // opens again, so the Remastered panel's own descriptor stays open (Android).
 inline constexpr int kDreadKeysSlot = 5;
 extern std::string sDreadPick;
+// Which 6 of the same picker: the Metroid Prime 2: Echoes image for the third-person body's
+// animations (port_third_person_echoes.h; desktop).
+inline constexpr int kEchoesPick = 6;
+extern std::string sEchoesPick;
 std::string RemasteredPickFile(int which);
 void TakeRemasteredPickFiles();
 void OpenRemasteredDialog(int which);

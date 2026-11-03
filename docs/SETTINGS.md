@@ -883,6 +883,29 @@
   FOV; a wider screen or FOV scales them so she keeps her place beside the
   crosshair. Console: `thirdperson [on|off] [distance N] [shoulder N]
   [height N]`.
+  Echoes animations (desktop; under the third-person option): "Choose Echoes
+  image..." keeps the user's own GameCube Metroid Prime 2: Echoes image
+  (`echoes_image`) and turns on `third_person_echoes_anims` (off by default).
+  Prime's cutscene clips have no strafe, walk back, side dash or double jump;
+  Echoes' multiplayer Samus has all of them on a skeleton whose joints sit
+  where Prime's do. With the image read (on a thread of its own, as soon as the
+  option is on), the body's legs and stance come from Echoes
+  (`platform/port_third_person_echoes.cpp`, `platform/port_echoes_locomotion.cpp`):
+  standing, walking, jogging and running forwards, backwards and sideways
+  blended by speed and direction, turning on the spot, take-offs, the jump
+  loop, double jumps, side dashes and their landings, and a recoil per shot
+  (heavier for a charged one). The body's own layers stay on top: the aim clips
+  and the arm turned to the aim point, the scan, a flinch, the grapple reach.
+  Echoes' keys read as Prime reads its own; its bind rotations are for skinning
+  only (`platform/port_echoes_anim.cpp` decodes the ANIMs, LZO-segmented in
+  Echoes' PAKs, `platform/port_lzo.cpp`). The panel shows the image with
+  "Change...", whether the animations are being read, ready or playing, and
+  why when they could not be read. Under Diagnostics, "Write animation report"
+  (or `--echoes-report <image>`) writes `echoes_skeleton_report.txt` to the
+  user folder: both games' Samus skeletons side by side, Echoes' Samus
+  animation names, and a decode check of a few clips (bit accounting, how the
+  keys sit against the bind pose, a ranking of the ways they could apply).
+  Names and numbers only; no game data is copied.
 - Speedrun timer and LiveSplit (F1 > Game > Speedrun; the timer also in pause Options >
   Display as In-Game Timer). `speedrun_timer` draws the in-game time (the play
   time the save shows, which stops in cutscenes, menus and loads) in the bottom

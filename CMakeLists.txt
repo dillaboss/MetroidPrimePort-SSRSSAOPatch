@@ -269,6 +269,12 @@ set(MP_PORT_SOURCES
     platform/port_freecam.cpp
     platform/port_third_person.cpp
     platform/port_third_person_body.cpp
+    platform/port_third_person_echoes.cpp
+    platform/port_lzo.cpp
+    platform/port_echoes_probe.cpp
+    platform/port_echoes_probe_import.cpp
+    platform/port_echoes_anim.cpp
+    platform/port_echoes_locomotion.cpp
     platform/port_world_holders.cpp
     platform/port_photo.cpp
     platform/port_radial.cpp
@@ -1565,6 +1571,12 @@ if(MP_BUILD_TESTS)
         INCLUDES platform/include)
     mp_port_test(port_third_person_body_tests
         SOURCES tests/port_third_person_body.cpp
+        INCLUDES platform/include)
+    # Echoes' Samus animations for the third-person body: LZO segments, skeletons, character and
+    # animation sets, compressed ANIMs, poses, the retarget onto Prime and the locomotion blend.
+    mp_port_test(port_echoes_probe_tests
+        SOURCES tests/port_echoes_probe.cpp platform/port_echoes_probe.cpp platform/port_echoes_anim.cpp
+            platform/port_echoes_locomotion.cpp platform/port_lzo.cpp
         INCLUDES platform/include)
     # The order a mod reload runs in: the port's own model holders go before the PAKs reopen
     # (port_world_holders.h), or the next world takes this one's models from the pool.

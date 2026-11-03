@@ -6,6 +6,7 @@
 #include "port_synthetic_effect.h"
 #include "port_third_person.h"
 #include "port_third_person_body.h"
+#include "port_third_person_echoes.h"
 #ifdef MP_ENABLE_SMOKE_DRIVER
 #include "port_smoke.h"
 #endif
@@ -669,6 +670,8 @@ void CPlayerGun::PortShotFromThirdPersonCannon(const CStateManager& mgr, CTransf
   const CPlayer& player = *mgr.GetPlayer();
   if (aim) {
     PortThirdPersonBody::NoteShot(mgr); // a fired shot (the aux beams' per-frame call passes !aim)
+    // Echoes' animations' recoil, heavier for a charged shot.
+    PortThirdPersonEchoes::NoteShot(x330_chargeState == kCS_Charged ? 2 : 0);
   }
   CVector3f origin = xf.GetTranslation();
   PortThirdPersonBody::CannonPosition(player, origin);

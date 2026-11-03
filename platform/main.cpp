@@ -20,6 +20,7 @@
 #include "port_disc.h"
 #include "port_gci.h"
 #include "port_debug.h"
+#include "port_echoes_probe.h"
 #include "port_graphics_backend.h"
 #include "port_paths.h"
 #include "port_actor_collision_bounds.h"
@@ -901,6 +902,15 @@ int main(int argc, char** argv) {
             return 2;
         }
         return PortPalLanguages::RunFromCommandLine(argv[2]);
+    }
+    // --echoes-report <image>: compare Samus's skeleton with Echoes' and check how Echoes'
+    // animations decode (port_echoes_probe.h), without starting the game.
+    if (argc >= 2 && std::strcmp(argv[1], "--echoes-report") == 0) {
+        if (argc != 3) {
+            std::fprintf(stderr, "usage: %s %s <Metroid Prime 2: Echoes disc image>\n", argv[0], argv[1]);
+            return 2;
+        }
+        return PortEchoesProbe::RunFromCommandLine(argv[2]);
     }
     // --import-flaahgra-music <image>: add the full Flaahgra theme from a PAL/JP
     // GameCube or Trilogy image to the mods folder (port_flaahgra_music.h).

@@ -9,6 +9,7 @@
 #include "port_gyro_motion.h"
 #include "port_photo.h"
 #include "port_third_person.h"
+#include "port_third_person_echoes.h"
 #include "port_pointer.h"
 #include "port_room_geo.h"
 #include "port_log.h"
@@ -284,6 +285,12 @@ const SettingKey kSettingKeys[] = {
        PortThirdPerson::SetHeight(height == 0.1f ? PortThirdPerson::Params{}.height : height);
      },
      [](std::ostream& out) { out << PortThirdPerson::GetParams().height; }, false, "0.5", "0"},
+    {"third_person_echoes_anims",
+     [](const std::string& value) { PortThirdPersonEchoes::SetEnabled(ParseBool(value)); },
+     [](std::ostream& out) { WriteBool(out, PortThirdPersonEchoes::Enabled()); }, false, "1", "0"},
+    {"echoes_image", [](const std::string& value) { PortThirdPersonEchoes::SetImagePath(value); },
+     [](std::ostream& out) { out << PortThirdPersonEchoes::ImagePath(); }, true, "/games/Echoes.rvz",
+     "C:\\Games\\mp2.iso"},
     BoolKey< &sHideVisorEffects >("hide_visor_effects"),
     BoolKey< &sSsao >("ssao"),
     {"ssao_intensity",

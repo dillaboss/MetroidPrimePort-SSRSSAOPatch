@@ -6,7 +6,9 @@
 #include "port_env.h"
 #include "port_debug.h"
 #include "port_dread_samus_mod.h"
+#include "port_echoes_probe.h"
 #include "port_third_person.h"
+#include "port_third_person_echoes.h"
 #include "port_graphics_backend.h"
 #include "port_gyro_motion.h"
 #include "port_dynamic_res.h"
@@ -48,6 +50,110 @@
 #include <vector>
 
 namespace PortDebug {
+
+#if !defined(__ANDROID__)
+// Echoes' animations for the third-person body (port_third_person_echoes.h): the user's own
+// Echoes image, read as soon as the option is on, and how that went.
+static void DrawThirdPersonEchoes() {
+  // An image from the picker: kept, and the animations switched on with it.
+  std::string picked;
+  {
+    std::lock_guard lock(sRemasteredPickMutex);
+    picked.swap(sEchoesPick);
+  }
+  if (!picked.empty()) {
+    PortThirdPersonEchoes::SetImagePath(picked);
+    PortThirdPersonEchoes::SetEnabled(true);
+    MarkDirty();
+  }
+  const std::string image = PortThirdPersonEchoes::ImagePath();
+  if (image.empty()) {
+    ImGui::TextDisabled("Optional: strafe, walk back, dash and double jump with Echoes' animations.");
+    if (ImGui::Button("Choose Echoes image...")) {
+      OpenRemasteredDialog(kEchoesPick);
+    }
+    ImGui::SetItemTooltip("Your own Metroid Prime 2: Echoes disc image (GameCube, any format the port reads:\n"
+                          ".iso, .rvz, ...). Its Samus animations fill in what Prime's lack: strafing,\n"
+                          "walking and running backwards, turning on the spot, side dashes, double jumps\n"
+                          "and a recoil per shot. Nothing is downloaded. Metroid Prime Trilogy's Echoes\n"
+                          "(Wii) is not supported.");
+    return;
+  }
+  bool on = PortThirdPersonEchoes::Enabled();
+  if (ImGui::Checkbox("Echoes animations", &on)) {
+    PortThirdPersonEchoes::SetEnabled(on);
+    MarkDirty();
+  }
+  ImGui::SetItemTooltip("Samus moves with Echoes' animations: standing, walking and running in every\n"
+                        "direction, turning, jumping, double jumps, side dashes, landings and a recoil\n"
+                        "per shot. Aiming, scanning, flinching and the grapple stay as they are.\n"
+                        "Experimental.");
+  const size_t slash = image.find_last_of("/\\");
+  ImGui::TextDisabled("Image: %s", slash == std::string::npos ? image.c_str() : image.c_str() + slash + 1);
+  ImGui::SetItemTooltip("%s", image.c_str());
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Change...##echoesimage")) {
+    OpenRemasteredDialog(kEchoesPick);
+  }
+  if (on) {
+    PortThirdPersonEchoes::Load();
+    const PortThirdPersonEchoes::State state = PortThirdPersonEchoes::GetState();
+    switch (state.phase) {
+    case PortThirdPersonEchoes::State::Phase::None:
+    case PortThirdPersonEchoes::State::Phase::Loading:
+      ImGui::TextDisabled("Reading the animations from the image...");
+      break;
+    case PortThirdPersonEchoes::State::Phase::Ready:
+      ImGui::TextColored(ThemeGoodColor(), state.playing ? "Playing (%zu animations)" : "Ready (%zu animations)",
+                         state.clips);
+      if (!state.playing) {
+        ImGui::SetItemTooltip("They play in game while the camera is behind Samus.");
+      }
+      if (!state.missing.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%zu not on this image)", state.missing.size());
+        std::string list;
+        for (const std::string& name : state.missing) {
+          list += (list.empty() ? "" : "\n") + name;
+        }
+        ImGui::SetItemTooltip("%s", list.c_str());
+      }
+      break;
+    case PortThirdPersonEchoes::State::Phase::Failed:
+      ImGui::TextColored(ThemeBadColor(), "Couldn't read the animations: %s.", state.message.c_str());
+      ImGui::TextDisabled("Choose a GameCube Metroid Prime 2: Echoes image with Change.");
+      break;
+    }
+  }
+  if (ImGui::TreeNode("Diagnostics##echoes")) {
+    static std::string sReportError;
+    const PortEchoesProbe::State report = PortEchoesProbe::Status();
+    ImGui::BeginDisabled(report.running);
+    if (ImGui::Button("Write animation report")) {
+      sReportError = PortEchoesProbe::Start(image) ? "" : "A report is already being written.";
+    }
+    ImGui::EndDisabled();
+    ImGui::SetItemTooltip("Compares Samus's skeleton in the two games and checks how Echoes' animations\n"
+                          "decode, into a text file in the user folder: names and numbers only, no game\n"
+                          "data. Useful when reporting a problem with the animations.");
+    if (report.running) {
+      ImGui::TextDisabled("%s...", report.message.c_str());
+    } else if (report.finished) {
+      if (report.ok) {
+        ImGui::TextWrapped("%s", report.message.c_str());
+        if (ImGui::Button("Copy report path##echoes")) {
+          ImGui::SetClipboardText(report.reportPath.c_str());
+        }
+      } else {
+        ImGui::TextColored(ThemeWarnColor(), "%s", report.message.c_str());
+      }
+    } else if (!sReportError.empty()) {
+      ImGui::TextColored(ThemeWarnColor(), "%s", sReportError.c_str());
+    }
+    ImGui::TreePop();
+  }
+}
+#endif
 
 void DrawVideoDisplay() {
   ImGui::SeparatorText("Display");
@@ -279,6 +385,13 @@ void DrawVideoDisplay() {
       "Plays from behind Samus's shoulder (not the morph ball or cutscenes), showing her\n"
       "body and hiding the arm cannon and helmet. Distance, shoulder and height:\n"
       "console `thirdperson`, or third_person_* in the settings file.");
+#if !defined(__ANDROID__)
+  if (thirdPerson) {
+    ImGui::Indent();
+    DrawThirdPersonEchoes();
+    ImGui::Unindent();
+  }
+#endif
   bool hideVisorFx = sHideVisorEffects;
   if (ImGui::Checkbox("Hide visor effects", &hideVisorFx)) {
     SetHideVisorEffects(hideVisorFx);

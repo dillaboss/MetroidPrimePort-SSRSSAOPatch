@@ -47,6 +47,8 @@ public:
   CSegId GetOriginalParent(const CSegId& seg) const { return GetSegmentData(seg).GetParent(); }
 #ifdef TARGET_PC
   bool ContainsSegment(const CSegId& seg) const { return mNodes->ContainsDataFor(seg); }
+  // Port: every bone by name (Echoes' animations are carried onto the body by bone name).
+  const rstl::map< rstl::string, CSegId >& PortNameMap() const { return mNameMap; }
 #endif
 
 private:
