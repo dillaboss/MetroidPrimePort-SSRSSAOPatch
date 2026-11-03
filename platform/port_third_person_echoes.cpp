@@ -212,8 +212,11 @@ bool Tick(const CStateManager& mgr, const CAnimData& body, float dt, float fwd, 
                      prime.bones.size());
     }
   }
-  if (!sMapped || dt <= 0.f) {
+  if (!sMapped) {
     return sPosed = false;
+  }
+  if (dt <= 0.f) {
+    return sPosed; // a tick that doesn't advance keeps the last pose
   }
 
   const CPlayer* player = mgr.GetPlayer();
